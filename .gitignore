@@ -111,4 +111,7 @@ assets/gen_typing_gif.py
 !/docs/
 /docs/*
 !/docs/hub/
-
+!/notebooklm/
+/notebooklm/*
+/notebooklm/.*
+!/notebooklm/agent-harness/

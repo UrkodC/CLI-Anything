@@ -126,6 +126,18 @@
       "category": "diagrams"
     },
     {
+      "name": "notebooklm",
+      "display_name": "NotebookLM",
+      "version": "0.1.0",
+      "description": "Experimental NotebookLM harness scaffold wrapping the installed notebooklm CLI for notebook, source, chat, artifact, download, and sharing workflows",
+      "requires": "notebooklm CLI from notebooklm-py + valid local NotebookLM login session",
+      "homepage": "https://notebooklm.google.com",
+      "install_cmd": "pip install git+https://github.com/HKUDS/CLI-Anything.git#subdirectory=notebooklm/agent-harness",
+      "entry_point": "cli-anything-notebooklm",
+      "skill_md": "notebooklm/agent-harness/cli_anything/notebooklm/skills/SKILL.md",
+      "category": "ai"
+    },
+    {
       "name": "ollama",
       "display_name": "Ollama",
       "version": "1.0.1",
