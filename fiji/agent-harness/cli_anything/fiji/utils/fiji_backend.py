@@ -156,7 +156,14 @@ def run_script(
         raise FileNotFoundError(f"Script file not found: {script_path}")
 
     fiji = find_fiji()
-    cmd = [fiji, "--headless", "--run", script_path]
+    abs_script = os.path.abspath(script_path)
+    ext = os.path.splitext(abs_script)[1].lower()
+
+    # .ijm files use -macro flag; other scripts use --run
+    if ext == ".ijm":
+        cmd = [fiji, "--headless", "-macro", abs_script]
+    else:
+        cmd = [fiji, "--headless", "--run", abs_script]
 
     result = subprocess.run(
         cmd,
