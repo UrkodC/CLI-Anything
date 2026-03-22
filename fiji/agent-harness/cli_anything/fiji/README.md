@@ -71,12 +71,16 @@ cli-anything-fiji --project project.json macro batch -i /input/dir -o /output/di
 | `measure`  | Configure and run measurements                   |
 | `macro`    | Store and execute custom ImageJ macros           |
 | `export`   | Render processed images via Fiji                 |
+| `channel`  | Merge, split channels; list LUTs                 |
+| `figure`   | Assemble multi-panel figures, journal presets     |
 | `backend`  | Direct Fiji interaction (version, run macro)      |
 | `session`  | Undo/redo, history, status                       |
 
 ## Processing Operations
 
 Categories: `adjust`, `filter`, `morphology`, `convert`, `spatial`, `analysis`, `stack`
+
+New in adjust: `set_scale`, `add_scale_bar`, `apply_lut`, `set_display_range`, `invert_lut`, `add_calibration_bar`
 
 ```bash
 cli-anything-fiji process list-ops               # all operations
