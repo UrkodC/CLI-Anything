@@ -19,6 +19,7 @@ from cli_anything.fiji.core import roi as roi_mod
 from cli_anything.fiji.core import measure as meas_mod
 from cli_anything.fiji.core import macro as macro_mod
 from cli_anything.fiji.core import export as export_mod
+from cli_anything.fiji.core import channel as chan_mod
 
 
 @pytest.fixture
@@ -496,3 +497,49 @@ class TestMacro:
         assert "Gaussian Blur" in macro
         assert "/input" in macro
         assert "/output" in macro
+
+
+# ═══════════════════════════════════════════════════════════════
+# Channel tests
+# ═══════════════════════════════════════════════════════════════
+
+class TestChannel:
+    def test_list_luts(self):
+        luts = chan_mod.list_luts()
+        assert len(luts) > 0
+        names = [l["name"] for l in luts]
+        assert "Grays" in names
+        assert "Green" in names
+        assert "Magenta" in names
+
+    def test_build_merge_macro(self):
+        channels = [
+            {"path": "/tmp/ch1.tif", "color": "Green"},
+            {"path": "/tmp/ch2.tif", "color": "Magenta"},
+        ]
+        macro = chan_mod.build_merge_macro(channels)
+        assert 'open("/tmp/ch1.tif")' in macro
+        assert 'open("/tmp/ch2.tif")' in macro
+        assert "Merge Channels" in macro
+
+    def test_build_merge_macro_three_channels(self):
+        channels = [
+            {"path": "/tmp/dapi.tif", "color": "Blue"},
+            {"path": "/tmp/gfp.tif", "color": "Green"},
+            {"path": "/tmp/rfp.tif", "color": "Magenta"},
+        ]
+        macro = chan_mod.build_merge_macro(channels)
+        assert "c3=" in macro
+        assert "c2=" in macro
+        assert "c6=" in macro
+
+    def test_build_split_macro(self):
+        macro = chan_mod.build_split_macro("/tmp/composite.tif", "/tmp/out")
+        assert 'open("/tmp/composite.tif")' in macro
+        assert "Split Channels" in macro
+
+    def test_merge_invalid_color(self):
+        channels = [{"path": "/tmp/ch1.tif", "color": "InvalidColor"}]
+        import pytest
+        with pytest.raises(ValueError, match="Unknown color"):
+            chan_mod.build_merge_macro(channels)

@@ -28,6 +28,7 @@ from cli_anything.fiji.core import project as proj_mod
 from cli_anything.fiji.core import image as img_mod
 from cli_anything.fiji.core import processing as proc_mod
 from cli_anything.fiji.core import roi as roi_mod
+from cli_anything.fiji.core import channel as chan_mod
 from cli_anything.fiji.core import measure as meas_mod
 from cli_anything.fiji.core import macro as macro_mod
 from cli_anything.fiji.core import export as export_mod
@@ -440,6 +441,50 @@ def roi_macro(index):
     click.echo(macro)
 
 
+# ── Channel Commands ─────────────────────────────────────────────
+@cli.group()
+def channel():
+    """Channel operations (merge, split, LUT)."""
+    pass
+
+@channel.command("luts")
+@handle_error
+def channel_luts():
+    """List available LUTs (lookup tables)."""
+    luts = chan_mod.list_luts()
+    output(luts, "Available LUTs:")
+
+@channel.command("merge")
+@click.argument("paths", nargs=-1, required=True)
+@click.option("--colors", "-c", required=True, help="Comma-separated colors: Green,Magenta")
+@click.option("--output-path", "-o", required=True, help="Output file path")
+@handle_error
+def channel_merge(paths, colors, output_path):
+    """Merge channel images into a composite."""
+    color_list = [c.strip() for c in colors.split(",")]
+    if len(paths) != len(color_list):
+        raise ValueError(f"Got {len(paths)} images but {len(color_list)} colors")
+    channels = [{"path": os.path.abspath(p), "color": c} for p, c in zip(paths, color_list)]
+    macro = chan_mod.build_merge_macro(channels)
+    abs_out = os.path.abspath(output_path)
+    macro += f'\nsaveAs("Tiff", "{abs_out}");'
+    from cli_anything.fiji.utils.fiji_backend import run_macro
+    run_macro(macro)
+    output({"output": abs_out, "channels": len(paths)}, f"Merged to: {abs_out}")
+
+@channel.command("split")
+@click.argument("input_path")
+@click.option("--output-dir", "-o", required=True, help="Output directory")
+@handle_error
+def channel_split(input_path, output_dir):
+    """Split a composite image into individual channels."""
+    os.makedirs(output_dir, exist_ok=True)
+    macro = chan_mod.build_split_macro(os.path.abspath(input_path), os.path.abspath(output_dir))
+    from cli_anything.fiji.utils.fiji_backend import run_macro
+    run_macro(macro)
+    output({"output_dir": output_dir}, f"Channels saved to: {output_dir}")
+
+
 # ── Measure Commands ─────────────────────────────────────────────
 @cli.group()
 def measure():
@@ -763,6 +808,7 @@ def repl(project_path):
         "image":    "add|remove|list|info",
         "process":  "list-ops|info|add|remove|log|macro",
         "roi":      "add|remove|list|macro",
+        "channel":  "luts|merge|split",
         "measure":  "types|commands|configure|run|results|clear",
         "macro":    "add|add-file|remove|list|show|batch",
         "export":   "presets|preset-info|render",
