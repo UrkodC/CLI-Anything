@@ -138,11 +138,13 @@ def render(
     result = run_macro(macro)
 
     if not os.path.exists(abs_output):
+        stderr = result.get('stderr', '')
+        stdout = result.get('stdout', '')
         raise RuntimeError(
             f"Fiji export produced no output file.\n"
             f"  Expected: {abs_output}\n"
-            f"  stderr: {result.get('stderr', '')[-500:]}\n"
-            f"  stdout: {result.get('stdout', '')[-500:]}"
+            f"  stderr: {stderr}\n"
+            f"  stdout: {stdout}"
         )
 
     file_size = os.path.getsize(abs_output)
