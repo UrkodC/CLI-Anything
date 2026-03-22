@@ -205,6 +205,20 @@ class TestSession:
         assert len(history) == 2
         assert history[0]["description"] == "step 2"
 
+    def test_save_session_no_metadata(self):
+        """save_session should not crash if project has no metadata key."""
+        sess = Session()
+        proj = {"name": "bare_project", "images": []}
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            sess.set_project(proj, path)
+            saved = sess.save_session()
+            assert os.path.exists(saved)
+        finally:
+            os.unlink(path)
+
 
 # ═══════════════════════════════════════════════════════════════
 # Image tests

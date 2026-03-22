@@ -105,6 +105,8 @@ class Session:
         if not save_path:
             raise ValueError("No save path specified.")
 
+        if "metadata" not in self.project:
+            self.project["metadata"] = {}
         self.project["metadata"]["modified"] = datetime.now().isoformat()
         with open(save_path, "w") as f:
             json.dump(self.project, f, indent=2, default=str)
