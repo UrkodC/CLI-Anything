@@ -314,6 +314,49 @@ class TestProcessing:
         assert 'Gaussian Blur' in macro
         assert 'Otsu' in macro
 
+    def test_add_scale_bar(self):
+        proj = proj_mod.create_project()
+        step = proc_mod.add_processing_step(proj, "add_scale_bar", params={
+            "width": 10, "height": 4, "font": 14,
+            "color": "White", "location": "Lower Right"
+        })
+        assert step["operation"] == "add_scale_bar"
+        assert "Scale Bar" in step["macro"]
+
+    def test_set_scale(self):
+        proj = proj_mod.create_project()
+        step = proc_mod.add_processing_step(proj, "set_scale", params={
+            "distance": 100, "known": 10, "unit": "um"
+        })
+        assert "Set Scale" in step["macro"]
+
+    def test_apply_lut(self):
+        proj = proj_mod.create_project()
+        step = proc_mod.add_processing_step(proj, "apply_lut", params={"lut": "Fire"})
+        assert "Fire" in step["macro"]
+
+    def test_apply_lut_grays(self):
+        proj = proj_mod.create_project()
+        step = proc_mod.add_processing_step(proj, "apply_lut", params={"lut": "Grays"})
+        assert "Grays" in step["macro"]
+
+    def test_set_display_range(self):
+        proj = proj_mod.create_project()
+        step = proc_mod.add_processing_step(proj, "set_display_range", params={"min_val": 100, "max_val": 4000})
+        assert "setMinAndMax" in step["macro"]
+
+    def test_invert_lut(self):
+        proj = proj_mod.create_project()
+        step = proc_mod.add_processing_step(proj, "invert_lut")
+        assert "Invert LUT" in step["macro"]
+
+    def test_add_calibration_bar(self):
+        proj = proj_mod.create_project()
+        step = proc_mod.add_processing_step(proj, "add_calibration_bar", params={
+            "location": "Upper Right", "label_color": "White", "font": 12
+        })
+        assert "Calibration Bar" in step["macro"]
+
 
 # ═══════════════════════════════════════════════════════════════
 # ROI tests

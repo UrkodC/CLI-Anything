@@ -167,6 +167,44 @@ OPERATIONS = {
         "macro": 'run("Enhance Contrast...", "saturated={saturated} normalize");',
         "params": {"saturated": 0.35},
     },
+    # Scale bar
+    "set_scale": {
+        "category": "adjust",
+        "description": "Set image spatial calibration",
+        "macro": 'run("Set Scale...", "distance={distance} known={known} unit={unit}");',
+        "params": {"distance": 1, "known": 1, "unit": "pixel"},
+    },
+    "add_scale_bar": {
+        "category": "adjust",
+        "description": "Add scale bar overlay to image",
+        "macro": 'run("Scale Bar...", "width={width} height={height} font={font} color={color} background=None location=[{location}] bold overlay");',
+        "params": {"width": 10, "height": 4, "font": 14, "color": "White", "location": "Lower Right"},
+    },
+    # LUT / Display
+    "apply_lut": {
+        "category": "adjust",
+        "description": "Apply a lookup table (color map) to the image",
+        "macro": 'run("{lut}");',
+        "params": {"lut": "Grays"},
+    },
+    "set_display_range": {
+        "category": "adjust",
+        "description": "Set the display min/max range (does not modify pixel data)",
+        "macro": 'setMinAndMax({min_val}, {max_val});',
+        "params": {"min_val": 0, "max_val": 255},
+    },
+    "invert_lut": {
+        "category": "adjust",
+        "description": "Invert the current lookup table",
+        "macro": 'run("Invert LUT");',
+        "params": {},
+    },
+    "add_calibration_bar": {
+        "category": "adjust",
+        "description": "Add a calibration bar showing LUT intensity mapping",
+        "macro": 'run("Calibration Bar...", "location=[{location}] fill=None label={label_color} number=5 decimal=0 font={font} zoom=1 overlay");',
+        "params": {"location": "Upper Right", "label_color": "White", "font": 12},
+    },
     # Stack operations
     "z_project_max": {
         "category": "stack",
