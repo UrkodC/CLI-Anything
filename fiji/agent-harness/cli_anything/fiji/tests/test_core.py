@@ -20,6 +20,7 @@ from cli_anything.fiji.core import measure as meas_mod
 from cli_anything.fiji.core import macro as macro_mod
 from cli_anything.fiji.core import export as export_mod
 from cli_anything.fiji.core import channel as chan_mod
+from cli_anything.fiji.core import figure as fig_mod
 
 
 @pytest.fixture
@@ -543,3 +544,53 @@ class TestChannel:
         import pytest
         with pytest.raises(ValueError, match="Unknown color"):
             chan_mod.build_merge_macro(channels)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Figure tests
+# ═══════════════════════════════════════════════════════════════
+
+class TestFigure:
+    def test_build_montage_macro_2x2(self):
+        panels = ["/tmp/a.tif", "/tmp/b.tif", "/tmp/c.tif", "/tmp/d.tif"]
+        macro = fig_mod.build_montage_macro(panels, columns=2, rows=2)
+        for p in panels:
+            assert f'open("{p}")' in macro
+        assert "Make Montage" in macro
+        assert "columns=2 rows=2" in macro
+
+    def test_build_montage_macro_with_scale_bar(self):
+        panels = ["/tmp/a.tif", "/tmp/b.tif"]
+        macro = fig_mod.build_montage_macro(
+            panels, columns=2, rows=1,
+            scale_bar_width=10, scale_bar_color="White"
+        )
+        assert "Scale Bar" in macro
+
+    def test_build_montage_macro_with_flatten(self):
+        panels = ["/tmp/a.tif"]
+        macro = fig_mod.build_montage_macro(panels, columns=1, rows=1, flatten=True)
+        assert "Flatten" in macro
+
+    def test_build_montage_macro_with_output(self):
+        panels = ["/tmp/a.tif", "/tmp/b.tif"]
+        macro = fig_mod.build_montage_macro(panels, columns=2, rows=1, output_path="/tmp/figure.tif")
+        assert 'saveAs("Tiff", "/tmp/figure.tif")' in macro
+
+    def test_list_figure_presets(self):
+        presets = fig_mod.list_figure_presets()
+        names = [p["name"] for p in presets]
+        assert "nature_single" in names
+        assert "nature_double" in names
+        assert "science_single" in names
+        assert "cell_single" in names
+
+    def test_get_figure_preset(self):
+        preset = fig_mod.get_figure_preset("nature_single")
+        assert preset["width_mm"] == 89
+        assert preset["dpi"] == 300
+
+    def test_get_figure_preset_invalid(self):
+        import pytest
+        with pytest.raises(ValueError, match="Unknown preset"):
+            fig_mod.get_figure_preset("nonexistent_journal")

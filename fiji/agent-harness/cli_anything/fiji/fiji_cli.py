@@ -32,6 +32,7 @@ from cli_anything.fiji.core import channel as chan_mod
 from cli_anything.fiji.core import measure as meas_mod
 from cli_anything.fiji.core import macro as macro_mod
 from cli_anything.fiji.core import export as export_mod
+from cli_anything.fiji.core import figure as fig_mod
 
 # Global session state
 _session: Optional[Session] = None
@@ -485,6 +486,52 @@ def channel_split(input_path, output_dir):
     output({"output_dir": output_dir}, f"Channels saved to: {output_dir}")
 
 
+# ── Figure Commands ──────────────────────────────────────────────
+@cli.group()
+def figure():
+    """Figure assembly commands."""
+    pass
+
+@figure.command("presets")
+@handle_error
+def figure_presets():
+    """List available journal figure presets."""
+    presets = fig_mod.list_figure_presets()
+    output(presets, "Figure presets:")
+
+@figure.command("preset-info")
+@click.argument("name")
+@handle_error
+def figure_preset_info(name):
+    """Show preset details."""
+    info = fig_mod.get_figure_preset(name)
+    output(info)
+
+@figure.command("montage")
+@click.argument("panels", nargs=-1, required=True)
+@click.option("--columns", "-c", type=int, default=2, help="Number of columns")
+@click.option("--rows", "-r", type=int, default=2, help="Number of rows")
+@click.option("--border", "-b", type=int, default=2, help="Border width in pixels")
+@click.option("--output", "-o", "output_path", required=True, help="Output file path")
+@click.option("--scale-bar", type=int, default=None, help="Scale bar width in calibrated units")
+@click.option("--scale-bar-color", default="White", help="Scale bar color")
+@click.option("--flatten", is_flag=True, help="Flatten overlays before montage")
+@handle_error
+def figure_montage(panels, columns, rows, border, output_path, scale_bar, scale_bar_color, flatten):
+    """Assemble a multi-panel figure from individual images."""
+    abs_panels = [os.path.abspath(p) for p in panels]
+    abs_output = os.path.abspath(output_path)
+    macro = fig_mod.build_montage_macro(
+        abs_panels, columns=columns, rows=rows, border=border,
+        scale_bar_width=scale_bar, scale_bar_color=scale_bar_color,
+        flatten=flatten, output_path=abs_output,
+    )
+    from cli_anything.fiji.utils.fiji_backend import run_macro
+    run_macro(macro)
+    output({"output": abs_output, "panels": len(panels), "layout": f"{columns}x{rows}"},
+           f"Figure saved to: {abs_output}")
+
+
 # ── Measure Commands ─────────────────────────────────────────────
 @cli.group()
 def measure():
@@ -811,6 +858,7 @@ def repl(project_path):
         "channel":  "luts|merge|split",
         "measure":  "types|commands|configure|run|results|clear",
         "macro":    "add|add-file|remove|list|show|batch",
+        "figure":   "presets|preset-info|montage",
         "export":   "presets|preset-info|render",
         "backend":  "version|find|run-macro|run-script",
         "session":  "status|undo|redo|history",
