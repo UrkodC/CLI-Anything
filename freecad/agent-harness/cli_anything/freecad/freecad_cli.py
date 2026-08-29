@@ -4902,15 +4902,6 @@ def repl(project_path: Optional[str]) -> None:
             break
 
 
-# ── Skill plugins (lazy-loaded so missing deps don't break the CLI) ─
-try:
-    from cli_anything.freecad.skills._template.driver import cli as _template_cli
-    cli.add_command(_template_cli)
-except Exception:  # pragma: no cover
-    # Optional deps (pyyaml) may be missing — skip registration silently.
-    pass
-
-
 def main():
     """Entry point for the CLI."""
     cli()

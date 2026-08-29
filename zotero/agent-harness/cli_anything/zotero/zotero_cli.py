@@ -1069,15 +1069,6 @@ def repl_command(ctx: click.Context) -> int:
     return run_repl(_current_cli_config(ctx))
 
 
-# ── Skill plugins (lazy-loaded so missing deps don't break the CLI) ─
-try:
-    from cli_anything.zotero.skills._template.driver import cli as _template_cli
-    cli.add_command(_template_cli)
-except Exception:  # pragma: no cover
-    # Optional deps (pyyaml) may be missing — skip registration silently.
-    pass
-
-
 def dispatch(argv: list[str] | None = None, prog_name: str | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -1092,3 +1083,7 @@ def dispatch(argv: list[str] | None = None, prog_name: str | None = None) -> int
 
 def entrypoint(argv: list[str] | None = None) -> int:
     return dispatch(argv, prog_name=sys.argv[0])
+
+
+if __name__ == "__main__":
+    raise SystemExit(entrypoint())

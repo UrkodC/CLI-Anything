@@ -101,7 +101,6 @@ def find_freecad(gui_required: bool = False) -> str:
     # 4. macOS application bundle
     if platform.system() == "Darwin":
         mac_paths = [
-            "/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd",
             "/Applications/FreeCAD.app/Contents/MacOS/FreeCADCmd",
             "/Applications/FreeCAD.app/Contents/MacOS/FreeCAD",
         ]
@@ -313,7 +312,7 @@ def run_macro_content(
 def export_headless(
     macro_content: str,
     output_path: str,
-    timeout: int = 300,
+    timeout: int = 120,
 ) -> Dict[str, Any]:
     """Write a macro to a temp file, execute it, and verify the output.
 

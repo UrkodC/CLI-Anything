@@ -40,40 +40,10 @@ def _gen_header() -> List[str]:
         "# Auto-generated FreeCAD macro by CLI-Anything FreeCAD harness",
         "import sys",
         "import os",
-        "import math",
         "import FreeCAD",
         "import Part",
         "",
         "doc = FreeCAD.newDocument('ExportDoc')",
-        "",
-    ]
-
-
-def _gen_helpers() -> List[str]:
-    """Generate helper functions for coordinate transforms.
-
-    Currently unused by the PartDesign-based ``_gen_bodies`` path, but kept
-    available for macros that operate at the Part workbench level and need
-    to project 2D sketch coordinates onto 3D planes.
-    """
-    return [
-        "# --- Coordinate helpers ---",
-        "def _to_3d(u, v, plane, offset=0.0):",
-        "    '''Transform 2D sketch coords to 3D based on plane.'''",
-        "    if plane == 'XY':",
-        "        return FreeCAD.Vector(u, v, offset)",
-        "    elif plane == 'XZ':",
-        "        return FreeCAD.Vector(u, offset, v)",
-        "    elif plane == 'YZ':",
-        "        return FreeCAD.Vector(offset, u, v)",
-        "    return FreeCAD.Vector(u, v, offset)",
-        "",
-        "def _normal(plane):",
-        "    '''Return the normal direction for a sketch plane.'''",
-        "    if plane == 'XY': return FreeCAD.Vector(0, 0, 1)",
-        "    if plane == 'XZ': return FreeCAD.Vector(0, 1, 0)",
-        "    if plane == 'YZ': return FreeCAD.Vector(1, 0, 0)",
-        "    return FreeCAD.Vector(0, 0, 1)",
         "",
     ]
 

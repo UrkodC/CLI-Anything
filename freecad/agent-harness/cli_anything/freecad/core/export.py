@@ -315,7 +315,7 @@ def export_project(
 
     # Execute via the headless backend
     result = freecad_backend.export_headless(
-        macro_content, output_path, timeout=300,
+        macro_content, output_path, timeout=120,
     )
 
     # Verify the output file
