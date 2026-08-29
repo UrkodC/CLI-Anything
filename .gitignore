@@ -98,6 +98,7 @@
 !/macrocli/
 !/sbox/
 !/quietshrink/
+!/r/
 !/mailchimp/
 !/3MF/
 !/calibre/
@@ -287,6 +288,7 @@
 !/macrocli/agent-harness/
 !/sbox/agent-harness/
 !/quietshrink/agent-harness/
+!/r/agent-harness/
 !/mailchimp/agent-harness/
 !/live2d/agent-harness/
 !/rekordbox/agent-harness/
