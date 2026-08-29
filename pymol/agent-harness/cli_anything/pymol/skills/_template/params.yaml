@@ -1,0 +1,22 @@
+# params.yaml — tunable parameters for the _template PyMOL skill.
+# Fill in defaults that produce the figure you want on a representative structure.
+
+load:
+  # Fetch from PDB if not a local file path. Set to false to require a local .cif/.pdb.
+  fetch_remote: true
+  # Default assembly to load (0 = asymmetric unit, 1+ = biological assembly N).
+  assembly: 1
+
+render:
+  bg_color: white
+  ray_shadows: false
+  ray_trace_mode: 1
+  representation: cartoon       # cartoon | surface | ribbon | sticks
+  color_by: chain               # chain | spectrum | bfactor | custom
+  cartoon_transparency: 0.0
+
+export:
+  width_px: 1600
+  height_px: 1200
+  dpi: 300
+  png_format: png               # png | jpg

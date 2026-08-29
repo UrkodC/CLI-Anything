@@ -1,0 +1,25 @@
+# params.yaml — tunable parameters for the _template FreeCAD skill.
+# Replace these with the dimensions and feature counts your model needs.
+
+build:
+  # Outline of the part
+  length: 80.0
+  width: 40.0
+  height: 10.0
+  fillet_radius: 2.0
+
+  # Through-holes pattern
+  holes: 4
+  hole_diameter: 5.0
+  hole_margin: 6.0     # distance from edge
+
+export:
+  # Formats to write from the headless FreeCAD pass
+  step: true
+  stl: true
+  iges: false
+
+qc:
+  preview_png: true
+  preview_width_px: 1200
+  preview_height_px: 900

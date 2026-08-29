@@ -1,0 +1,82 @@
+# mt_clip170 pipeline parameters
+# All sigmas / radii / areas are in MICROMETERS.
+# The macro converts to pixels using the Bio-Formats pixel calibration.
+
+# ── Channel assignment (1-based, as the file stores them) ───────────
+channels:
+  tubulin: 1       # alpha-tubulin (microtubules)
+  gfp:     2       # GFP-CLIP170 variant (transfection marker + comets)
+  dapi:    3       # DAPI (nuclei)
+
+# ── Stage 1 — Nuclei seeds from DAPI ────────────────────────────────
+dapi:
+  gaussian_sigma_um: 1.0
+  threshold_method: "Otsu"       # Otsu / Triangle / Li / Huang / MaxEntropy
+  min_nucleus_area_um2: 30.0
+  fill_holes: true
+  watershed_split: true          # split touching nuclei
+
+# ── Stage 2 — Tubulin whole-cell mask ───────────────────────────────
+tubulin_mask:
+  bg_rolling_ball_um: 20.0       # rolling ball radius for background subtraction
+  gaussian_sigma_um: 1.5
+  threshold_method: "Huang"      # Huang / Li / Otsu / Triangle / MaxEntropy
+  fill_holes: true
+
+# ── Stage 3 — Marker-controlled watershed cell isolation ────────────
+cells:
+  watershed_input: "intensity_inverted"   # intensity_inverted | distance_map
+  min_area_um2: 200.0
+  max_area_um2: 8000.0
+  exclude_border: true
+
+# ── Stage 4 — GFP+ classification ───────────────────────────────────
+# Final gate is the MAX of all enabled criteria (most stringent wins).
+# Recommended: combine the per-image MAD-based gate (handles intensity scaling)
+# with an absolute gate value (handles autofluorescence floor across the dataset).
+# The absolute_gate_value should be set from a negative control (Parental).
+gfp_classification:
+  bg_method: "outside_cells_median_mad"   # only option currently
+  mad_multiplier: 10.0                    # gate1 = bg_median + k * 1.4826 * MAD
+  absolute_gate_value: 350                # gate2 = this raw gray value (stable across images)
+  fold_over_bg: null                      # gate3 = bg_median * fold        (disabled unless set)
+  absolute_delta: null                    # gate4 = bg_median + delta       (disabled unless set)
+
+# ── Stage 5 — MT segmentation (Ridge Detection / Steger) ───────────
+mt:
+  # Ridge Detection plugin parameters (ij_ridge_detect-1.4.1)
+  # Operates on 8-bit tubulin masked to cell ROIs.
+  # NOTE: extend_line flag removed — it causes the plugin to hang on dense 2048² networks.
+  ridge_line_width_um: 0.27        # ~2.5 px at 0.1083 um/px
+  ridge_sigma: 1.0                 # derivative smoothing kernel
+  ridge_high_contrast: 230         # 0-255 (post 8-bit)
+  ridge_low_contrast: 30           # 0-255; above-background gate
+  ridge_lower_threshold: 3.0       # gradient magnitude lower
+  ridge_upper_threshold: 10.0      # gradient magnitude upper
+  ridge_min_line_length_um: 0.3    # drop sub-resolution speckles (~3 px)
+  # Complementary coverage metric (Tubeness + Triangle)
+  coverage_tubeness_sigma_um: 0.10
+  coverage_threshold_method: "Triangle"
+
+# ── Stage 6 — CLIP170 (lattice-binding variant; traced as filaments) ──
+# This CLIP170 variant decorates the MT lattice (not plus-end comets), so
+# we trace it as filaments using Ridge Detection (same approach as Stage 5
+# for MTs). Thresholds are more permissive than Stage 5 because lattice
+# decoration is typically dimmer than tubulin staining.
+clip170:
+  ridge_line_width_um: 0.27      # same expected filament width as MTs
+  ridge_sigma: 1.0
+  ridge_high_contrast: 200       # lower than Stage 5 (GFP signal is dimmer)
+  ridge_low_contrast: 15         # more permissive to catch dim lattice decoration
+  ridge_lower_threshold: 1.5     # lower than Stage 5 for sensitivity
+  ridge_upper_threshold: 6.0
+  ridge_min_line_length_um: 0.2  # shorter min (allow fragments of lattice trace)
+
+# ── Stage 7 — MT / CLIP170 co-localization ──────────────────────────
+coloc:
+  mt_dilation_um: 0.3            # dilation radius applied to MT mask before intersect
+
+# ── Runtime ─────────────────────────────────────────────────────────
+runtime:
+  stage_timeout_s: 300           # per-stage subprocess timeout (driver-side)
+  verbose: true

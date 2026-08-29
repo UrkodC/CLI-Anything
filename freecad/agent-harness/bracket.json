@@ -1,0 +1,429 @@
+{
+  "version": "1.0",
+  "name": "TriangularBracket",
+  "units": "mm",
+  "parts": [],
+  "sketches": [
+    {
+      "id": 0,
+      "name": "L_Profile",
+      "plane": "XZ",
+      "offset": 0.0,
+      "elements": [
+        {
+          "id": 0,
+          "type": "line",
+          "start": [
+            0.0,
+            0.0
+          ],
+          "end": [
+            32.0,
+            0.0
+          ]
+        },
+        {
+          "id": 1,
+          "type": "line",
+          "start": [
+            32.0,
+            0.0
+          ],
+          "end": [
+            32.0,
+            14.0
+          ]
+        },
+        {
+          "id": 2,
+          "type": "line",
+          "start": [
+            32.0,
+            14.0
+          ],
+          "end": [
+            10.0,
+            14.0
+          ]
+        },
+        {
+          "id": 3,
+          "type": "line",
+          "start": [
+            10.0,
+            14.0
+          ],
+          "end": [
+            10.0,
+            42.0
+          ]
+        },
+        {
+          "id": 4,
+          "type": "line",
+          "start": [
+            10.0,
+            42.0
+          ],
+          "end": [
+            0.0,
+            42.0
+          ]
+        },
+        {
+          "id": 5,
+          "type": "line",
+          "start": [
+            0.0,
+            42.0
+          ],
+          "end": [
+            0.0,
+            0.0
+          ]
+        }
+      ],
+      "constraints": [],
+      "closed": true
+    },
+    {
+      "id": 1,
+      "name": "LeftCut",
+      "plane": "YZ",
+      "offset": 0.0,
+      "elements": [
+        {
+          "id": 0,
+          "type": "line",
+          "start": [
+            -32.0,
+            0.0
+          ],
+          "end": [
+            -20.0,
+            42.0
+          ]
+        },
+        {
+          "id": 1,
+          "type": "line",
+          "start": [
+            -20.0,
+            42.0
+          ],
+          "end": [
+            -32.0,
+            42.0
+          ]
+        },
+        {
+          "id": 2,
+          "type": "line",
+          "start": [
+            -32.0,
+            42.0
+          ],
+          "end": [
+            -32.0,
+            0.0
+          ]
+        }
+      ],
+      "constraints": [],
+      "closed": true
+    },
+    {
+      "id": 2,
+      "name": "RightCut",
+      "plane": "YZ",
+      "offset": 0.0,
+      "elements": [
+        {
+          "id": 0,
+          "type": "line",
+          "start": [
+            32.0,
+            0.0
+          ],
+          "end": [
+            20.0,
+            42.0
+          ]
+        },
+        {
+          "id": 1,
+          "type": "line",
+          "start": [
+            20.0,
+            42.0
+          ],
+          "end": [
+            32.0,
+            42.0
+          ]
+        },
+        {
+          "id": 2,
+          "type": "line",
+          "start": [
+            32.0,
+            42.0
+          ],
+          "end": [
+            32.0,
+            0.0
+          ]
+        }
+      ],
+      "constraints": [],
+      "closed": true
+    },
+    {
+      "id": 3,
+      "name": "Rib1",
+      "plane": "XZ",
+      "offset": -7.5,
+      "elements": [
+        {
+          "id": 0,
+          "type": "line",
+          "start": [
+            10.0,
+            14.0
+          ],
+          "end": [
+            32.0,
+            14.0
+          ]
+        },
+        {
+          "id": 1,
+          "type": "line",
+          "start": [
+            32.0,
+            14.0
+          ],
+          "end": [
+            10.0,
+            28.0
+          ]
+        },
+        {
+          "id": 2,
+          "type": "line",
+          "start": [
+            10.0,
+            28.0
+          ],
+          "end": [
+            10.0,
+            14.0
+          ]
+        }
+      ],
+      "constraints": [],
+      "closed": true
+    },
+    {
+      "id": 4,
+      "name": "Rib2",
+      "plane": "XZ",
+      "offset": 2.5,
+      "elements": [
+        {
+          "id": 0,
+          "type": "line",
+          "start": [
+            10.0,
+            14.0
+          ],
+          "end": [
+            32.0,
+            14.0
+          ]
+        },
+        {
+          "id": 1,
+          "type": "line",
+          "start": [
+            32.0,
+            14.0
+          ],
+          "end": [
+            10.0,
+            28.0
+          ]
+        },
+        {
+          "id": 2,
+          "type": "line",
+          "start": [
+            10.0,
+            28.0
+          ],
+          "end": [
+            10.0,
+            14.0
+          ]
+        }
+      ],
+      "constraints": [],
+      "closed": true
+    },
+    {
+      "id": 5,
+      "name": "Boss",
+      "plane": "XY",
+      "offset": 42.0,
+      "elements": [
+        {
+          "id": 0,
+          "type": "circle",
+          "center": [
+            5.0,
+            0.0
+          ],
+          "radius": 7.5
+        }
+      ],
+      "constraints": [],
+      "closed": true
+    },
+    {
+      "id": 6,
+      "name": "MountingHoles",
+      "plane": "YZ",
+      "offset": 0.0,
+      "elements": [
+        {
+          "id": 0,
+          "type": "point",
+          "position": [
+            -22.0,
+            8.0
+          ]
+        },
+        {
+          "id": 1,
+          "type": "point",
+          "position": [
+            22.0,
+            8.0
+          ]
+        },
+        {
+          "id": 2,
+          "type": "point",
+          "position": [
+            0.0,
+            34.0
+          ]
+        }
+      ],
+      "constraints": [],
+      "closed": true
+    }
+  ],
+  "bodies": [
+    {
+      "id": 0,
+      "name": "Bracket",
+      "features": [
+        {
+          "id": 0,
+          "type": "pad",
+          "sketch_index": 0,
+          "sketch_name": "L_Profile",
+          "length": 64.0,
+          "symmetric": true,
+          "reversed": false
+        },
+        {
+          "id": 1,
+          "type": "pocket",
+          "sketch_index": 1,
+          "sketch_name": "LeftCut",
+          "length": 32.0,
+          "symmetric": false,
+          "reversed": false
+        },
+        {
+          "id": 2,
+          "type": "pocket",
+          "sketch_index": 2,
+          "sketch_name": "RightCut",
+          "length": 32.0,
+          "symmetric": false,
+          "reversed": false
+        },
+        {
+          "id": 3,
+          "type": "fillet",
+          "radius": 12.0,
+          "edges": "all"
+        },
+        {
+          "id": 4,
+          "type": "pad",
+          "sketch_index": 3,
+          "sketch_name": "Rib1",
+          "length": 5.0,
+          "symmetric": false,
+          "reversed": false
+        },
+        {
+          "id": 5,
+          "type": "pad",
+          "sketch_index": 4,
+          "sketch_name": "Rib2",
+          "length": 5.0,
+          "symmetric": false,
+          "reversed": false
+        },
+        {
+          "id": 6,
+          "type": "pad",
+          "sketch_index": 5,
+          "sketch_name": "Boss",
+          "length": 10.0,
+          "symmetric": false,
+          "reversed": false
+        },
+        {
+          "id": 7,
+          "type": "fillet",
+          "radius": 20.0,
+          "edges": "all"
+        },
+        {
+          "id": 8,
+          "type": "hole",
+          "sketch_index": 6,
+          "sketch_name": "MountingHoles",
+          "diameter": 10.0,
+          "depth": 10.0,
+          "threaded": false,
+          "thread_standard": "metric",
+          "tapered": false,
+          "taper_angle": null
+        }
+      ],
+      "base_sketch_index": 0
+    }
+  ],
+  "materials": [],
+  "assemblies": [],
+  "meshes": [],
+  "techdraw_pages": [],
+  "draft_objects": [],
+  "measurements": [],
+  "surfaces": [],
+  "fem_analyses": [],
+  "cam_jobs": [],
+  "spreadsheets": [],
+  "metadata": {
+    "created": "2026-03-31T21:44:37.986571",
+    "modified": "2026-03-31T21:44:37.986608",
+    "software": "cli-anything-freecad 1.0.0"
+  }
+}

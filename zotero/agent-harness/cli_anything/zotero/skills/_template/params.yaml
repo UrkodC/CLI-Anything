@@ -1,0 +1,31 @@
+# params.yaml — tunable parameters for the _template Zotero skill.
+
+fetch:
+  # Source of items. Set exactly one of these on the CLI (--collection / --search / --tag).
+  # Values listed here are defaults used when no CLI override is given.
+  collection: null          # collection name (string) or null
+  search: null              # saved-search key or null
+  tag: null                 # tag string or null
+  include_attachments: true
+  include_notes: true
+
+filter:
+  year_min: null            # e.g. 2018
+  year_max: null            # e.g. 2026
+  item_types:               # whitelist of Zotero item types; empty/null = all
+    - journalArticle
+    - preprint
+  tag_allow: []             # only keep items with at least one of these tags (empty = no constraint)
+  tag_deny: []              # drop items with any of these tags
+  dedupe_by: doi            # doi | title | none
+
+extract:
+  pull_abstract: true
+  pull_notes: true
+  pull_pdf_paths: true
+  pull_pmid: true           # resolve PMIDs via Extra field or DOI->PubMed lookup
+
+export:
+  csv: true
+  bibtex: false
+  markdown_summary: true

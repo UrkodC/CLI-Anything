@@ -1,0 +1,1 @@
+"""PyMOL CLI core modules."""
