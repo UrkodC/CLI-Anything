@@ -92,22 +92,6 @@ on run argv
 end run
 '''
 
-_DELETE_SCRIPT = f'''
-on run argv
-	tell application "{APP_NAME}"
-		repeat with p in argv
-			set pmid to contents of p
-			set ids to find pmid in field "Accession Number"
-			repeat with i from 1 to count of ids
-				set r to item i of ids
-				if (field "Accession Number" of record r) is pmid then delete record r
-			end repeat
-		end repeat
-	end tell
-	return "OK"
-end run
-'''
-
 
 def open_libraries() -> list[str] | None:
     """Names of the open libraries, or None when EndNote is not running."""
@@ -145,9 +129,3 @@ def lookup(pmids: list[str]) -> list[FoundRecord]:
 def import_xml(xml: str) -> None:
     """Import EndNote XML into the open library (document 1)."""
     run_applescript(_IMPORT_SCRIPT, args=[xml])
-
-
-def delete_pmids(pmids: list[str]) -> None:
-    """Delete records whose Accession Number equals one of `pmids`. For tests on the test library."""
-    if pmids:
-        run_applescript(_DELETE_SCRIPT, args=list(pmids))
