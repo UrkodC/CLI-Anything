@@ -25,7 +25,8 @@ PMIDS = ["17625570", "15033360", "41528114"]   # Soda 2007, Güthe 2004 (non-ASC
 _DELETE_SCRIPT = f'''
 on run argv
 	tell application "{endnote_backend.APP_NAME}"
-		repeat with p in argv
+		if (count of documents) is not 1 or name of document 1 is not (item 1 of argv) then error "endnote-cli: library changed" number 1001
+		repeat with p in rest of argv
 			set pmid to contents of p
 			set ids to find pmid in field "Accession Number"
 			repeat with i from 1 to count of ids
@@ -44,7 +45,7 @@ def _delete_test_records(pmids: list[str]) -> None:
     names = endnote_backend.open_libraries()
     if names != [TEST_LIBRARY]:
         raise RuntimeError(f"refusing to delete: open libraries are {names}, not [{TEST_LIBRARY!r}]")
-    endnote_backend.run_applescript(_DELETE_SCRIPT, args=list(pmids))
+    endnote_backend.run_applescript(_DELETE_SCRIPT, args=[TEST_LIBRARY, *pmids])
 
 
 def _exact(rows):
@@ -66,8 +67,8 @@ def test_library():
 def test_import_round_trip(test_library):
     records, missing = pubmed.fetch(PMIDS)
     assert missing == []
-    endnote_backend.import_xml(enxml.to_endnote_xml(records))
-    found = _exact(endnote_backend.lookup(PMIDS))
+    endnote_backend.import_xml(enxml.to_endnote_xml(records), TEST_LIBRARY)
+    found = _exact(endnote_backend.lookup(PMIDS, TEST_LIBRARY))
     assert set(found) == set(PMIDS)
     assert found["17625570"].citation.startswith("{Soda, 2007 #")
     assert found["15033360"].citation.startswith("{Güthe, 2004 #")

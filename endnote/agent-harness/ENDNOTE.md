@@ -33,4 +33,4 @@
 - macOS and EndNote 2025 only.
 - Markers in footnotes, endnotes, headers and comments are not processed.
 - PDFs are not attached.
-- An open dialog in EndNote blocks AppleScript. The CLI stops after 300 seconds with `endnote_timeout`.
+- An open dialog in EndNote blocks AppleScript. The CLI stops with `endnote_timeout`.

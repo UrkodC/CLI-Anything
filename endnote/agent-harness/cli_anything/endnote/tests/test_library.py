@@ -20,6 +20,7 @@ class FakeBackend:
         self.imports: list[str] = []
         self.import_drops: set[str] = set()
         self.next_number = 100
+        self.current = None  # name of the library EndNote has open right now; None means libraries[0]
 
     def open_libraries(self):
         return self.libraries
@@ -27,7 +28,13 @@ class FakeBackend:
     def record_count(self):
         return len(self.records)
 
-    def lookup(self, pmids):
+    def _check(self, library_name):
+        current = self.current if self.current is not None else (self.libraries or [None])[0]
+        if current != library_name:
+            raise CliError("library_changed", "The open EndNote library changed during the run.")
+
+    def lookup(self, pmids, library_name):
+        self._check(library_name)
         return [
             FoundRecord(q, num, acc, cite, title)
             for q in pmids
@@ -35,7 +42,8 @@ class FakeBackend:
             if q in acc
         ]
 
-    def import_xml(self, xml):
+    def import_xml(self, xml, library_name):
+        self._check(library_name)
         self.imports.append(xml)
         for pmid in re.findall(r"<accession-num><style[^>]*>(\d+)</style>", xml):
             if pmid in self.import_drops:
@@ -120,6 +128,19 @@ def test_imports_are_sent_in_chunks_of_25():
     report = library.add_pmids(pmids, backend=be, fetch=fake_fetch(set(pmids)))
     assert len(be.imports) == 2
     assert len(report.added) == 30
+
+
+def test_add_propagates_library_changed_and_imports_nothing_elsewhere():
+    be = FakeBackend()
+
+    def fetch(pmids):
+        be.current = "Other.enl"   # the user switched libraries during the PubMed fetch
+        return fake_fetch(set(pmids))(pmids)
+
+    with pytest.raises(CliError) as exc:
+        library.add_pmids(["17625570"], backend=be, fetch=fetch)
+    assert exc.value.code == "library_changed"
+    assert be.imports == [] and be.records == []
 
 
 def test_add_checks_the_library_before_anything_else():

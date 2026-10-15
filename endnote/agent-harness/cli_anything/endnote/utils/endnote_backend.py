@@ -44,6 +44,8 @@ def run_applescript(script: str, args: list[str] | None = None, timeout: int = 3
         ) from exc
     if proc.returncode != 0:
         err = proc.stderr.strip()
+        if "(-1712)" in err:
+            raise CliError("endnote_timeout", f"{APP_NAME} did not answer. Check for an open dialog in EndNote.")
         if "-1743" in err or "Not authorized" in err:
             raise CliError(
                 "automation_denied",
@@ -68,7 +70,8 @@ on run argv
 	set RS to character id 30
 	set out to {{}}
 	tell application "{APP_NAME}"
-		repeat with p in argv
+		if (count of documents) is not 1 or name of document 1 is not (item 1 of argv) then error "endnote-cli: library changed" number 1001
+		repeat with p in rest of argv
 			set pmid to contents of p
 			set ids to find pmid in field "Accession Number"
 			repeat with i from 1 to count of ids
@@ -87,7 +90,10 @@ end run
 
 _IMPORT_SCRIPT = f'''
 on run argv
-	tell application "{APP_NAME}" to import (item 1 of argv) into document 1
+	tell application "{APP_NAME}"
+		if (count of documents) is not 1 or name of document 1 is not (item 1 of argv) then error "endnote-cli: library changed" number 1001
+		import (item 2 of argv) into document 1
+	end tell
 	return "OK"
 end run
 '''
@@ -119,13 +125,34 @@ def parse_lookup_output(out: str) -> list[FoundRecord]:
     return rows
 
 
-def lookup(pmids: list[str]) -> list[FoundRecord]:
-    """Records whose Accession Number contains one of `pmids`. Includes substring hits."""
+def _library_changed(library: str) -> CliError:
+    return CliError(
+        "library_changed",
+        f"The open EndNote library changed during the run. Open only {library} and run the command again.",
+    )
+
+
+def lookup(pmids: list[str], library: str) -> list[FoundRecord]:
+    """Records whose Accession Number contains one of `pmids`. Includes substring hits.
+
+    Fails with library_changed unless `library` is still the only open library.
+    """
     if not pmids:
         return []
-    return parse_lookup_output(run_applescript(_LOOKUP_SCRIPT, args=list(pmids)))
+    try:
+        out = run_applescript(_LOOKUP_SCRIPT, args=[library, *pmids])
+    except CliError as err:
+        if err.code == "applescript_error" and "(1001)" in err.message:
+            raise _library_changed(library) from err
+        raise
+    return parse_lookup_output(out)
 
 
-def import_xml(xml: str) -> None:
-    """Import EndNote XML into the open library (document 1)."""
-    run_applescript(_IMPORT_SCRIPT, args=[xml])
+def import_xml(xml: str, library: str) -> None:
+    """Import EndNote XML into `library`, which must still be the only open library."""
+    try:
+        run_applescript(_IMPORT_SCRIPT, args=[library, xml])
+    except CliError as err:
+        if err.code == "applescript_error" and "(1001)" in err.message:
+            raise _library_changed(library) from err
+        raise

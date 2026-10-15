@@ -215,3 +215,17 @@ def test_real_document(tmp_path):
     assert visible_paragraphs(dst) == expected
     with zipfile.ZipFile(dst) as zf:
         assert zf.testzip() is None
+
+
+def test_link_docx_refuses_to_overwrite_its_own_input(tmp_path):
+    src = make_docx(tmp_path / "grant.docx", "<w:p><w:r><w:t>[PMID 1]</w:t></w:r></w:p>")
+    before = src.read_bytes()
+    with pytest.raises(CliError) as exc:
+        word_link.link_docx(src, src, {"1": "{A, 2000 #1}"})
+    assert exc.value.code == "output_is_input"
+    alias = tmp_path / "alias.docx"
+    os.link(src, alias)
+    with pytest.raises(CliError) as exc:
+        word_link.link_docx(src, alias, {"1": "{A, 2000 #1}"})
+    assert exc.value.code == "output_is_input"
+    assert src.read_bytes() == before

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -147,6 +148,28 @@ def test_link_output_cannot_be_the_input(tmp_path):
     result = run("--json", "link", str(src), "--output", str(src), "--overwrite")
     assert result.exit_code == 1
     assert json.loads(result.output)["code"] == "output_is_input"
+
+
+def test_link_output_differing_only_in_case_is_the_input(monkeypatch, tmp_path):
+    src = make_docx(tmp_path / "grant.docx", BODY)
+    if not Path(str(src).upper()).exists():
+        pytest.skip("case-sensitive filesystem")
+    before = src.read_bytes()
+    monkeypatch.setattr(library, "add_pmids", lambda pmids: pytest.fail("EndNote must not be called"))
+    result = run("--json", "link", str(src), "--output", str(tmp_path / "GRANT.DOCX"), "--overwrite")
+    assert result.exit_code == 1
+    assert json.loads(result.output)["code"] == "output_is_input"
+    assert src.read_bytes() == before
+
+
+def test_link_output_folder_must_exist(monkeypatch, tmp_path):
+    src = make_docx(tmp_path / "grant.docx", BODY)
+    monkeypatch.setattr(library, "add_pmids", lambda pmids: pytest.fail("EndNote must not be called"))
+    result = run("--json", "link", str(src), "--output", str(tmp_path / "missing" / "x.docx"))
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert data["code"] == "bad_output"
+    assert data["error"] == f"The folder {tmp_path / 'missing'} does not exist."
 
 
 def test_link_without_markers_writes_nothing(monkeypatch, tmp_path):

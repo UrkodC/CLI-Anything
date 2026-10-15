@@ -7,7 +7,8 @@ import pytest
 PKG = Path(__file__).resolve().parents[1]
 REPO_SKILL = PKG.parents[3] / "skills" / "cli-anything-endnote" / "SKILL.md"
 CODES = ["endnote_missing", "no_library", "many_libraries", "automation_denied", "pubmed_error",
-         "output_exists", "output_is_input", "bad_docx", "no_pmids", "endnote_timeout", "applescript_error"]
+         "output_exists", "output_is_input", "bad_docx", "no_pmids", "endnote_timeout", "applescript_error",
+         "library_changed", "bad_output"]
 
 
 def test_packaged_skill_covers_every_command_and_error_code():

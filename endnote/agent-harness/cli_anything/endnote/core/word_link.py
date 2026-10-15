@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import re
 import zipfile
 from dataclasses import dataclass, field
@@ -228,6 +229,8 @@ def scan_docx(path: Path) -> ScanResult:
 
 def link_docx(src: Path, dst: Path, citations: dict[str, str]) -> LinkReport:
     src, dst = Path(src), Path(dst)
+    if dst.resolve() == src.resolve() or (dst.exists() and os.path.samefile(src, dst)):
+        raise CliError("output_is_input", "The output file must be different from the input file.")
     root = _read_document(src)
     report = LinkReport(has_tracked_changes=_has_tracked_changes(root))
     for p in list(root.iter(_w("p"))):

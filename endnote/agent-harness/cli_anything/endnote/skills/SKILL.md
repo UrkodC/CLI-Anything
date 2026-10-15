@@ -14,6 +14,7 @@ EndNote by PMID.
 ## Before you run it
 
 - EndNote 2025 must be open with exactly one library: the library for this project.
+- Run `cli-anything-endnote status` and confirm the library name with the user before `add` or `link`, unless the user already named the library.
 - The first run makes macOS ask for permission to control EndNote. The user must click OK.
 
 ## Commands
@@ -34,6 +35,8 @@ With no command, the tool starts an interactive shell.
 
 Write markers as `[PMID 12345678]` or `[PMID 12345678; 23456789]`. Also accepted:
 `[PMID: 1]`, `[PMIDs 1; 2]`, `[pmid 1, 2]`. Highlight is optional.
+
+Markers in footnotes, endnotes, headers and comments are not processed.
 
 `link` replaces each marker with EndNote's own temporary citation, for example
 `{Soda, 2007 #18; Siegel, 2026 #2}`, adds missing papers to the library first, and leaves
@@ -70,5 +73,7 @@ changes, accept them first.
 | `pubmed_error` | Network problem. Try again later. |
 | `output_exists` | Use `--overwrite` or `--output`. |
 | `output_is_input` | Choose a different `--output`. |
+| `bad_output` | The folder for `--output` does not exist. Choose an existing folder. |
+| `library_changed` | The open library changed during the run. Ask the user to keep only the project library open, then run again. |
 | `bad_docx` | The file is not a .docx. |
 | `no_pmids` | Give PMIDs or `--file`. |

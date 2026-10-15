@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -172,10 +173,12 @@ def link(ctx: click.Context, docx: Path, output: Path | None, overwrite: bool) -
     try:
         if not src.is_file():
             raise CliError("bad_docx", f"{src} is not a Word .docx file.")
-        if dst.resolve() == src.resolve():
+        if dst.resolve() == src.resolve() or (dst.exists() and os.path.samefile(src, dst)):
             raise CliError("output_is_input", "The output file must be different from the input file.")
         if dst.exists() and not overwrite:
             raise CliError("output_exists", f"{dst} exists. Use --overwrite to replace it.")
+        if not dst.parent.is_dir():
+            raise CliError("bad_output", f"The folder {dst.parent} does not exist.")
         scan = word_link.scan_docx(src)
         if not scan.markers:
             _emit(ctx, {"ok": True, "input": str(src), "output": None, "markers_found": 0},

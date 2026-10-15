@@ -59,9 +59,9 @@ def require_single_library(backend=endnote_backend) -> str:
     return names[0]
 
 
-def _lookup_exact(pmids: list[str], backend) -> tuple[dict[str, LibraryRecord | None], list[str]]:
+def _lookup_exact(pmids: list[str], library: str, backend) -> tuple[dict[str, LibraryRecord | None], list[str]]:
     hits: dict[str, list] = {p: [] for p in pmids}
-    for row in backend.lookup(pmids):
+    for row in backend.lookup(pmids, library):
         if row.query in hits and row.accession.strip() == row.query:
             hits[row.query].append(row)
     result: dict[str, LibraryRecord | None] = {}
@@ -80,13 +80,14 @@ def _lookup_exact(pmids: list[str], backend) -> tuple[dict[str, LibraryRecord | 
 
 
 def find_pmids(pmids: list[str], backend=endnote_backend) -> tuple[dict[str, LibraryRecord | None], list[str]]:
-    require_single_library(backend)
-    return _lookup_exact(pmids, backend)
+    name = require_single_library(backend)
+    return _lookup_exact(pmids, name, backend)
 
 
 def add_pmids(pmids: list[str], backend=endnote_backend, fetch=pubmed.fetch) -> AddReport:
-    report = AddReport(library=require_single_library(backend))
-    existing, warnings = _lookup_exact(pmids, backend)
+    name = require_single_library(backend)
+    report = AddReport(library=name)
+    existing, warnings = _lookup_exact(pmids, name, backend)
     report.warnings.extend(warnings)
     report.skipped = [existing[p] for p in pmids if existing[p] is not None]
     missing = [p for p in pmids if existing[p] is None]
@@ -95,9 +96,9 @@ def add_pmids(pmids: list[str], backend=endnote_backend, fetch=pubmed.fetch) -> 
     records, not_found = fetch(missing)
     report.failed.extend({"pmid": p, "reason": "not found on PubMed"} for p in not_found)
     for i in range(0, len(records), IMPORT_CHUNK):
-        backend.import_xml(enxml.to_endnote_xml(records[i:i + IMPORT_CHUNK]))
+        backend.import_xml(enxml.to_endnote_xml(records[i:i + IMPORT_CHUNK]), name)
     imported = [r["pmid"] for r in records]
-    after, warnings = _lookup_exact(imported, backend)
+    after, warnings = _lookup_exact(imported, name, backend)
     report.warnings.extend(warnings)
     for pmid in imported:
         if after[pmid] is None:

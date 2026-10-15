@@ -29,7 +29,7 @@ def test_parse_lookup_output_rejects_unknown_record_id():
 
 def test_lookup_with_no_pmids_does_not_call_endnote(monkeypatch):
     monkeypatch.setattr(backend, "run_applescript", lambda *a, **k: pytest.fail("no call expected"))
-    assert backend.lookup([]) == []
+    assert backend.lookup([], "Test.enl") == []
 
 
 def test_missing_app_raises_endnote_missing(monkeypatch, tmp_path):
@@ -92,11 +92,43 @@ def test_arguments_and_unicode_are_passed_to_osascript(monkeypatch, tmp_path):
     assert seen["kwargs"]["input"] == "return 1"
 
 
-def test_import_sends_xml_as_one_argument(monkeypatch):
+def test_import_sends_library_then_xml(monkeypatch):
     sent = []
     monkeypatch.setattr(backend, "run_applescript", lambda script, args=None, timeout=300: sent.append(args) or "OK")
-    backend.import_xml("<xml/>")
-    assert sent == [["<xml/>"]]
+    backend.import_xml("<xml/>", "Test.enl")
+    assert sent == [["Test.enl", "<xml/>"]]
+
+
+def test_lookup_sends_library_first(monkeypatch):
+    sent = []
+    monkeypatch.setattr(backend, "run_applescript", lambda script, args=None, timeout=300: sent.append(args) or "")
+    assert backend.lookup(["1", "2"], "Test.enl") == []
+    assert sent == [["Test.enl", "1", "2"]]
+
+
+@pytest.mark.parametrize("call", [lambda: backend.lookup(["1"], "Test.enl"), lambda: backend.import_xml("<x/>", "Test.enl")])
+def test_library_changed_error_is_recognised(monkeypatch, tmp_path, call):
+    monkeypatch.setattr(backend, "APP_PATH", tmp_path)
+    monkeypatch.setattr(
+        backend.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "execution error: endnote-cli: library changed (1001)"),
+    )
+    with pytest.raises(CliError) as exc:
+        call()
+    assert exc.value.code == "library_changed"
+    assert exc.value.message == "The open EndNote library changed during the run. Open only Test.enl and run the command again."
+
+
+def test_apple_event_timeout_is_endnote_timeout(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "APP_PATH", tmp_path)
+    monkeypatch.setattr(
+        backend.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "execution error: EndNote 2025 got an error: AppleEvent timed out. (-1712)"),
+    )
+    with pytest.raises(CliError) as exc:
+        backend.run_applescript("return 1")
+    assert exc.value.code == "endnote_timeout"
+    assert exc.value.message == "EndNote 2025 did not answer. Check for an open dialog in EndNote."
 
 
 def test_open_libraries_parses_names(monkeypatch):
