@@ -55,6 +55,7 @@
 !/audacity/
 !/libreoffice/
 !/zotero/
+!/endnote/
 !/mubu/
 !/obs-studio/
 !/nslogger/
@@ -120,6 +121,8 @@
 /libreoffice/.*
 /zotero/*
 /zotero/.*
+/endnote/*
+/endnote/.*
 /mubu/*
 /mubu/.*
 /obs-studio/*
@@ -234,6 +237,7 @@
 !/wavetone/agent-harness/
 !/libreoffice/agent-harness/
 !/zotero/agent-harness/
+!/endnote/agent-harness/
 !/mubu/agent-harness/
 !/obs-studio/agent-harness/
 !/nslogger/agent-harness/
