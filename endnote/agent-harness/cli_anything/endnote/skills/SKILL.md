@@ -53,7 +53,9 @@ changes, accept them first.
 - `find`: `{"ok", "records": {pmid: record or null}, "warnings"}`
 - `link`: `{"ok", "library", "input", "output", "markers_found", "markers_linked",
   "markers_left", "pmids_added", "pmids_already_in_library", "failed", "warnings"}`
+- `link` with no markers in the file: only `{"ok", "input", "output": null, "markers_found": 0}`, and no file is written.
 - Errors: `{"ok": false, "error", "code"}` with exit code 1.
+- Exit code 1 can also come with `"ok": true`: `add` when every PMID failed, and `link` when no PMID could be added (then `"output"` is null and no file is written). Always check `failed` and `output`, not only `ok`.
 
 ## Error codes
 
