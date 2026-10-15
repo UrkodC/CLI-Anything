@@ -20,7 +20,20 @@ See `../README.md`, section Tests. Switches: `PUBMED_NETWORK=1`, `ENDNOTE_E2E=1`
 
 ## Manual Word check
 
-Pending: Urko opens ~/EndNoteCLI_Test_demo_LINKED.docx in Word and clicks Update Citations and Bibliography.
+2026-10-15, done by Urko on macOS with Microsoft Word and EndNote 2025, with only `EndNoteCLI_Test.enl` open.
+Input: `~/EndNoteCLI_Test_demo_LINKED.docx`, made by `cli-anything-endnote link`, with the text
+`Lung cancer deaths {Siegel, 2026 #13}. EML4-ALK {Soda, 2007 #14; Güthe, 2004 #15}.`
+After EndNote > Update Citations and Bibliography, Word showed:
+
+```
+Lung cancer deaths (1). EML4-ALK (2, 3).
+
+1. R. L. Siegel, T. B. Kratzer, N. S. Wagle, H. Sung, A. Jemal, Cancer statistics, 2026. CA Cancer J Clin 76, e70043 (2026).
+2. M. Soda et al., Identification of the transforming EML4-ALK fusion gene in non-small-cell lung cancer. Nature 448, 561–566 (2007).
+3. S. Güthe et al., Very fast folding and association of a trimerization domain from bacteriophage T4 fibritin. J Mol Biol 337, 905–915 (2004).
+```
+
+Result: PASS. All temporary citations became live EndNote citations, and the bibliography lists the 3 papers imported by the CLI.
 
 ## Last full run
 
