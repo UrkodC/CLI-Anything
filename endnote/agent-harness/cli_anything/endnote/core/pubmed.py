@@ -1,6 +1,7 @@
 """Fetch PubMed records by PMID (NCBI E-utilities) and turn them into plain dicts."""
 from __future__ import annotations
 
+import http.client
 import os
 import re
 import time
@@ -119,7 +120,7 @@ def _efetch(pmids: list[str]) -> bytes:
             last_error = exc
             if exc.code not in (429, 500, 502, 503, 504):
                 break
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
             last_error = exc
         time.sleep(1 + attempt)
     raise CliError("pubmed_error", NETWORK_MESSAGE) from last_error

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import urllib.error
 from pathlib import Path
 
@@ -95,6 +96,39 @@ def test_network_error_raises_pubmed_error(monkeypatch):
         pubmed.fetch(["17625570"])
     assert exc.value.code == "pubmed_error"
     assert exc.value.message == "PubMed did not answer. Check the network and run the command again."
+
+
+@pytest.mark.parametrize("failure", [ConnectionResetError("reset"), http.client.IncompleteRead(b"")])
+def test_dropped_connection_while_reading_raises_pubmed_error(monkeypatch, failure):
+    monkeypatch.setattr(pubmed.time, "sleep", lambda s: None)
+
+    class Broken:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            raise failure
+
+    monkeypatch.setattr(pubmed.urllib.request, "urlopen", lambda *a, **k: Broken())
+    with pytest.raises(CliError) as exc:
+        pubmed.fetch(["17625570"])
+    assert exc.value.code == "pubmed_error"
+    assert exc.value.message == "PubMed did not answer. Check the network and run the command again."
+
+
+def test_connection_reset_on_open_raises_pubmed_error(monkeypatch):
+    monkeypatch.setattr(pubmed.time, "sleep", lambda s: None)
+
+    def reset(*args, **kwargs):
+        raise ConnectionResetError("reset")
+
+    monkeypatch.setattr(pubmed.urllib.request, "urlopen", reset)
+    with pytest.raises(CliError) as exc:
+        pubmed.fetch(["17625570"])
+    assert exc.value.code == "pubmed_error"
 
 
 @pytest.mark.network
