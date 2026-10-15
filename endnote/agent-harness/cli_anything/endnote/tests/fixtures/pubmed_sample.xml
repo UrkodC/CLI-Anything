@@ -1,0 +1,75 @@
+<?xml version="1.0" ?>
+<!DOCTYPE PubmedArticleSet PUBLIC "-//NLM//DTD PubMedArticle, 1st January 2025//EN" "https://dtd.nlm.nih.gov/ncbi/pubmed/out/pubmed_250101.dtd">
+<PubmedArticleSet>
+<PubmedArticle>
+  <MedlineCitation Status="MEDLINE" Owner="NLM">
+    <PMID Version="1">17625570</PMID>
+    <Article PubModel="Print-Electronic">
+      <Journal>
+        <JournalIssue CitedMedium="Internet">
+          <Volume>448</Volume>
+          <Issue>7153</Issue>
+          <PubDate><Year>2007</Year><Month>Aug</Month><Day>02</Day></PubDate>
+        </JournalIssue>
+        <Title>Nature</Title>
+        <ISOAbbreviation>Nature</ISOAbbreviation>
+      </Journal>
+      <ArticleTitle>Identification of the transforming <i>EML4-ALK</i> fusion gene in non-small-cell lung cancer.</ArticleTitle>
+      <Pagination><StartPage>561</StartPage><EndPage>566</EndPage><MedlinePgn>561-6</MedlinePgn></Pagination>
+      <ELocationID EIdType="doi" ValidYN="Y">10.1038/nature05945</ELocationID>
+      <Abstract><AbstractText>Improvement in the clinical outcome of lung cancer is likely to be achieved by identification of the molecular events that underlie its pathogenesis.</AbstractText></Abstract>
+      <AuthorList CompleteYN="Y">
+        <Author ValidYN="Y"><LastName>Soda</LastName><ForeName>Manabu</ForeName><Initials>M</Initials></Author>
+        <Author ValidYN="Y"><LastName>Choi</LastName><ForeName>Young Lim</ForeName><Initials>YL</Initials></Author>
+      </AuthorList>
+    </Article>
+    <MedlineJournalInfo><MedlineTA>Nature</MedlineTA></MedlineJournalInfo>
+    <MeshHeadingList>
+      <MeshHeading><DescriptorName UI="D002289" MajorTopicYN="N">Carcinoma, Non-Small-Cell Lung</DescriptorName></MeshHeading>
+      <MeshHeading><DescriptorName UI="D015514" MajorTopicYN="N">Oncogene Proteins, Fusion</DescriptorName></MeshHeading>
+    </MeshHeadingList>
+  </MedlineCitation>
+  <PubmedData>
+    <ArticleIdList>
+      <ArticleId IdType="pubmed">17625570</ArticleId>
+      <ArticleId IdType="doi">10.1038/nature05945</ArticleId>
+    </ArticleIdList>
+  </PubmedData>
+</PubmedArticle>
+<PubmedArticle>
+  <MedlineCitation Status="MEDLINE" Owner="NLM">
+    <PMID Version="1">15033360</PMID>
+    <Article PubModel="Print">
+      <Journal>
+        <JournalIssue CitedMedium="Print">
+          <Volume>337</Volume>
+          <Issue>4</Issue>
+          <PubDate><MedlineDate>2004 Apr-May</MedlineDate></PubDate>
+        </JournalIssue>
+        <Title>Journal of molecular biology</Title>
+        <ISOAbbreviation>J Mol Biol</ISOAbbreviation>
+      </Journal>
+      <ArticleTitle>Very fast folding and association of a trimerization domain from bacteriophage T4 fibritin.</ArticleTitle>
+      <Pagination><MedlinePgn>905-15</MedlinePgn></Pagination>
+      <Abstract>
+        <AbstractText Label="BACKGROUND">First part.</AbstractText>
+        <AbstractText Label="RESULTS">Second part with α-helix.</AbstractText>
+      </Abstract>
+      <AuthorList CompleteYN="Y">
+        <Author ValidYN="Y"><LastName>Güthe</LastName><ForeName>Sarah</ForeName><Initials>S</Initials></Author>
+        <Author ValidYN="Y"><CollectiveName>Example Consortium</CollectiveName></Author>
+      </AuthorList>
+    </Article>
+    <MedlineJournalInfo><MedlineTA>J Mol Biol</MedlineTA></MedlineJournalInfo>
+  </MedlineCitation>
+  <PubmedData>
+    <ArticleIdList>
+      <ArticleId IdType="pubmed">15033360</ArticleId>
+      <ArticleId IdType="pmc">PMC1234567</ArticleId>
+    </ArticleIdList>
+  </PubmedData>
+</PubmedArticle>
+<PubmedBookArticle>
+  <BookDocument><PMID Version="1">20301295</PMID></BookDocument>
+</PubmedBookArticle>
+</PubmedArticleSet>
