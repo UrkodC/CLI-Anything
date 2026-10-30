@@ -7,7 +7,9 @@ from click.testing import CliRunner
 
 from cli_anything.snapgene.core import seqtools
 from cli_anything.snapgene.snapgene_cli import cli
-from cli_anything.snapgene.tests._helpers import TEST_GENE, filler, takara_vector, write_snapgene
+from cli_anything.snapgene.tests._helpers import (
+    ATTB1, TEST_GENE, destination_vector, entry_clone, filler, takara_vector, write_snapgene,
+)
 
 CDS = "ATGAAACCCTAA"
 SEQ = CDS + "GAATTCGG" + seqtools.revcomp("ATGGGGTAG") + "AAAA"
@@ -161,6 +163,31 @@ def test_infusion_will_not_overwrite(vector, insert, tmp_path):
 def test_infusion_needs_an_insert(vector):
     _, data = run("infusion", vector, "--at", 400, "--json")
     assert data["code"] == "bad_request"
+
+
+def test_gateway_json(tmp_path):
+    entry = entry_clone(tmp_path / "pENTR-gene.dna")
+    dest = destination_vector(tmp_path / "pDEST-x.dna")
+    out = tmp_path / "expression.gb"
+    _, data = run("gateway", dest, "--entry", entry, "-o", out, "--json")
+    assert data["ok"] is True
+    assert [s["name"] for s in data["att_sites"]] == ["attB1", "attB2"]
+    assert data["att_sites"][0]["sequence"] == ATTB1
+    assert data["insert"]["length"] == len(TEST_GENE)
+    assert "ccdB" in data["destination"]["cassette_features"]
+    written = out.read_text()
+    assert written.startswith("LOCUS") and "attB1" in written and "ccdB" not in written
+    assert data["product"]["output"] == str(out)
+
+
+def test_gateway_human_and_errors(tmp_path, vector):
+    entry = entry_clone(tmp_path / "pENTR-gene.dna")
+    dest = destination_vector(tmp_path / "pDEST-x.dna")
+    result, _ = run("gateway", dest, "--entry", entry, "--no-product")
+    assert result.exit_code == 0
+    assert "attB1" in result.output and "no file written" in result.output
+    _, data = run("gateway", vector, "--entry", entry, "--json")
+    assert data["code"] == "no_att"
 
 
 def test_gblock_json(insert, tmp_path):

@@ -62,9 +62,14 @@ def take_arc(sg: SnapGeneFile, start: int, length: int, flip: bool = False,
     return Piece(bases, coords, sg, flip, label, label_type)
 
 
-def literal(sequence: str, label: str | None = None, label_type: str = "misc_feature") -> Piece:
-    """A piece of new bases that came from nowhere, for example a primer tail."""
-    return Piece(sequence.upper(), [], None, False, label, label_type)
+def literal(sequence: str, label: str | None = None, label_type: str = "misc_feature",
+            flipped: bool = False) -> Piece:
+    """A piece of new bases that came from nowhere, for example a primer tail.
+
+    `flipped` only says which strand the label goes on, because new bases have
+    no source file to be read backwards from.
+    """
+    return Piece(sequence.upper(), [], None, flipped, label, label_type)
 
 
 def _segment_positions(seg: Segment, n: int) -> list[int]:

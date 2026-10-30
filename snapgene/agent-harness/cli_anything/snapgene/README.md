@@ -6,8 +6,8 @@ CDS features, exports GenBank or FASTA, aligns sequences with SnapGene's own ali
 searches folders of plasmids, and opens files in the SnapGene app.
 
 It also does the work SnapGene keeps behind a paid licence: cut a plasmid, design
-Takara In-Fusion primers, build the product plasmid, check a fragment before you order
-it as synthetic DNA, edit a sequence, and add features. Those commands write GenBank,
+Takara In-Fusion primers, run a Gateway LR reaction, build the product plasmid, check a
+fragment before you order it as synthetic DNA, edit a sequence, and add features. Those commands write GenBank,
 which the free SnapGene Viewer opens and draws as a map.
 
 ## What it uses from SnapGene
@@ -34,6 +34,11 @@ a web page and cannot be called from a terminal, so this tool follows the printe
 its arithmetic is checked against all six primers printed in Figure 3. Tm comes from
 Primer3 (SantaLucia 1998, 50 mM Na+, 50 nM primer), so it can differ from SnapGene's
 number by about a degree. Synthesis limits are IDT's published gBlocks limits.
+
+Gateway LR works out each attB site from the entry clone's attL and the destination
+vector's attR, by finding the core the two sites share instead of using a fixed offset.
+It gives SnapGene's own attB1 and attB2 for all 74 of the bundled destination vectors
+that carry attR1 and attR2.
 
 ## Install
 
@@ -97,6 +102,10 @@ cli-anything-snapgene infusion pENTR1A.dna --remove 500-1200 --insert insert.dna
 # Gibson or HiFi assembly: the same command with a longer overlap
 cli-anything-snapgene infusion vector.dna --at 100 --insert gene.dna --overlap 25
 
+# Gateway LR: put an entry clone into a destination vector
+cli-anything-snapgene gateway pcDNA-DEST40.dna --entry pENTR1A-FKBP-GFP-CterLTK.dna \
+    --name FKBP-GFP-CterLTK -o pcDNA40-FKBP-GFP-CterLTK.gb
+
 # Check a fragment against IDT's gBlocks limits, and write the FASTA to order
 cli-anything-snapgene gblock plasmid.dna --feature mCherry -o order.fasta
 
@@ -135,7 +144,14 @@ cuts in half is left out of the product and named.
 The product keeps the vector's own numbering: base 1 of the vector stays base 1 of the
 product, so the map is not renumbered.
 
-`edit` and `infusion` never touch the input file.
+`gateway` runs the LR reaction on paper. It takes the part between attL1 and attL2 of
+the entry clone, drops the ccdB cassette between attR1 and attR2 of the destination
+vector, and writes the expression clone with a real attB1 and attB2 at the joins. It
+reports any tag next to the insert and whether the insert is in frame with it. Both
+files must be `.dna`: the CLI reads SnapGene files and writes GenBank, not the other
+way round.
+
+`edit`, `infusion` and `gateway` never touch the input files.
 
 ### Errors
 
@@ -166,7 +182,9 @@ SNAPGENE_GUI=1 ~/.venvs/cli-anything-snapgene/bin/pytest snapgene/agent-harness/
   free SnapGene Viewer open.
 - Alignment (`.dnaln`), gel, trace and collection files as input.
 - Rendering maps (SnapGene draws maps only in its window). No `preview` command.
-- Gateway BP and LR, Golden Gate, and ligating a cut insert into a cut vector.
+- Reading GenBank or FASTA back in. Input is always a SnapGene file.
+- Gateway BP, MultiSite Gateway with more than one insert, Golden Gate, and ligating a
+  cut insert into a cut vector.
 - Primers for sequencing a long region (one `pcr` call designs one pair) and qPCR
   specific checks such as exon junction or probe design.
 - Multi-fragment assembly (one insert at a time).

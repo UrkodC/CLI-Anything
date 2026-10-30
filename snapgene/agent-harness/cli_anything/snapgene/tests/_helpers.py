@@ -6,6 +6,8 @@ import struct
 from pathlib import Path
 from xml.sax.saxutils import escape, quoteattr
 
+from cli_anything.snapgene.core.seqtools import revcomp
+
 # The bases printed around the cut sites in Figure 3 of Takara's In-Fusion HD
 # manual (PT5165-1), so the tool's primers can be checked against Takara's own.
 TAKARA_MCS = "ATACATTATACGAAGTTATCAGTCGACGGTACCGGACATATGCCCGGGAATTCCTGCAGGATCCGCT"
@@ -18,6 +20,21 @@ TEST_GENE = (
     "CTCCCCTTCGCCTTCGACATCCTGGCTACCAGCTTCATGTACGGCAGCAAAACCTTCATCAACCACACCCAGGGCATCCCC"
     "GACTTCTTTAAGCAGTCCTTCCCTGAGGGCTTCACATGGGAGAGAGTCACCTAA"
 )
+
+
+# The Gateway att sites exactly as SnapGene annotates them in the plasmids it
+# ships, each read 5' to 3' along its own strand. ATTB1 and ATTB2 are what an
+# LR reaction has to produce, so they are the answer the tests check against.
+ATTL1 = ("CAAATAATGATTTTATTTTGACTGATAGTGACCTGTTCGTTGCAACAAATTGATGAGCAATGCTTTTTT"
+         "ATAATGCCAACTTTGTACAAAAAAGCAGGCT")
+ATTL2 = ("CAAATAATGATTTTATTTTGACTGATAGTGACCTGTTCGTTGCAACAAATTGATAAGCAATGCTTTCTT"
+         "ATAATGCCAACTTTGTACAAGAAAGCTGGGT")
+ATTR1 = ("ACAAGTTTGTACAAAAAAGCTGAACGAGAAACGTAAAATGATATAAATATCAATATATTAAATTAGATT"
+         "TTGCATAAAAAACAGACTACATAATACTGTAAAACACAACATATCCAGTCACTATG")
+ATTR2 = ("ACCACTTTGTACAAGAAAGCTGAACGAGAAACGTAAAATGATATAAATATCAATATATTAAATTAGATT"
+         "TTGCATAAAAAACAGACTACATAATACTGTAAAACACAACATATCCAGTCACTATG")
+ATTB1 = "ACAAGTTTGTACAAAAAAGCAGGCT"
+ATTB2 = "ACCACTTTGTACAAGAAAGCTGGGT"
 
 SEQ_TYPE = {"dna": 1, "protein": 2, "rna": 7}
 SEQ_PACKET = {"dna": 0x00, "protein": 0x15, "rna": 0x20}
@@ -105,6 +122,58 @@ def filler(size: int, seed: int = 0) -> str:
         out = "".join(rng.choice("ACGT") for _ in range(size))
         if not any(site in out for site in TEST_SITES):
             return out
+
+
+def entry_clone(path: Path, insert: str = TEST_GENE, name: str = "gene",
+                backwards: bool = False) -> Path:
+    """A pENTR-style entry clone: attL1, the insert, then attL2 facing back.
+
+    With `backwards` the same plasmid is drawn the other way round, so attL2
+    is the site on the plus strand. The insert must still come out forwards.
+    """
+    head, tail = filler(300, 41), filler(400, 42)
+    first, second = (ATTL1, ATTL2) if not backwards else (ATTL2, ATTL1)
+    middle = insert if not backwards else revcomp(insert)
+    sequence = head + first + middle + revcomp(second) + tail
+    a = (len(head) + 1, len(head) + len(first))
+    b = (a[1] + 1, a[1] + len(middle))
+    c = (b[1] + 1, b[1] + len(second))
+    features = [
+        {"name": "attL1" if not backwards else "attL2", "type": "protein_bind",
+         "strand": "+", "segments": [a]},
+        {"name": name, "type": "CDS", "strand": "+" if not backwards else "-", "segments": [b]},
+        {"name": "attL2" if not backwards else "attL1", "type": "protein_bind",
+         "strand": "-", "segments": [c]},
+    ]
+    return write_snapgene(path, sequence, circular=True, features=features)
+
+
+def destination_vector(path: Path, cassette_named: bool = True, spacer: str = "GC") -> Path:
+    """A pDEST-style vector: a tag, attR1, the ccdB cassette, attR2, a tag.
+
+    The spacer on each side is two bases, so with the 25 bp attB site between
+    them both tags end up in frame with the insert.
+    """
+    head, tail = filler(200, 51), filler(500, 56)
+    ntag = "ATG" + filler(60, 53)
+    cassette = filler(330, 54)
+    ctag = filler(45, 55) + "TAA"
+    sequence = (head + ntag + spacer + ATTR1 + cassette + revcomp(ATTR2)
+                + spacer + ctag + tail)
+    n = (len(head) + 1, len(head) + len(ntag))
+    r1 = (n[1] + len(spacer) + 1, n[1] + len(spacer) + len(ATTR1))
+    cas = (r1[1] + 1, r1[1] + len(cassette))
+    r2 = (cas[1] + 1, cas[1] + len(ATTR2))
+    c = (r2[1] + len(spacer) + 1, r2[1] + len(spacer) + len(ctag))
+    features = [
+        {"name": "N tag", "type": "CDS", "strand": "+", "segments": [n]},
+        {"name": "attR1", "type": "protein_bind", "strand": "+", "segments": [r1]},
+        {"name": "ccdB" if cassette_named else "stuffer", "type": "CDS", "strand": "+",
+         "segments": [(cas[0] + 30, cas[1] - 30)]},
+        {"name": "attR2", "type": "protein_bind", "strand": "-", "segments": [r2]},
+        {"name": "C tag", "type": "CDS", "strand": "+", "segments": [c]},
+    ]
+    return write_snapgene(path, sequence, circular=True, features=features)
 
 
 def takara_vector(path: Path, features: list[dict] | None = None) -> Path:

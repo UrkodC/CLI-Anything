@@ -5,9 +5,9 @@ description: >-
   features, primers, sequence ranges, translation, ORFs, restriction sites, motif search.
   Exports GenBank or FASTA, aligns sequences with SnapGene's bundled Clustal Omega or
   MUSCLE, searches folders of plasmids, and opens files in the SnapGene app. Also clones:
-  cuts a plasmid with enzymes, designs Takara In-Fusion (or Gibson/HiFi) primers, builds
-  the product plasmid, checks a fragment against IDT gBlocks limits, edits a sequence and
-  adds features.
+  cuts a plasmid with enzymes, designs Takara In-Fusion (or Gibson/HiFi) primers, runs a
+  Gateway LR reaction, builds the product plasmid, checks a fragment against IDT gBlocks
+  limits, edits a sequence and adds features.
 ---
 
 # cli-anything-snapgene
@@ -16,7 +16,8 @@ Use this tool when the user asks about a SnapGene file (`.dna`, `.rna`, `.prot`)
 in a plasmid, where a feature or site is, the protein a CDS makes, which plasmid in a folder
 has a given insert, or when a GenBank/FASTA copy is needed for another tool.
 
-Use it as well when the user wants to clone something (In-Fusion, Gibson or HiFi), design
+Use it as well when the user wants to clone something (In-Fusion, Gibson, HiFi or
+Gateway LR), design
 the primers for it, order a gene fragment, or change a sequence. The paid SnapGene cloning
 tools are not needed: these commands write GenBank, which the free SnapGene Viewer draws.
 
@@ -54,6 +55,8 @@ cli-anything-snapgene infusion VECTOR.dna (--enzyme E [--enzyme E2] | --at N | -
     [--insert-name NAME] [--insert-revcomp] [--overlap 15] [--no-restore-sites] \
     [--keep larger|smaller] \
     [-o PRODUCT.gb] [--fragment-out ORDER.fasta] [--no-product] [--overwrite]
+cli-anything-snapgene gateway DESTINATION.dna --entry ENTRY.dna [--name NAME] \
+    [-o PRODUCT.gb] [--no-product] [--overwrite]
 cli-anything-snapgene gblock FILE.dna [--feature NAME | --range A-B] [--flank5 S] [--flank3 S] [-o F.fasta]
 cli-anything-snapgene edit FILE.dna (--at N --sequence BASES | --range A-B [--sequence BASES] \
     | --feature NAME [--sequence BASES]) [--label NAME] [-o OUT.gb]
@@ -109,8 +112,19 @@ cli-anything-snapgene primer-check FILE.dna PRIMER_BASES
 - `pcr` designs plain PCR primers with Primer3 and keeps the target whole; the primers sit
   in the flanks, so the file needs sequence on both sides of the target. `pairs` comes back
   best first. `primer-check` tests a primer the user already has.
-- Not supported: Gateway BP/LR, Golden Gate, plain ligation, more than one insert at a
-  time, and qPCR or sequencing primer sets. Say so instead of improvising.
+- `gateway` runs an LR reaction: the part between attL1 and attL2 of the entry clone
+  replaces the ccdB cassette between attR1 and attR2 of the destination vector. Both
+  files must be `.dna` with those features annotated; `no_att` means they are missing,
+  and `att_mismatch` means the numbers do not pair (an attL1/attL2 entry clone cannot go
+  into an attR4/attR3 vector). Do not try to work around either error.
+- The attB sites `gateway` reports are computed from the two files, not copied from a
+  table. For att1 and att2 they come out as SnapGene's own attB1 and attB2.
+- `gateway` reports any CDS within 60 bp of the insert and whether the insert is in
+  frame with it. A V5 or His tag that is out of frame is the usual Gateway mistake, so
+  always pass that line on.
+- Not supported: Gateway BP, MultiSite Gateway with more than one insert, Golden Gate,
+  plain ligation, more than one insert at a time, and qPCR or sequencing primer sets.
+  Say so instead of improvising.
 
 ## Examples
 
@@ -134,4 +148,8 @@ cli-anything-snapgene infusion pUC19.dna --enzyme EcoRI --enzyme HindIII \
 # Swap a tag out of a plasmid, no enzyme needed
 cli-anything-snapgene infusion pENTR1A-GFP-CLIP170LTK.dna --remove 834-1550 \
     --insert mCherry.dna --json
+
+# Gateway LR: move an entry clone into a mammalian expression vector
+cli-anything-snapgene gateway pcDNA-DEST40.dna --entry pENTR1A-FKBP-GFP-CterLTK.dna \
+    --name FKBP-GFP-CterLTK -o pcDNA40-FKBP-GFP-CterLTK.gb --json
 ```

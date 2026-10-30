@@ -16,6 +16,7 @@ from cli_anything.snapgene.core import assemble as assemble_core
 from cli_anything.snapgene.core import convert, cutting, dnafile
 from cli_anything.snapgene.core import edit as edit_core
 from cli_anything.snapgene.core import enzymes as enzyme_core
+from cli_anything.snapgene.core import gateway as gateway_core
 from cli_anything.snapgene.core import gblock as gblock_core
 from cli_anything.snapgene.core import pcr as pcr_core
 from cli_anything.snapgene.core import infusion as infusion_core
@@ -36,6 +37,7 @@ REPL_COMMANDS = {
     "find FILE MOTIF": "Find a DNA motif (IUPAC) on both strands",
     "cut FILE --enzyme EcoRI [--enzyme XhoI]": "Cut with enzymes and show the ends",
     "infusion VECTOR --enzyme E --insert FILE": "In-Fusion primers and the product plasmid",
+    "gateway DEST --entry ENTRY": "Gateway LR: swap the ccdB cassette for your insert",
     "gblock FILE [--feature NAME] [--flank5 S]": "Check a fragment before you order it",
     "edit FILE --at N --sequence ACGT": "Put bases in, take them out, or swap them",
     "annotate FILE --name N --range A-B": "Add a feature",
@@ -561,6 +563,63 @@ def infusion_command(ctx: click.Context, vector: Path, names, at, remove, keep, 
     lines.append("")
     lines.append("All Takara and IDT checks passed." if not everything
                  else "\n".join(f"Check: {w}" for w in everything))
+    _emit(ctx, result, "\n".join(lines))
+
+
+@cli.command("gateway")
+@click.argument("destination", type=click.Path(path_type=Path))
+@click.option("--entry", required=True, type=click.Path(path_type=Path),
+              help="The entry clone, with attL1 and attL2 around the insert.")
+@click.option("--name", "insert_name", default=None, help="Name for the insert in the product.")
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
+              help="Where to write the expression clone as GenBank.")
+@click.option("--no-product", is_flag=True, help="Report the reaction only; write no file.")
+@click.option("--overwrite", is_flag=True, help="Replace the output file if it exists.")
+@json_option
+@click.pass_context
+def gateway_command(ctx: click.Context, destination: Path, entry: Path, insert_name,
+                    output, no_product, overwrite) -> None:
+    """Run a Gateway LR reaction: entry clone + destination vector.
+
+    The part between attL1 and attL2 of the entry clone replaces the ccdB
+    cassette between attR1 and attR2 of the destination vector, and each join
+    becomes an attB site. The product keeps the destination's numbering.
+    """
+    try:
+        dest_sg = dnafile.load(destination)
+        entry_sg = dnafile.load(entry)
+        name = insert_name or entry_sg.name
+        result = gateway_core.lr(entry_sg, dest_sg, Path(f"{dest_sg.name}-{name}"), name)
+        product = result.pop("_product")
+        if not no_product:
+            out = output or destination.with_name(f"{destination.stem}-{name}.gb")
+            result["product"].update(_write_product(product, out, overwrite))
+    except CliError as err:
+        _fail(ctx, err)
+        return
+    rows = [[s["name"], s["from"], _range(*s["range"]), s["strand"], s["sequence"]]
+            for s in result["att_sites"]]
+    lines = [
+        f"Entry clone: {entry_sg.name}, insert {result['insert']['length']} bp"
+        + (" (read the other way round)" if result["insert"]["reversed"] else ""),
+        f"Destination: {dest_sg.name}, backbone {result['destination']['backbone_bp']} bp",
+        f"Taken out: {result['destination']['cassette_bp']} bp between "
+        f"{result['destination']['sites'][0]['name']} and {result['destination']['sites'][1]['name']}"
+        + (" (" + ", ".join(result["destination"]["cassette_features"]) + ")"
+           if result["destination"]["cassette_features"] else ""),
+        "",
+        _table(["site", "made from", "where", "strand", "sequence"], rows),
+        "",
+        f"Insert lands at {_range(*result['insert']['range_in_product'])}.",
+    ]
+    if result["product"].get("output"):
+        lines.append(f"Product: {result['product']['length']} bp, "
+                     f"{result['product']['features']} features -> {result['product']['output']}")
+    else:
+        lines.append(f"Product would be {result['product']['length']} bp (no file written).")
+    lines.append("")
+    lines.append("Nothing to report." if not result["warnings"]
+                 else "\n".join(f"Check: {w}" for w in result["warnings"]))
     _emit(ctx, result, "\n".join(lines))
 
 

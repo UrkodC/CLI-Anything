@@ -18,7 +18,11 @@ from Bio import SeqIO
 from Bio.Restriction import EcoRI, HindIII
 from Bio.Seq import Seq
 
-from cli_anything.snapgene.core import align, assemble, convert, cutting, dnafile, enzymes, infusion, seqtools
+from cli_anything.snapgene.core import (
+    align, assemble, convert, cutting, dnafile, enzymes, gateway, infusion, seqtools,
+)
+from cli_anything.snapgene.errors import CliError
+from cli_anything.snapgene.tests._helpers import ATTB1, ATTB2, entry_clone
 from cli_anything.snapgene.utils import snapgene_backend
 
 APP = snapgene_backend.find_app()
@@ -28,6 +32,8 @@ PUC19 = SAMPLES / "1. Annotate and Visualize/2. Annotate/2. pUC19 Annotated.dna"
 GFP = SAMPLES / "2. Experimental Design/1. PCR/1. GFP.dna"
 GFP_PCR = SAMPLES / "2. Experimental Design/1. PCR/2. GFP Amplified.dna"
 ALL_DNA = sorted(RESOURCES.rglob("*.dna"))
+GATEWAY_DESTS = sorted((RESOURCES / "Plasmids/Gateway Destination Vectors").glob("*.dna"))
+PDEST14 = RESOURCES / "Plasmids/Gateway Destination Vectors/pDEST14.dna"
 
 
 def _resolve_cli(name):
@@ -161,6 +167,83 @@ def test_infusion_product_reads_back_as_genbank(tmp_path):
     print(f"\n  GenBank: {out} ({out.stat().st_size:,} bytes)")
 
 
+def _gfp_entry_clone(tmp_path) -> tuple:
+    """An entry clone carrying SnapGene's GFP between the real attL1 and attL2."""
+    gfp = dnafile.load(GFP)
+    gene = dnafile.find_feature(gfp, "GFP")
+    bases = seqtools.subseq(gfp, gene.start, gene.end)
+    entry = dnafile.load(entry_clone(tmp_path / "pENTR-GFP.dna", insert=bases, name="GFP"))
+    return entry, gene, bases
+
+
+def test_gateway_lr_runs_on_every_bundled_destination_vector(tmp_path):
+    """The 77 Invitrogen destination vectors SnapGene ships, through one LR each."""
+    entry, _, insert = _gfp_entry_clone(tmp_path)
+    done, refused = 0, []
+    for path in GATEWAY_DESTS:
+        dest = dnafile.load(path)
+        if len(gateway.find_att(dest, "R")) != 2:
+            continue
+        try:
+            result = gateway.lr(entry, dest, tmp_path / "product.gb")
+        except CliError as exc:
+            assert exc.code in {"att_mismatch", "att_direction"}, (path.name, exc.code)
+            refused.append(path.name)
+            continue
+        sites = {s["name"]: s["sequence"] for s in result["att_sites"]}
+        assert sites == {"attB1": ATTB1, "attB2": ATTB2}, path.name
+        product = result["_product"]
+        assert product.length == result["destination"]["backbone_bp"] + 50 + len(insert), path.name
+        assert not [f for f in product.features if "ccdb" in f.name.lower()], path.name
+        done += 1
+    assert done >= 70 and refused
+    print(f"\n  {done} destination vectors recombined; {len(refused)} refused for att numbers "
+          f"that do not pair ({', '.join(refused)})")
+
+
+def test_gateway_product_is_a_clean_expression_clone(tmp_path):
+    """pDEST14 x an entry clone: backbone whole, cassette gone, proteins unchanged."""
+    entry, gene, insert = _gfp_entry_clone(tmp_path)
+    dest = dnafile.load(PDEST14)
+    result = gateway.lr(entry, dest, tmp_path / "pDEST14-GFP.gb")
+    product = result["_product"]
+
+    backbone = seqtools.subseq(dest, 1913, 66)            # attR2 cut round to attR1
+    circle = product.sequence + product.sequence          # the backbone crosses the origin
+    assert backbone in circle                             # the vector is whole
+    assert product.length == len(backbone) + 50 + len(insert)     # and used once
+    assert product.sequence.startswith(dest.sequence[:66])    # numbered like the vector
+    assert set(result["destination"]["cassette_features"]) >= {"ccdB", "CmR"}
+    assert circle.count(ATTB1) == 2
+    assert circle.count(seqtools.revcomp(ATTB2)) == 2
+    assert circle.count(insert) == 2
+
+    moved = {f.name: f for f in product.features}
+    assert "T7 promoter" in moved and "ccdB" not in moved
+    assert seqtools.translate(seqtools.coding_sequence(product, moved["AmpR"])) == \
+        seqtools.snapgene_translation(dnafile.find_feature(dest, "AmpR"))
+    assert seqtools.translate(seqtools.coding_sequence(product, moved["GFP"])) == \
+        seqtools.snapgene_translation(gene)
+    print(f"\n  product {product.length} bp, {len(product.features)} features")
+
+
+def test_gateway_product_reads_back_as_genbank(tmp_path):
+    entry, gene, _ = _gfp_entry_clone(tmp_path)
+    result = gateway.lr(entry, dnafile.load(PDEST14), Path("pDEST14-GFP"))
+    out = tmp_path / "pDEST14-GFP.gb"
+    convert.export(result["_product"], out, "genbank")
+    rec = SeqIO.read(out, "genbank")
+    assert len(rec.seq) == result["_product"].length
+    assert rec.annotations["topology"] == "circular"
+    b1 = next(f for f in rec.features if f.qualifiers["label"] == ["attB1"])
+    assert str(b1.extract(rec.seq)) == ATTB1
+    b2 = next(f for f in rec.features if f.qualifiers["label"] == ["attB2"])
+    assert str(b2.extract(rec.seq)) == ATTB2          # extract reverse complements a minus feature
+    gfp_cds = next(f for f in rec.features if f.qualifiers["label"] == ["GFP"] and f.type == "CDS")
+    assert str(gfp_cds.extract(rec.seq).translate()) == seqtools.snapgene_translation(gene)
+    print(f"\n  GenBank: {out} ({out.stat().st_size:,} bytes)")
+
+
 class TestCLISubprocess:
     CLI_BASE = _resolve_cli("cli-anything-snapgene")
 
@@ -209,6 +292,20 @@ class TestCLISubprocess:
         checks = json.loads(self._run(["gblock", GFP, "--feature", "GFP", "--json"]).stdout)
         assert checks["length"] == 717 and checks["ok"]
         print(f"\n  GenBank: {product}\n  Fragment: {fragment}")
+
+    def test_gateway_workflow(self, tmp_path):
+        entry, _, insert = _gfp_entry_clone(tmp_path)
+        product = tmp_path / "pDEST14-GFP.gb"
+        data = json.loads(self._run(["gateway", PDEST14, "--entry", entry.path,
+                                     "-o", product, "--json"]).stdout)
+        assert data["ok"]
+        assert [s["sequence"] for s in data["att_sites"]] == [ATTB1, ATTB2]
+        assert data["destination"]["cassette_bp"] == 1846
+        assert data["product"]["length"] == 6422 - 1846 + 50 + len(insert)
+        rec = SeqIO.read(product, "genbank")
+        assert len(rec.seq) == data["product"]["length"]
+        assert not [f for f in rec.features if f.qualifiers.get("label") == ["ccdB"]]
+        print(f"\n  GenBank: {product}")
 
     def test_error_json(self, tmp_path):
         result = self._run(["info", tmp_path / "missing.dna", "--json"], check=False)

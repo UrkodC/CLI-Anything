@@ -457,3 +457,128 @@ default), 2.1 s.
   they can differ from SnapGene's by about a degree.
 - `pcr` designs one pair at a time for one target. Sequencing primer sets and
   qPCR probe design are not built.
+
+## Part 4: Gateway LR (`gateway`)
+
+### Ground truth
+
+Invitrogen's att sites, taken from the plasmids SnapGene ships rather than from
+memory. A scan of the 203 bundled `.dna` files gives every att feature and its
+sequence:
+
+| Site | Length | Files | Sequence, 5' to 3' along its own strand |
+|---|---|---|---|
+| attB1 | 25 | 8 | `ACAAGTTTGTACAAAAAAGCAGGCT` |
+| attB2 | 25 | 8 | `ACCACTTTGTACAAGAAAGCTGGGT` |
+| attL1 | 100 | 4 | `CAAATAATG...CCAACTTTGTACAAAAAAGCAGGCT` |
+| attL2 | 100 | 3 | `CAAATAATG...CCAACTTTGTACAAGAAAGCTGGGT` |
+| attR1 | 125 | 78 | `ACAAGTTTGTACAAAAAAGCTGAACGAG...CAGTCACTATG` |
+| attR2 | 125 | 79 | `ACCACTTTGTACAAGAAAGCTGAACGAG...CAGTCACTATG` |
+
+attB1 is the first 20 bases of attR1 followed by the last 5 of attL1, and attB2
+is the same arrangement of attR2 and attL2. That is the whole arithmetic. The
+shared core is 15 bases in both pairs, but the code finds it by comparison
+instead of trusting those offsets, because SnapGene annotates attR3 and attR4 as
+124 bp, one base shorter than attR1 and attR2.
+
+### Test inventory
+
+| File | What it covers |
+|---|---|
+| `test_gateway.py` | the rule, reading the two files, the product, the warnings |
+| `test_cli.py` | the `gateway` command, JSON and human output, one error |
+| `test_full_e2e.py` | every bundled destination vector, pDEST14 in detail, the CLI |
+
+### Unit test plan
+
+- the rule: attB1 and attB2 come out exactly as SnapGene annotates them; attB is
+  the attR head plus the attL tail; the core is in both sites; two sites that
+  share no core are refused; attL1 does not recombine with attR2
+- reading a file: the pair is found with the plus-strand site first; a file with
+  no attL pair, two sites on one strand, a linear file and a protein file are
+  each refused with their own code
+- the product: length is backbone + 25 + insert + 25; the insert appears once;
+  the ccdB cassette is gone; the destination's numbering is kept; both attB
+  sites are annotated, attB1 on the plus strand and attB2 on the minus; the
+  insert's features and the backbone's tags come across; an entry clone drawn
+  the other way round still gives a forward insert
+- the warnings: a vector with no ccdB between its attR sites; a tag in frame;
+  a tag out of frame; an insert whose length is not a multiple of 3; an insert
+  that still carries its stop codon
+
+### End-to-end plan
+
+- run one entry clone into all 77 Gateway destination vectors SnapGene ships
+- pDEST14 in detail, checked against the file itself: backbone whole, cassette
+  gone, both attB sites present once, AmpR and GFP proteins unchanged
+- the product written and read back with Biopython
+- the installed command through a subprocess, with `--json`
+
+### Results
+
+Run on 2026-10-30, same machine and versions as Part 2b.
+
+```
+test_gateway.py::test_attb1_and_attb2_match_snapgenes_own_annotation PASSED
+test_gateway.py::test_attb_is_the_attr_head_and_the_attl_tail PASSED
+test_gateway.py::test_the_shared_core_is_found_in_both_sites PASSED
+test_gateway.py::test_sites_that_share_no_core_are_refused PASSED
+test_gateway.py::test_att1_does_not_recombine_with_att2 PASSED
+test_gateway.py::test_read_clone_finds_the_pair PASSED
+test_gateway.py::test_a_file_without_two_attl_is_refused PASSED
+test_gateway.py::test_two_sites_on_the_same_strand_are_refused PASSED
+test_gateway.py::test_linear_and_protein_files_are_refused PASSED
+test_gateway.py::test_lr_builds_the_expression_clone PASSED
+test_gateway.py::test_the_ccdb_cassette_is_gone PASSED
+test_gateway.py::test_the_product_keeps_the_destination_numbering PASSED
+test_gateway.py::test_the_attb_sites_are_annotated_on_the_right_strands PASSED
+test_gateway.py::test_the_insert_features_come_across PASSED
+test_gateway.py::test_an_entry_clone_drawn_backwards_still_gives_a_forward_insert PASSED
+test_gateway.py::test_a_vector_without_ccdb_is_flagged PASSED
+test_gateway.py::test_tags_in_frame_are_reported PASSED
+test_gateway.py::test_tags_out_of_frame_are_reported PASSED
+test_gateway.py::test_an_insert_that_is_not_a_multiple_of_three_is_flagged PASSED
+test_gateway.py::test_an_insert_that_keeps_its_stop_codon_is_flagged PASSED
+test_cli.py::test_gateway_json PASSED
+test_cli.py::test_gateway_human_and_errors PASSED
+test_full_e2e.py::test_gateway_lr_runs_on_every_bundled_destination_vector PASSED
+test_full_e2e.py::test_gateway_product_is_a_clean_expression_clone PASSED
+test_full_e2e.py::test_gateway_product_reads_back_as_genbank PASSED
+test_full_e2e.py::TestCLISubprocess::test_gateway_workflow PASSED
+```
+
+The sweep prints:
+
+```
+74 destination vectors recombined; 3 refused for att numbers that do not pair
+(pDEST R4-R3 Vector II.dna, pDEST R4-R3.dna, pLenti6.4 R4R2 V5-DEST.dna)
+```
+
+Every one of the 74 gave exactly `ACAAGTTTGTACAAAAAAGCAGGCT` and
+`ACCACTTTGTACAAGAAAGCTGGGT`. The 3 refusals are correct: those vectors carry
+attR4 and attR3, which do not pair with an attL1/attL2 entry clone.
+
+The whole suite is now **203 passed, 1 skipped** (the `gui` test, off by
+default), 2.6 s.
+
+### Checked by hand on a lab file
+
+`pcDNA-DEST40` x `pENTR1A-FKBP-GFP-CterLTK`: 1705 bp taken out (CmR, ccdB, lac
+UV5 promoter), 2287 bp insert, product 7775 bp with 19 features, attB1 at
+911-935 and attB2 at 3223-3247. The tool reported that the insert is 2287 bp,
+not a multiple of 3, and that the vector's V5 tag 50 bp downstream is therefore
+out of frame with it by 2 bases. That is a real result, not a bug: pENTR1A puts
+the insert out of frame with pcDNA-DEST40's C-terminal tag, so the fusion would
+need a different entry clone or a different vector.
+
+### Coverage notes
+
+- The byproduct plasmid of the reaction (the cassette between two attP sites) is
+  not built, because nobody keeps it.
+- BP (attB x attP) is not built, so an entry clone cannot be made here.
+- MultiSite Gateway with two or three inserts at once is not built. A two-site
+  LR is all that is covered.
+- The frame report looks 60 bp either side of the insert and names any CDS it
+  finds. It does not work out what the fusion protein would be.
+- Input must be `.dna`. The CLI writes GenBank but does not read it, so the
+  product of one command cannot be fed straight into the next.

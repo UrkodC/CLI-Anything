@@ -56,7 +56,8 @@ written as GenBank, which the Viewer opens and draws as a map.
 | Primer design | `infusion`, `pcr`, `primer-check` | Takara's windows; Primer3 for plain PCR |
 | File > Export | `export` | Biopython GenBank/FASTA |
 | Order a gene fragment | `gblock` | IDT gBlocks limits |
-| Gateway BP/LR, Golden Gate, ligation | not built | |
+| Actions > Gateway Cloning (LR) | `gateway` | Invitrogen att site arithmetic |
+| Gateway BP, Golden Gate, ligation | not built | |
 
 ### In-Fusion primer rules (PT5165-1, section IV.C and Figures 2-3)
 
@@ -77,6 +78,27 @@ Figure 3, which covers 5' overhangs (SalI, HindIII), blunt ends (SmaI) and 3' ov
 (KpnI). Tm comes from Primer3 (SantaLucia 1998, 50 mM Na+, 50 nM primer), not from
 SnapGene, so it can differ by about a degree. Hairpin and dimer limits (-5 and
 -12 kcal/mol) are rules of thumb, not Takara numbers.
+
+### Gateway LR rules
+
+The LR reaction swaps the attL1-insert-attL2 part of an entry clone for the
+attR1-ccdB-attR2 cassette of a destination vector: attL1 x attR1 gives attB1
+and attP1, attL2 x attR2 gives attB2 and attP2.
+
+- attL and attR share a core region, and the crossover happens inside it. The
+  attB site is therefore the attR bases up to the end of the core plus the attL
+  bases after it. Inside the core both sites read the same, so where exactly
+  the crossover falls does not change the answer.
+- The core is found by comparing the two sites, not from a fixed offset.
+  SnapGene annotates attR1 and attR2 as 125 bp but attR3 and attR4 as 124 bp,
+  so a fixed offset would be one base out on some vectors.
+- Only sites with the same number recombine. An attL1/attL2 entry clone and an
+  attR4/attR3 destination vector are refused.
+- Everything between attR1 and attR2 is dropped, which is what removes ccdB
+  and CmR. The other product of the reaction, the cassette between two attP
+  sites, is not built.
+- The product keeps the destination vector's numbering, so its map lines up
+  with the empty vector.
 
 Synthesis limits are IDT's published gBlocks limits: 125-3000 bp, GC 25-75%, no runs of
 10 or more A/T or 6 or more G/C. IDT says acceptance is "complex and multifactorial", so
@@ -100,6 +122,7 @@ a clean report is not a promise.
 | Primers > Design primers | `pcr` |
 | Primers > check a primer | `primer-check` |
 | Actions > In-Fusion Cloning | `infusion` |
+| Actions > Gateway Cloning | `gateway` |
 | Edit > Insert, Delete, Replace | `edit` |
 | Add Feature | `annotate` |
 
@@ -120,9 +143,16 @@ a clean report is not a promise.
   GFP proteins still equal the translations SnapGene saved.
 - A vector opened inside one enzyme site gives a product of vector + insert + one extra
   copy of the site, with the site present twice.
+- Gateway LR reproduces SnapGene's own attB1 (ACAAGTTTGTACAAAAAAGCAGGCT) and attB2
+  (ACCACTTTGTACAAGAAAGCTGGGT), the sequences it labels in the plasmids it ships.
+- An entry clone was run into all 77 Gateway destination vectors SnapGene ships: 74
+  recombined and gave those two attB sites, and the 3 attR4/attR3 vectors were refused
+  because their att numbers do not pair. In the pDEST14 product the backbone is whole,
+  the ccdB and CmR cassette is gone, and the AmpR and GFP proteins are unchanged.
 
 ## Not built
 
-Writing `.dna` files, map rendering, alignment/gel/trace input, `preview` commands,
-Gateway BP/LR, Golden Gate, plain ligation, multi-fragment assembly, sequencing primer
-sets, qPCR probe design, and codon optimisation.
+Writing `.dna` files, reading GenBank or FASTA back in (input is always `.dna`), map
+rendering, alignment/gel/trace input, `preview` commands, Gateway BP, MultiSite Gateway
+with more than one insert, Golden Gate, plain ligation, multi-fragment assembly,
+sequencing primer sets, qPCR probe design, and codon optimisation.
