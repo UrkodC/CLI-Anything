@@ -1,6 +1,7 @@
 """The parts of the real SnapGene app this CLI uses.
 
-SnapGene for macOS has no scripting interface and no headless mode. The CLI uses:
+SnapGene for macOS has no scripting interface. Its own command line (--convert,
+--createPreview, --history) needs a licence. The CLI uses:
 - the app itself, to open files for the user (`open -a SnapGene`);
 - the aligners SnapGene ships in SnapGene.app/Contents/Resources/Tools
   (Clustal Omega and MUSCLE), the same programs SnapGene runs for its alignments.

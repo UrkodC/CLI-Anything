@@ -14,7 +14,8 @@ opens either one.
 
 ## What it uses from SnapGene
 
-SnapGene for macOS has no scripting interface and no headless mode. This tool uses:
+SnapGene for macOS has no scripting interface. Its own command line (`--convert`,
+`--createPreview`, `--history`) needs a licence. This tool uses:
 
 - **SnapGene's file format**, read and written directly (packets in the `.dna` file).
 - **SnapGene's bundled aligners**: Clustal Omega and MUSCLE from
@@ -206,7 +207,8 @@ SNAPGENE_GUI=1 ~/.venvs/cli-anything-snapgene/bin/pytest snapgene/agent-harness/
   is drawn without them; a parent just cannot be reopened out of the product.
 - Writing enzyme sets, display settings or alignment data into a `.dna` file.
 - Alignment (`.dnaln`), gel, trace and collection files as input.
-- Rendering maps (SnapGene draws maps only in its window). No `preview` command.
+- Rendering maps. SnapGene draws maps in its window, and its `--createPreview` command
+  needs a licence. No `preview` command.
 - Reading GenBank or FASTA back in. Input is always a SnapGene file.
 - Gateway BP, MultiSite Gateway with more than one insert, Golden Gate, and ligating a
   cut insert into a cut vector.

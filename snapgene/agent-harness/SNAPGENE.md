@@ -13,13 +13,23 @@ Checked on this Mac on 2026-10-30 with SnapGene 8.2.3 (`/Applications/SnapGene.a
   SnapGene Server is a separate licensed product.
 - **Launch options** in the binary (`-open`, `-newDnaOrRnaFile`, `-saveToCollection`,
   `-restrictionEnzymes` ...) open GUI windows. They are for the GUI, not for batch work.
+- **A command line exists, but it needs a licence.** `SnapGene --help` lists
+  `-c/--convert <FORMAT>` (GenBank, FASTA, EMBL, DDBJ, SnapGene ...), `-I`/`-O` file
+  lists for batches, `--createPreview` (a map image) and `--history` (the History view
+  as an image or text). SnapGene must be closed first. Checked on 2026-11-01 with no
+  licence: `--convert` and `--history` print "Please activate before using this
+  command." and write nothing. `--createPreview` wrote nothing and had not finished
+  after 120 s. SnapGene documents the converter in its support article "How can I
+  convert file(s) into SnapGene format using the command line?".
 - **Bundled programs** in `Contents/Resources/Tools` run on their own: Clustal Omega
   1.2.4, MUSCLE 3.8, MAFFT (`disttbfast` only), T-Coffee, ViennaRNA 2.5 (`RNAfold`),
   parasail, samtools, CAP3. The CLI uses Clustal Omega and MUSCLE for `align`.
 
 Result: the CLI reads and writes SnapGene's native files directly, runs SnapGene's
 bundled aligners, and uses the app only to open files for the user. It cannot render
-maps or run SnapGene's own exporter, because those exist only behind the GUI.
+maps or run SnapGene's own exporter: the GUI locks them, and the command-line versions
+ask for a licence. With a licence, `--convert` and `--history` would let SnapGene itself
+check the files this CLI writes.
 
 ## Data model: the `.dna` file
 
@@ -29,16 +39,17 @@ A list of packets: 1 byte type, 4 byte big-endian length, data.
 |---|---|
 | `0x09` | Cookie: `SnapGene`, sequence type (1 DNA, 2 protein, 7 RNA), export and import versions |
 | `0x00` | DNA: 1 flag byte, then bases. Flags: 0x01 circular, 0x02 double-stranded, 0x04 Dam, 0x08 Dcm, 0x10 EcoKI |
+| `0x01` | DNA packed 2 bits per base, with IUPAC and N runs (layout in sgffp's spec). None of the 203 sample files use it at the top level. The CLI does not read it |
 | `0x20` | RNA residues (same layout as `0x00`) |
 | `0x15` | Protein residues (same layout) |
 | `0x0A` | Features XML. `Segment range` is 1-based inclusive. `directionality` 1 forward, 2 reverse, 3 both. `readingFrame` is signed by strand (-2 = frame 2 of a reverse feature). `<Q>/<V text|int|predef>` qualifiers; text is HTML |
 | `0x05` | Primers XML. `BindingSite location` is 0-based inclusive; sites with `simplified="1"` repeat the others |
 | `0x06` | Notes XML: Type, Description (HTML), Created, LastModified (`2022.9.2`), CreatedBy, Organism, References |
-| `0x08` | Sticky ends and 5' modifications |
+| `0x08` | `AdditionalSequenceProperties`: sticky ends and 5' modifications |
 | `0x03`, `0x0D`, `0x0E`, `0x1C` | Enzyme display settings |
-| `0x07` | History tree XML, plain or xz-compressed |
-| `0x0B` | A snapshot of one parent file, so it can be reopened from the history |
-| `0x1D` ... | Other history data (compressed) |
+| `0x07` | History tree XML, xz-compressed (CRC64 check) or plain. 8 of the 12 sample files with a tree compress it. The CLI reads both and writes it compressed |
+| `0x0B` | A snapshot of one parent file, so it can be reopened from the history. Per sgffp (not checked here): node ID (4 bytes), sequence type, the bases, then the parent's own packets |
+| `0x1D`, `0x1E` | History modifier and history node content, xz-compressed (names from sgffp) |
 
 The translation SnapGene computes for each CDS is saved in the `translation` qualifier
 (segments joined with commas, `?` for an ambiguous codon). The CLI uses it as a check,
@@ -50,9 +61,9 @@ saved copy could be stale.
 A `HistoryTree` holding one `Node`: the file itself, with a `Node` for each file it was
 made from nested under it, and so on down. A node carries `name`, `seqLen`, `circular`
 and `operation` (`inFusionCloning`, `gatewayLRCloning`, `amplifyFragment`,
-`insertFragment`, `goldenGateAssembly`, `primerDirectedMutagenesis`, `flip`,
-`newFileFromSelection`, `changeMethylation`; `invalid` means the file was not made in
-SnapGene). Under it: `Features`, `Primers`, `Oligo` elements for PCR primers,
+`insertFragment`, `insertFragments`, `goldenGateAssembly`, `primerDirectedMutagenesis`,
+`flip`, `newFileFromSelection`, `changeMethylation`, `convertToSingleStranded`;
+`invalid` means the file was not made in SnapGene). Under it: `Features`, `Primers`, `Oligo` elements for PCR primers,
 `HistoryColors` (`ColorRange` 0-based, red for new bases, black for used ones), and one
 `InputSummary` per input.
 
@@ -60,13 +71,35 @@ Rules found by opening written files in SnapGene 8.2.3:
 
 - **A step needs exactly one `InputSummary` per input node.** With fewer, SnapGene quits
   as it opens the file, with no message and no crash report. `core.history.check` refuses
-  such a tree before it is written.
+  such a tree before it is written. All 24 steps with inputs in the sample files have
+  one `InputSummary` per input.
 - `InputSummary` values given with `name1`/`name2` are positions printed next to those
   names: `Replace BamHI (444) - HindIII (474)`. Values without names are 0-based and
   printed one higher: `val1="0" val2="737"` prints `Insert 1 .. 738`.
 - A node marked `resurrectable="1"` promises a snapshot packet (`0x0B`). The CLI writes
   no snapshots, so it removes the mark. SnapGene then draws the tree as usual; a parent
   simply cannot be reopened from the product.
+
+### Other readers of the format
+
+- **Biopython** (`Bio.SeqIO`, format `snapgene`) reads bases, topology and features.
+  The tests use it as an independent check.
+- **sgffp** 0.22.1 (`github.com/merv1n34k/sgffp`, MIT) reads and writes every packet
+  type, snapshots and traces included. Its code and format spec were read on
+  2026-11-01; it was not run. Against the 203 sample files:
+  - It takes the tree of a version-15 file as always xz-compressed. Four of the twelve
+    sample trees are plain, and sgffp drops them with no warning. The CLI checks the
+    first byte and reads both.
+  - It writes one empty `InputSummary` on a step that has none, even on a step with two
+    inputs. SnapGene quit on every two-input step tried with fewer summaries than
+    inputs (rule above).
+  - It sorts packets by type and puts `resurrectable` and `operation` before
+    `upstreamModification`. SnapGene's own files do neither. SnapGene is not known to
+    care about either order.
+  - It lists operations that no sample file uses (`gibsonAssembly`, `gatewayBPCloning`,
+    `ligateFragments`, `digest`, `restrictionCloning`, `changeTopology` ...). These are
+    names to check in SnapGene, not facts.
+  - Useful later: its snapshot (`0x0B`) writer, if parents must reopen from a product.
 
 ## Licence: what the Viewer locks, and what the CLI does instead
 
@@ -186,6 +219,9 @@ a clean report is not a promise.
   In-Fusion product over its vector and its PCR fragment, with both primers named, and
   the Gateway product over its destination vector and entry clone, with the att sites
   named. Checked on the lab's own pENTR1A-FKBP-GFP-CterLTK and pcDNA-DEST40 files.
+- Since 2026-11-01 the history tree is written xz-compressed. A Gateway product written
+  that way opens in SnapGene 8.2.3 and SnapGene stays up. The History view of that
+  file was not looked at by hand.
 
 ## Not built
 

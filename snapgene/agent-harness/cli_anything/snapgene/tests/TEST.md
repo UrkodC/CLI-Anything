@@ -687,3 +687,26 @@ Both products were rebuilt as `.dna` next to the lab plasmids and reread:
 - The history is checked for the one rule that makes SnapGene quit, not for
   everything SnapGene might dislike. A tree built by hand through the `history`
   module could still be wrong in some other way.
+
+## Part 6: the history packet is written compressed
+
+Run on 2026-11-01, macOS, SnapGene 8.2.3 (Viewer, no licence).
+
+Why: sgffp, an open-source SnapGene reader, takes the history tree of a
+version-15 file as xz-compressed and drops a plain one. 8 of the 12 sample
+files with a tree use xz with a CRC64 check, which is what Python's
+`lzma.compress` writes. The reader already took both forms.
+
+- New test `test_dnawrite.py::test_the_history_packet_is_xz_compressed`. It
+  failed first (the packet began with `<?xml`), then passed after the change in
+  `core/dnawrite.py`.
+- `test_snapgene_opens_a_product_we_wrote` (with `SNAPGENE_GUI=1`) passes:
+  SnapGene opens the Gateway product with the compressed tree and stays up. The
+  History view was not looked at by hand this time.
+- SnapGene's own command line was tried as a second checker. With no licence,
+  `--convert` and `--history` print "Please activate before using this
+  command." and `--createPreview` wrote nothing in 120 s. So it cannot check
+  written files on this machine.
+
+The whole suite is now **254 passed** with `SNAPGENE_GUI=1` (11.5 s), and
+**252 passed, 2 skipped** without it.

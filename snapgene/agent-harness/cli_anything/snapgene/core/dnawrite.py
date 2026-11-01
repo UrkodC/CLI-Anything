@@ -11,6 +11,7 @@ was read from, and the CLI also refuses every input of the command.
 """
 from __future__ import annotations
 
+import lzma
 import struct
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -50,7 +51,9 @@ def to_bytes(sg: SnapGeneFile, name: str) -> bytes:
     blob += _packet(PACKET_NOTES, ET.tostring(sgxml.notes_element(sg.notes), encoding="utf-8",
                                               xml_declaration=False))
     if sg.history:
-        blob += _packet(PACKET_HISTORY, history.finish(sg.history, name, sg.length))
+        # xz with a CRC64 check, as SnapGene 8 writes it. SnapGene also opens a
+        # plain tree, but sgffp drops a plain tree in a version-15 file.
+        blob += _packet(PACKET_HISTORY, lzma.compress(history.finish(sg.history, name, sg.length)))
     return blob
 
 

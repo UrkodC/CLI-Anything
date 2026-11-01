@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import lzma
 
 import pytest
 from Bio import SeqIO
@@ -172,6 +173,20 @@ def test_a_history_goes_in_and_comes_back(plasmid, tmp_path):
     sg = dataclasses.replace(plasmid, history=history.tree(top))
     again = reread(sg, tmp_path)
     assert [s["operation"] for s in history.steps(again.history)] == ["inFusionCloning", "invalid"]
+
+
+def test_the_history_packet_is_xz_compressed(plasmid, tmp_path):
+    """8 of the 12 SnapGene sample files with a history compress it this way.
+    sgffp reads only this form in a version-15 file and drops a plain one."""
+    top = history.made_node("product.dna", plasmid.length, True, "inFusionCloning",
+                            [(history.file_node(plasmid, [(1, 100)]), history.summary("replace", 0, 99))],
+                            [(1, 10)])
+    out = tmp_path / "packed.dna"
+    dnawrite.write(dataclasses.replace(plasmid, history=history.tree(top)), out)
+    packets = dict(dnafile.read_packets(out.read_bytes()[19:], out))
+    blob = packets[dnafile.PACKET_HISTORY]
+    assert blob[:6] == b"\xfd7zXZ\x00"
+    assert lzma.decompress(blob).startswith(b'<?xml version="1.0" encoding="UTF-8"?><HistoryTree>')
 
 
 def test_the_top_step_is_named_after_the_file(plasmid, tmp_path):
