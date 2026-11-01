@@ -17,9 +17,9 @@ Checked on this Mac on 2026-10-30 with SnapGene 8.2.3 (`/Applications/SnapGene.a
   1.2.4, MUSCLE 3.8, MAFFT (`disttbfast` only), T-Coffee, ViennaRNA 2.5 (`RNAfold`),
   parasail, samtools, CAP3. The CLI uses Clustal Omega and MUSCLE for `align`.
 
-Result: the CLI reads SnapGene's native files directly, runs SnapGene's bundled aligners,
-and uses the app only to open files for the user. It cannot render maps or run SnapGene's
-own exporter, because those exist only behind the GUI.
+Result: the CLI reads and writes SnapGene's native files directly, runs SnapGene's
+bundled aligners, and uses the app only to open files for the user. It cannot render
+maps or run SnapGene's own exporter, because those exist only behind the GUI.
 
 ## Data model: the `.dna` file
 
@@ -36,17 +36,45 @@ A list of packets: 1 byte type, 4 byte big-endian length, data.
 | `0x06` | Notes XML: Type, Description (HTML), Created, LastModified (`2022.9.2`), CreatedBy, Organism, References |
 | `0x08` | Sticky ends and 5' modifications |
 | `0x03`, `0x0D`, `0x0E`, `0x1C` | Enzyme display settings |
-| `0x07`, `0x0B`, `0x1D` ... | History (compressed) |
+| `0x07` | History tree XML, plain or xz-compressed |
+| `0x0B` | A snapshot of one parent file, so it can be reopened from the history |
+| `0x1D` ... | Other history data (compressed) |
 
 The translation SnapGene computes for each CDS is saved in the `translation` qualifier
-(segments joined with commas, `?` for an ambiguous codon). The CLI uses it as a check.
+(segments joined with commas, `?` for an ambiguous codon). The CLI uses it as a check,
+and leaves it out of files it writes, because SnapGene works it out from the bases and a
+saved copy could be stale.
+
+### The history tree (`0x07`)
+
+A `HistoryTree` holding one `Node`: the file itself, with a `Node` for each file it was
+made from nested under it, and so on down. A node carries `name`, `seqLen`, `circular`
+and `operation` (`inFusionCloning`, `gatewayLRCloning`, `amplifyFragment`,
+`insertFragment`, `goldenGateAssembly`, `primerDirectedMutagenesis`, `flip`,
+`newFileFromSelection`, `changeMethylation`; `invalid` means the file was not made in
+SnapGene). Under it: `Features`, `Primers`, `Oligo` elements for PCR primers,
+`HistoryColors` (`ColorRange` 0-based, red for new bases, black for used ones), and one
+`InputSummary` per input.
+
+Rules found by opening written files in SnapGene 8.2.3:
+
+- **A step needs exactly one `InputSummary` per input node.** With fewer, SnapGene quits
+  as it opens the file, with no message and no crash report. `core.history.check` refuses
+  such a tree before it is written.
+- `InputSummary` values given with `name1`/`name2` are positions printed next to those
+  names: `Replace BamHI (444) - HindIII (474)`. Values without names are 0-based and
+  printed one higher: `val1="0" val2="737"` prints `Insert 1 .. 738`.
+- A node marked `resurrectable="1"` promises a snapshot packet (`0x0B`). The CLI writes
+  no snapshots, so it removes the mark. SnapGene then draws the tree as usual; a parent
+  simply cannot be reopened from the product.
 
 ## Licence: what the Viewer locks, and what the CLI does instead
 
 Without a licence SnapGene 8 runs as the SnapGene Viewer: it opens and draws files but
-locks editing, cloning, primer design and export. The licence check is not worked around.
+locks editing, cloning, primer design and saving. The licence check is not worked around.
 The locked work is done in the CLI instead, from published rules, and the result is
-written as GenBank, which the Viewer opens and draws as a map.
+written as a SnapGene file (or GenBank), which the Viewer opens and draws as a map. The
+Viewer draws the History view of a file it will not let you save.
 
 | Locked in the Viewer | CLI | Rules it follows |
 |---|---|---|
@@ -55,6 +83,8 @@ written as GenBank, which the Viewer opens and draws as a map.
 | Gibson / HiFi assembly | `infusion --overlap 20..25` | same engine, longer overlap |
 | Primer design | `infusion`, `pcr`, `primer-check` | Takara's windows; Primer3 for plain PCR |
 | File > Export | `export` | Biopython GenBank/FASTA |
+| Save as a SnapGene file | `-o name.dna` on any product | the packet layout above |
+| History view of a product | written by `infusion`, `gateway` | the history rules above |
 | Order a gene fragment | `gblock` | IDT gBlocks limits |
 | Actions > Gateway Cloning (LR) | `gateway` | Invitrogen att site arithmetic |
 | Gateway BP, Golden Gate, ligation | not built | |
@@ -115,6 +145,7 @@ a clean report is not a promise.
 | Show ORFs | `orfs` |
 | Choose Enzymes > Unique 6+ Cutters | `enzymes` |
 | Find (Cmd+F) | `find` |
+| History tab | `-o name.dna`, then `open` |
 | File > Export > GenBank / FASTA | `export` |
 | Tools > Align Multiple Sequences | `align` |
 | File > Open | `open` |
@@ -133,6 +164,8 @@ a clean report is not a promise.
 - 2064 of 2064 CDS features translate to the exact protein SnapGene saved.
 - pUC19: EcoRI at 396 and HindIII at 447, as on SnapGene's map.
 - GenBank export of pUC19 opened in SnapGene from the CLI (`open`).
+- All 413 files written back out as `.dna` and reread: same bases, same topology, same
+  feature names, ranges and strands, same primers. Biopython's reader agrees on every one.
 
 ## Verification of the cloning commands
 
@@ -149,10 +182,16 @@ a clean report is not a promise.
   recombined and gave those two attB sites, and the 3 attR4/attR3 vectors were refused
   because their att numbers do not pair. In the pDEST14 product the backbone is whole,
   the ccdB and CmR cassette is gone, and the AmpR and GFP proteins are unchanged.
+- Products written as `.dna` open in SnapGene 8.2.3 and draw in its History view: the
+  In-Fusion product over its vector and its PCR fragment, with both primers named, and
+  the Gateway product over its destination vector and entry clone, with the att sites
+  named. Checked on the lab's own pENTR1A-FKBP-GFP-CterLTK and pcDNA-DEST40 files.
 
 ## Not built
 
-Writing `.dna` files, reading GenBank or FASTA back in (input is always `.dna`), map
+Snapshots of parent files inside a written `.dna` (packet `0x0B`), enzyme sets and
+display settings in a written `.dna`, reading GenBank or FASTA back in (input is always
+`.dna`), map
 rendering, alignment/gel/trace input, `preview` commands, Gateway BP, MultiSite Gateway
 with more than one insert, Golden Gate, plain ligation, multi-fragment assembly,
 sequencing primer sets, qPCR probe design, and codon optimisation.

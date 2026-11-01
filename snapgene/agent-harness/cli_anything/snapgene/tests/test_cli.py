@@ -5,7 +5,7 @@ import json
 import pytest
 from click.testing import CliRunner
 
-from cli_anything.snapgene.core import seqtools
+from cli_anything.snapgene.core import dnafile, history, seqtools
 from cli_anything.snapgene.snapgene_cli import cli
 from cli_anything.snapgene.tests._helpers import (
     ATTB1, TEST_GENE, destination_vector, entry_clone, filler, takara_vector, write_snapgene,
@@ -176,7 +176,7 @@ def test_gateway_json(tmp_path):
     assert data["insert"]["length"] == len(TEST_GENE)
     assert "ccdB" in data["destination"]["cassette_features"]
     written = out.read_text()
-    assert written.startswith("LOCUS") and "attB1" in written and "ccdB" not in written
+    assert written.startswith("LOCUS") and '/label="attB1"' in written and '/label="ccdB"' not in written
     assert data["product"]["output"] == str(out)
 
 
@@ -239,3 +239,60 @@ def test_annotate_json(vector, tmp_path):
     assert "my site" in out.read_text()
     _, data = run("annotate", vector, "--name", "x", "--range", "nonsense", "--json")
     assert data["code"] == "bad_range"
+
+
+# --- what the commands write by default ------------------------------------
+
+def test_infusion_writes_a_snapgene_file_by_default(vector, insert, tmp_path):
+    _, data = run("infusion", vector, "--at", 400, "--insert", insert, "--json")
+    out = tmp_path / "pTakara-gene.dna"
+    assert data["product"]["output"] == str(out)
+    assert data["product"]["format"] == "snapgene"
+    again = dnafile.load(out)
+    assert again.length == data["product"]["length"]
+    assert "In-Fusion cloning (Takara)" in again.notes["description"]
+    assert [s["operation"] for s in history.steps(again.history)][0] == "inFusionCloning"
+
+
+def test_a_gb_name_still_gives_genbank(vector, insert, tmp_path):
+    out = tmp_path / "product.gb"
+    _, data = run("infusion", vector, "--at", 400, "--insert", insert, "-o", out, "--json")
+    assert data["product"]["format"] == "genbank"
+    assert out.read_text().startswith("LOCUS")
+
+
+def test_gateway_writes_a_snapgene_file_by_default(tmp_path):
+    entry = entry_clone(tmp_path / "pENTR-gene.dna")
+    dest = destination_vector(tmp_path / "pDEST-x.dna")
+    _, data = run("gateway", dest, "--entry", entry, "--name", "gene", "--json")
+    out = tmp_path / "pDEST-x-gene.dna"
+    assert data["product"]["output"] == str(out)
+    again = dnafile.load(out)
+    assert "Gateway LR cloning" in again.notes["description"]
+    assert [s["name"] for s in history.steps(again.history)][1:] == ["pDEST-x.dna", "pENTR-gene.dna"]
+
+
+def test_edit_and_annotate_write_snapgene_files(vector, tmp_path):
+    _, data = run("edit", vector, "--at", 400, "--sequence", "GGCGGC", "--label", "linker", "--json")
+    assert data["output"] == str(tmp_path / "pTakara-edited.dna")
+    assert "linker" in [f.name for f in dnafile.load(data["output"]).features]
+    _, data = run("annotate", vector, "--name", "my site", "--range", "400-420", "--json")
+    assert data["output"] == str(tmp_path / "pTakara-annotated.dna")
+    assert "my site" in [f.name for f in dnafile.load(data["output"]).features]
+
+
+def test_a_product_may_not_replace_a_file_it_was_made_from(vector, insert):
+    """Even with --overwrite: losing the vector you cloned from is not recoverable."""
+    for target in (vector, insert):
+        _, data = run("infusion", vector, "--at", 400, "--insert", insert,
+                      "-o", target, "--overwrite", "--json")
+        assert data["code"] == "output_is_input"
+    assert dnafile.load(insert).sequence == TEST_GENE
+
+
+def test_an_entry_clone_is_safe_from_its_own_product(tmp_path):
+    entry = entry_clone(tmp_path / "pENTR-gene.dna")
+    dest = destination_vector(tmp_path / "pDEST-x.dna")
+    _, data = run("gateway", dest, "--entry", entry, "-o", entry, "--overwrite", "--json")
+    assert data["code"] == "output_is_input"
+    assert dnafile.load(entry).length > 0

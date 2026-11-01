@@ -7,7 +7,8 @@ description: >-
   MUSCLE, searches folders of plasmids, and opens files in the SnapGene app. Also clones:
   cuts a plasmid with enzymes, designs Takara In-Fusion (or Gibson/HiFi) primers, runs a
   Gateway LR reaction, builds the product plasmid, checks a fragment against IDT gBlocks
-  limits, edits a sequence and adds features.
+  limits, edits a sequence and adds features. Writes products as SnapGene .dna files
+  carrying the cloning history SnapGene draws in its History view.
 ---
 
 # cli-anything-snapgene
@@ -19,7 +20,8 @@ has a given insert, or when a GenBank/FASTA copy is needed for another tool.
 Use it as well when the user wants to clone something (In-Fusion, Gibson, HiFi or
 Gateway LR), design
 the primers for it, order a gene fragment, or change a sequence. The paid SnapGene cloning
-tools are not needed: these commands write GenBank, which the free SnapGene Viewer draws.
+tools are not needed: these commands write a SnapGene file, which the free SnapGene
+Viewer opens and draws, History view included.
 
 ## Before you run it
 
@@ -54,13 +56,13 @@ cli-anything-snapgene infusion VECTOR.dna (--enzyme E [--enzyme E2] | --at N | -
     (--insert FILE.dna [--insert-feature NAME | --insert-range A-B] | --insert-seq BASES) \
     [--insert-name NAME] [--insert-revcomp] [--overlap 15] [--no-restore-sites] \
     [--keep larger|smaller] \
-    [-o PRODUCT.gb] [--fragment-out ORDER.fasta] [--no-product] [--overwrite]
+    [-o PRODUCT.dna] [--fragment-out ORDER.fasta] [--no-product] [--overwrite]
 cli-anything-snapgene gateway DESTINATION.dna --entry ENTRY.dna [--name NAME] \
-    [-o PRODUCT.gb] [--no-product] [--overwrite]
+    [-o PRODUCT.dna] [--no-product] [--overwrite]
 cli-anything-snapgene gblock FILE.dna [--feature NAME | --range A-B] [--flank5 S] [--flank3 S] [-o F.fasta]
 cli-anything-snapgene edit FILE.dna (--at N --sequence BASES | --range A-B [--sequence BASES] \
-    | --feature NAME [--sequence BASES]) [--label NAME] [-o OUT.gb]
-cli-anything-snapgene annotate FILE.dna --name NAME --range A-B [--type CDS] [--strand +|-] [-o OUT.gb]
+    | --feature NAME [--sequence BASES]) [--label NAME] [-o OUT.dna]
+cli-anything-snapgene annotate FILE.dna --name NAME --range A-B [--type CDS] [--strand +|-] [-o OUT.dna]
 cli-anything-snapgene pcr FILE.dna (--feature NAME | --range A-B) [--context 600] [--pairs 3] \
     [--opt-tm 60] [--min-tm 57] [--max-tm 63] [--min-product N] [--max-product N] [-o OUT.gb]
 cli-anything-snapgene primer-check FILE.dna PRIMER_BASES
@@ -78,8 +80,9 @@ cli-anything-snapgene primer-check FILE.dna PRIMER_BASES
 - `enzymes` without `--enzyme` lists unique cutters with sites of 6+ bases from commercial
   REBASE enzymes (isoschizomers included). Positions are the last base before the top-strand
   cut, the number SnapGene shows on the map. Methylation blocking is not checked.
-- `export` and `align -o` refuse to overwrite unless `--overwrite` is given. The tool never
-  writes to `.dna` files.
+- `export` and `align -o` refuse to overwrite unless `--overwrite` is given. The tool
+  never writes to an input file, and a product may not replace a file it was made from,
+  even with `--overwrite`.
 - For clone verification against a sequencing read, export the reference with
   `export --format genbank` and hand it to the `plasmid-verify` skill.
 - `open` puts a window on the user's screen. Use it only when the user wants to look.
@@ -98,8 +101,15 @@ cli-anything-snapgene primer-check FILE.dna PRIMER_BASES
 - `fragment_sequence` is the PCR product, which is also the gene fragment to order.
   `--fragment-out` writes it as FASTA.
 - Raise `--overlap` to 20-25 for Gibson or HiFi assembly. Takara's range is 12-21.
-- The product is GenBank. Tell the user to open it with `open PRODUCT.gb` to see the map.
+- The product is a SnapGene `.dna` file by default, named `<vector>-<insert>.dna` next
+  to the vector. Tell the user to open it with `open PRODUCT.dna` to see the map, and to
+  click **History** to see the cloning drawn: the parent files, the step, and the
+  primers. Give `-o name.gb` only when the user asks for GenBank; the written story is
+  kept there but the drawn history is not.
   Nothing is written over without `--overwrite`, and input files are never changed.
+- The product also carries the story in words, in its description: the vector, how it
+  was opened, where the insert came from, the primers and what came out. `info` prints
+  it. Quote it rather than writing your own account of the cloning.
 - `dropped_features` names features the change cut in half. Pass that on: a lost feature
   usually means the user cut inside something they cared about.
 - `edit` reports `protein_changes` when a CDS protein came out different. That is how a
@@ -143,7 +153,7 @@ cli-anything-snapgene translate pENTR1A-GFP-CLIP170LTK.dna --feature "LTK C'ter"
 # In-Fusion mCherry into pUC19 cut with EcoRI and HindIII
 cli-anything-snapgene infusion pUC19.dna --enzyme EcoRI --enzyme HindIII \
     --insert pCMV-mCherry.dna --insert-feature mCherry \
-    -o pUC19-mCherry.gb --fragment-out mCherry-order.fasta --json
+    -o pUC19-mCherry.dna --fragment-out mCherry-order.fasta --json
 
 # Swap a tag out of a plasmid, no enzyme needed
 cli-anything-snapgene infusion pENTR1A-GFP-CLIP170LTK.dna --remove 834-1550 \
@@ -151,5 +161,5 @@ cli-anything-snapgene infusion pENTR1A-GFP-CLIP170LTK.dna --remove 834-1550 \
 
 # Gateway LR: move an entry clone into a mammalian expression vector
 cli-anything-snapgene gateway pcDNA-DEST40.dna --entry pENTR1A-FKBP-GFP-CterLTK.dna \
-    --name FKBP-GFP-CterLTK -o pcDNA40-FKBP-GFP-CterLTK.gb --json
+    --name FKBP-GFP-CterLTK -o pcDNA40-FKBP-GFP-CterLTK.dna --json
 ```

@@ -29,9 +29,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
-from cli_anything.snapgene.core import assemble, seqtools
+from cli_anything.snapgene.core import assemble, history, seqtools
 from cli_anything.snapgene.core.dnafile import Feature, SnapGeneFile
 from cli_anything.snapgene.errors import CliError
 
@@ -200,6 +201,34 @@ def _tag_notes(product: SnapGeneFile, insert_start: int, insert_end: int) -> lis
     return out
 
 
+def _story(entry_sg: SnapGeneFile, dest_sg: SnapGeneFile, dest: Clone, partners: tuple[AttSite, AttSite],
+           insert: tuple[int, int], flipped: bool, backbone: tuple[int, int], product: SnapGeneFile,
+           new: tuple[int, int], cassette: list[str]) -> tuple[str, str]:
+    """The history tree and the written story of an LR product."""
+    left_partner, right_partner = partners
+    destination = history.file_node(dest_sg, [backbone])
+    entry = history.file_node(entry_sg, [insert])
+    top = history.made_node(
+        f"{product.name}.dna", product.length, True, "gatewayLRCloning",
+        [(destination, history.summary("replace", dest.left.start, dest.right.end,
+                                       dest.left.name, dest.right.name)),
+         (entry, history.summary("insert", left_partner.start, right_partner.end,
+                                 left_partner.name, right_partner.name))],
+        [new])
+    insert_bp = (insert[1] - insert[0]) % entry_sg.length + 1
+    taken = (dest.right.end - dest.left.start) % dest_sg.length + 1
+    sites = [f for f in product.features if f.name in (f"attB{dest.left.number}", f"attB{dest.right.number}")]
+    text = "\n".join([
+        f"Made by Gateway LR cloning (Invitrogen) with cli-anything-snapgene on {date.today().isoformat()}.",
+        f"Destination vector: {dest_sg.path.name}; {taken} bp from {dest.left.name} to {dest.right.name} "
+        f"taken out" + (f" ({', '.join(cassette)})" if cassette else "") + ".",
+        f"Entry clone: {entry_sg.path.name}; {insert_bp} bp between {left_partner.name} and "
+        f"{right_partner.name} put in" + (", read the other way round" if flipped else "") + ".",
+        "New sites: " + ", ".join(f"{f.name} {f.start}-{f.end}" for f in sites) + ".",
+    ])
+    return history.tree(top), text
+
+
 def lr(entry_sg: SnapGeneFile, dest_sg: SnapGeneFile, product_path: Path | None = None,
        insert_name: str | None = None) -> dict:
     """Run an LR reaction on paper: entry clone + destination vector -> expression clone."""
@@ -275,6 +304,10 @@ def lr(entry_sg: SnapGeneFile, dest_sg: SnapGeneFile, product_path: Path | None 
     elif insert.sequence[-3:].upper() in STOP_CODONS:
         notes.append(f"The insert ends with the stop codon {insert.sequence[-3:].upper()}. "
                      "A tag after it in the vector would not be made.")
+    product.history, product.notes["description"] = _story(
+        entry_sg, dest_sg, dest, (left_partner, right_partner), (first, last), flip,
+        (backbone_first, _wrap(dest.left.start - 1, n_dest)), product, (insert_start, insert_end),
+        cassette_names)
     notes += _tag_notes(product, insert_start, insert_end)
     if dropped:
         notes.append("Features cut in half, left out of the product: " + ", ".join(sorted(set(dropped))) + ".")

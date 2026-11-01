@@ -13,7 +13,7 @@ import click
 from cli_anything.snapgene import __version__
 from cli_anything.snapgene.core import align as align_core
 from cli_anything.snapgene.core import assemble as assemble_core
-from cli_anything.snapgene.core import convert, cutting, dnafile
+from cli_anything.snapgene.core import convert, cutting, dnafile, dnawrite
 from cli_anything.snapgene.core import edit as edit_core
 from cli_anything.snapgene.core import enzymes as enzyme_core
 from cli_anything.snapgene.core import gateway as gateway_core
@@ -411,7 +411,17 @@ def _enzyme_names(values) -> list[str]:
     return [n.strip() for item in values for n in item.split(",") if n.strip()]
 
 
-def _write_product(product: dnafile.SnapGeneFile, output: Path, overwrite: bool) -> dict:
+def _write_product(product: dnafile.SnapGeneFile, output: Path, overwrite: bool,
+                   inputs: tuple[Path | None, ...] = ()) -> dict:
+    """Write a product: .dna as a SnapGene file with its history, anything else as GenBank.
+
+    The files the product was made from are never replaced, even with --overwrite.
+    """
+    for source in inputs:
+        if source is not None and output.resolve() == Path(source).resolve():
+            raise CliError("output_is_input", f"{output} is one of the input files. Give the product another name.")
+    if output.suffix.lower() == ".dna":
+        return dnawrite.write(product, output, overwrite)
     return convert.export(product, output, "genbank", overwrite)
 
 
@@ -497,7 +507,8 @@ def cut_command(ctx: click.Context, file: Path, names) -> None:
 @click.option("--restore-sites/--no-restore-sites", default=True, show_default=True,
               help="Add the few bases that rebuild the enzyme site at each join.")
 @click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
-              help="Where to write the product as GenBank.")
+              help="Where to write the product: .dna (SnapGene file with its cloning history, "
+                   "the default) or .gb (GenBank).")
 @click.option("--no-product", is_flag=True, help="Only design the primers; write no product file.")
 @click.option("--fragment-out", type=click.Path(path_type=Path), default=None,
               help="Write the fragment to order (the PCR product) as FASTA.")
@@ -528,8 +539,8 @@ def infusion_command(ctx: click.Context, vector: Path, names, at, remove, keep, 
         product = result.pop("_product")
         result["warnings"] = notes + result["warnings"]
         if not no_product:
-            out = output or vector.with_name(f"{vector.stem}-{insert_name}.gb")
-            result["product"].update(_write_product(product, out, overwrite))
+            out = output or vector.with_name(f"{vector.stem}-{insert_name}.dna")
+            result["product"].update(_write_product(product, out, overwrite, (vector, insert)))
         if fragment_out:
             if fragment_out.exists() and not overwrite:
                 raise CliError("output_exists", f"{fragment_out} exists. Use --overwrite to replace it.")
@@ -572,7 +583,8 @@ def infusion_command(ctx: click.Context, vector: Path, names, at, remove, keep, 
               help="The entry clone, with attL1 and attL2 around the insert.")
 @click.option("--name", "insert_name", default=None, help="Name for the insert in the product.")
 @click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
-              help="Where to write the expression clone as GenBank.")
+              help="Where to write the expression clone: .dna (SnapGene file with its cloning "
+                   "history, the default) or .gb (GenBank).")
 @click.option("--no-product", is_flag=True, help="Report the reaction only; write no file.")
 @click.option("--overwrite", is_flag=True, help="Replace the output file if it exists.")
 @json_option
@@ -592,8 +604,8 @@ def gateway_command(ctx: click.Context, destination: Path, entry: Path, insert_n
         result = gateway_core.lr(entry_sg, dest_sg, Path(f"{dest_sg.name}-{name}"), name)
         product = result.pop("_product")
         if not no_product:
-            out = output or destination.with_name(f"{destination.stem}-{name}.gb")
-            result["product"].update(_write_product(product, out, overwrite))
+            out = output or destination.with_name(f"{destination.stem}-{name}.dna")
+            result["product"].update(_write_product(product, out, overwrite, (destination, entry)))
     except CliError as err:
         _fail(ctx, err)
         return
@@ -681,13 +693,14 @@ def gblock_command(ctx: click.Context, file: Path, feature, feature_index, rng, 
 @click.option("--sequence", default="", help="The bases to put in. Leave it out to delete.")
 @click.option("--label", default=None, help="Name a feature over the bases you put in.")
 @click.option("--label-type", default="misc_feature", show_default=True, help="Type of that feature.")
-@click.option("--output", "-o", type=click.Path(path_type=Path), default=None, help="Where to write the GenBank.")
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
+              help="Where to write the result: .dna (SnapGene file, the default) or .gb (GenBank).")
 @click.option("--overwrite", is_flag=True, help="Replace the output file if it exists.")
 @json_option
 @click.pass_context
 def edit_command(ctx: click.Context, file: Path, at, rng, feature, feature_index, sequence, label,
                  label_type, output, overwrite) -> None:
-    """Put bases in, take bases out, or swap a part. Writes a new GenBank file."""
+    """Put bases in, take bases out, or swap a part. Writes a new file."""
     try:
         sg = dnafile.load(file)
         start = end = None
@@ -696,11 +709,11 @@ def edit_command(ctx: click.Context, file: Path, at, rng, feature, feature_index
             start, end = edit_core.feature_span(sg, feat)
         elif rng:
             start, end = _span("--range", rng)
-        out = output or file.with_name(f"{file.stem}-edited.gb")
+        out = output or file.with_name(f"{file.stem}-edited.dna")
         result = edit_core.edit(sg, sequence, at, start, end, label, label_type, Path(f"{sg.name}-edited"))
         product = result.pop("_product")
         result["protein_changes"] = edit_core.protein_check(sg, product)
-        result.update(_write_product(product, out, overwrite))
+        result.update(_write_product(product, out, overwrite, (file,)))
     except CliError as err:
         _fail(ctx, err)
         return
@@ -719,18 +732,19 @@ def edit_command(ctx: click.Context, file: Path, at, rng, feature, feature_index
 @click.option("--range", "rng", required=True, help="Where it sits, for example 400-900.")
 @click.option("--type", "ftype", default="misc_feature", show_default=True, help="Feature type, for example CDS.")
 @click.option("--strand", type=click.Choice(["+", "-", "none"]), default="+", show_default=True)
-@click.option("--output", "-o", type=click.Path(path_type=Path), default=None, help="Where to write the GenBank.")
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
+              help="Where to write the result: .dna (SnapGene file, the default) or .gb (GenBank).")
 @click.option("--overwrite", is_flag=True, help="Replace the output file if it exists.")
 @json_option
 @click.pass_context
 def annotate_command(ctx: click.Context, file: Path, name, rng, ftype, strand, output, overwrite) -> None:
-    """Add one feature to a file and write the result as GenBank."""
+    """Add one feature to a file and write the result as a new file."""
     try:
         sg = dnafile.load(file)
         start, end = _span("--range", rng)
         product = edit_core.annotate(sg, name, start, end, ftype, strand)
-        out = output or file.with_name(f"{file.stem}-annotated.gb")
-        result = _write_product(product, out, overwrite)
+        out = output or file.with_name(f"{file.stem}-annotated.dna")
+        result = _write_product(product, out, overwrite, (file,))
         result.update({"added": {"name": name, "type": ftype, "strand": strand, "range": [start, end]},
                        "feature_count": len(product.features)})
     except CliError as err:

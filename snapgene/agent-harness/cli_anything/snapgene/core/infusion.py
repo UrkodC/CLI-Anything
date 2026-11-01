@@ -19,9 +19,10 @@ primer in Figure 3 of the manual.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
-from cli_anything.snapgene.core import assemble, gblock, primers, seqtools
+from cli_anything.snapgene.core import assemble, gblock, history, primers, seqtools
 from cli_anything.snapgene.core.cutting import Cut, find_cuts
 from cli_anything.snapgene.core.dnafile import BindingSite, Primer, SnapGeneFile
 from cli_anything.snapgene.errors import CliError
@@ -170,6 +171,55 @@ def open_vector(sg: SnapGeneFile, enzyme_names: list[str] | None = None, at: int
                       cuts=cuts, removed=removed, removed_bp=removed_bp, how=how)
 
 
+def _vector_row(opened: OpenVector):
+    """What the history says was done to the vector."""
+    n = opened.sg.length
+    if opened.cuts:
+        left = next((c for c in opened.cuts if c.top == opened.last_top), opened.cuts[0])
+        right = next((c for c in opened.cuts if _wrap(c.top + 1, n) == opened.first_top), opened.cuts[-1])
+        return history.summary("replace", left.top, right.top, left.enzyme, right.enzyme)
+    if opened.removed:
+        a, b = opened.removed
+        return history.summary("replace", a - 1, b - 1)
+    return history.summary("replace", opened.last_top, opened.last_top - 1)
+
+
+def _story(opened: OpenVector, insert: assemble.Piece, insert_name: str, fragment: str,
+           arms: tuple[int, int], oligos: list[tuple[str, str]], product: SnapGeneFile,
+           new: tuple[int, int], overlap: int) -> tuple[str, str]:
+    """The history tree and the written story of an In-Fusion product."""
+    left_arm, right_arm = arms
+    pieces = [assemble.literal(fragment[:left_arm]), insert, assemble.literal(fragment[len(fragment) - right_arm:])]
+    fragment_features = assemble.assemble(pieces, Path(insert_name), circular=False)[0].features
+    vector = history.file_node(opened.sg, [(opened.first_top, opened.last_top)])
+    if insert.source is not None:
+        first, last = insert.coords[0], insert.coords[-1]
+        t0, t1 = (last, first) if insert.flipped else (first, last)
+        template = history.file_node(insert.source, [(t0, t1)])
+        part = history.made_node(f"{insert_name} In-Fusion PCR.dna", len(fragment), False, "amplifyFragment",
+                                 [(template, history.summary("amplify", t0 - 1, t1 - 1))],
+                                 [(1, left_arm), (len(fragment) - right_arm + 1, len(fragment))],
+                                 fragment_features, oligos)
+        source = (f"from {insert.source.path.name}, bases {t0}-{t1}"
+                  + (", reverse complement" if insert.flipped else ""))
+    else:
+        part = history.leaf(f"{insert_name} In-Fusion fragment.dna", len(fragment), False, fragment_features)
+        source = "typed in"
+    history.mark_used(part, [(1, len(fragment))])
+    top = history.made_node(f"{product.name}.dna", product.length, True, "inFusionCloning",
+                            [(vector, _vector_row(opened)), (part, history.summary("insert", 0, len(fragment) - 1))],
+                            [new])
+    gene_bp = len(insert.sequence)
+    text = "\n".join([
+        f"Made by In-Fusion cloning (Takara) with cli-anything-snapgene on {date.today().isoformat()}.",
+        f"Vector: {opened.sg.path.name}, {opened.how}.",
+        f"Insert: {insert_name}, {gene_bp} bp, {source}.",
+        "Primers: " + "; ".join(f"{name} {seq}" for name, seq in oligos) + ".",
+        f"PCR product: {len(fragment)} bp, with {overlap} bp of vector homology at each end.",
+    ])
+    return history.tree(top), text
+
+
 def design(opened: OpenVector, insert: assemble.Piece, overlap: int = OVERLAP,
            restore_sites: bool = True, product_path: Path | None = None,
            insert_name: str = "insert") -> dict:
@@ -204,6 +254,11 @@ def design(opened: OpenVector, insert: assemble.Piece, overlap: int = OVERLAP,
                [BindingSite(*_site(head + len(after) + len(gene) - len(anchor_r["anchor"]),
                                    len(reverse_seq), total), "-", anchor_r["tm"])]),
     ]
+
+    new_bp = len(after) + len(gene) + len(before)
+    product.history, product.notes["description"] = _story(
+        opened, insert, insert_name, fragment, (overlap + len(after), len(before) + overlap),
+        [(p.name, p.sequence) for p in product.primers], product, (head + 1, head + new_bp), overlap)
 
     notes = []
     low, high = OVERLAP_RANGE

@@ -1,8 +1,7 @@
 """Build a new sequence out of pieces, and carry the features across.
 
-SnapGene writes its own .dna files and keeps a history tree inside them. This
-tool never writes .dna, so a product is built here in memory as a SnapGeneFile
-and then written as GenBank by core.convert.
+A product is built here in memory as a SnapGeneFile. core.dnawrite then
+writes it as a .dna file with its history tree, or core.convert as GenBank.
 
 Every base of a piece remembers where it came from. A feature moves to the
 product when all of its bases made it across in one run, and it stretches over
@@ -114,7 +113,7 @@ def _map_feature(feat: Feature, index: dict[int, int], source_n: int, total: int
                 return None, True
         first, last = places[0], places[-1]
         lo, hi = (last, first) if flipped else (first, last)
-        segments.append(Segment(lo + 1, hi + 1, seg.name, seg.translated))
+        segments.append(Segment(lo + 1, hi + 1, seg.name, seg.translated, seg.color))
     if flipped:
         segments.reverse()
     if all(s.start <= s.end for s in segments):

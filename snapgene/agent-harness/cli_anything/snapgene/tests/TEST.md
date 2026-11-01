@@ -580,5 +580,110 @@ need a different entry clone or a different vector.
   LR is all that is covered.
 - The frame report looks 60 bp either side of the insert and names any CDS it
   finds. It does not work out what the fusion protein would be.
-- Input must be `.dna`. The CLI writes GenBank but does not read it, so the
-  product of one command cannot be fed straight into the next.
+- Input must be `.dna`. GenBank is written but not read. Since Part 5 the
+  product of a command is itself a `.dna` file, so it can be fed straight into
+  the next command.
+
+
+## Part 5: writing SnapGene files and the cloning history (`dnawrite`, `history`, `sgxml`)
+
+Asked for after the Gateway work: SnapGene has a History view that draws how a
+plasmid was cloned, and the question was whether products could carry one.
+
+### Ground truth
+
+SnapGene does not publish the history format, so it was taken from the files
+SnapGene 8.2.3 ships and checked by opening written files in SnapGene itself.
+
+- Packet `0x07` holds a `HistoryTree`: one `Node` for the file, with a `Node`
+  per input nested under it. Twelve of the 203 bundled plasmids have one; the
+  richest is `BlueScribe-mEGFP.dna`, 14 steps on nine levels.
+- Operation names come from the binary: `inFusionCloning`, `gatewayLRCloning`,
+  `amplifyFragment`, `insertFragment`, `goldenGateAssembly`,
+  `primerDirectedMutagenesis`, `flip`, `newFileFromSelection`,
+  `changeMethylation`, and `invalid` for a file not made in SnapGene.
+- Packet `0x0B` holds a snapshot of one parent, promised by `resurrectable="1"`.
+- The cookie of a written file is `SnapGene` + type 1 + versions 15 and 19, the
+  values in the files SnapGene ships.
+
+**The rule that matters**, found by writing test files and opening them:
+SnapGene quits as it opens a file whose history step has input nodes but no
+matching `InputSummary`. No dialog, no console message, no crash report: the
+process is simply gone within two seconds. It was isolated by cutting a product
+down one packet at a time (bases, features, notes and a single-node history all
+opened fine) and then by trying a series of two-parent trees. Adding one
+`InputSummary` per input fixed every one that had failed. `core.history.check` now
+refuses such a tree before anything is written.
+
+Two more rules came from the same files:
+
+- `InputSummary` values with `name1`/`name2` are printed next to those names
+  (`Replace BamHI (444) - HindIII (474)`, matching SnapGene's own
+  `BlueScribe-mEGFP`). Values without names are 0-based and printed one higher.
+- `resurrectable="1"` without a snapshot packet is safe once the mark is
+  removed, which is what the writer does. A sample stripped of its `0x0B`
+  packets opened fine.
+
+### Test inventory
+
+| File | Tests | What it covers |
+|---|---|---|
+| `test_dnawrite.py` | 21 | the round trip, rich text, colours, frames, methylation, what is refused |
+| `test_history.py` | 17 | tree shape, the InputSummary rule, what In-Fusion and Gateway record |
+| `test_cli.py` (added) | 6 | `.dna` by default, `.gb` on request, input files protected |
+| `test_full_e2e.py` (added) | 5 | all 203 shipped files written and reread, and SnapGene opening one |
+
+### Results
+
+Run on 2026-11-01, macOS, SnapGene 8.2.3 (Viewer, no licence).
+
+- **Round trip on everything SnapGene ships.** All 203 `.dna` files were
+  written back out and read again: same bases, same topology, same feature
+  names, ranges and strands, same primers. Biopython's independent SnapGene
+  reader agrees on every one.
+- **The real check.** `test_snapgene_opens_a_product_we_wrote` writes a Gateway
+  product, opens it in SnapGene and asserts SnapGene is still running eight
+  seconds later. It passes. Run it with `SNAPGENE_GUI=1`.
+- **The History view.** Both lab products were opened by hand. The In-Fusion
+  one draws the product over the vector and the PCR fragment, with the step
+  labelled IN-FUSION CLONING, `Replace 834 .. 1550`, `Insert 1 .. 738`, and the
+  PCR below it naming both primers and `Amplify 2127 .. 2834`. The Gateway one
+  draws GATEWAY LR CLONING over pcDNA-DEST40 (ccdB and CmR visible on its map)
+  and the entry clone, with `Replace attR1 (911) - attR2 (2615)` and
+  `Insert attL1 (358) - attL2 (2844)`.
+- **A parent's history is carried on.** `GFP Amplified.dna`, which SnapGene
+  made by PCR, keeps that `amplifyFragment` step when it is cloned into pUC19,
+  so the product's tree is four levels deep.
+- **A broken parent history is dropped, not passed on.** A tree that would make
+  SnapGene quit is left out of the product rather than copied into it.
+- **Input files are protected.** A product may not be written over the vector,
+  the insert, the entry clone or the destination vector, even with
+  `--overwrite`.
+
+The whole suite is now **251 passed, 2 skipped** (the two `gui` tests, off by
+default), 3.3 s. With `SNAPGENE_GUI=1` the two gui tests pass as well.
+
+### Checked by hand on lab files
+
+Both products were rebuilt as `.dna` next to the lab plasmids and reread:
+
+- `pENTR1A-FKBP-GFP-CterLTK-mCherry.dna`, 4507 bp, 9 features, 2 primers, four
+  history steps.
+- `pcDNA-DEST40-FKBP-GFP-CterLTK.dna`, 7775 bp, 19 features, three history
+  steps. Same length, feature count and att site positions as the GenBank
+  product built before Part 5, so the chemistry did not change.
+
+### Coverage notes
+
+- Snapshots of parent files (`0x0B`) are not written. The history draws
+  without them; a parent just cannot be reopened out of the product.
+- Enzyme sets, display settings, alignment and trace data are not written.
+  SnapGene opens files without them.
+- The saved `translation` qualifier is deliberately left out of written files:
+  SnapGene works it out from the bases, and a copy could be stale after an edit.
+- `edit` keeps the written story but drops the history tree, because the tree
+  describes bases that are no longer there. A tree for an edit (SnapGene's own
+  `insertFragment`) is not built.
+- The history is checked for the one rule that makes SnapGene quit, not for
+  everything SnapGene might dislike. A tree built by hand through the `history`
+  module could still be wrong in some other way.

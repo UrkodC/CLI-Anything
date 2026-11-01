@@ -2,14 +2,16 @@
 
 A SnapGene file is a list of packets. Each packet is 1 byte of type, a 4-byte
 big-endian length, then the data. The first packet is the cookie ("SnapGene"
-plus the sequence type). Packets this module does not need (history, enzyme
-display settings, traces) are skipped.
+plus the sequence type). The history tree is kept as text, so a product can
+carry its parents' history on. Packets this module does not need (enzyme
+display settings, traces, the snapshots of parent files) are skipped.
 
 Coordinates in this module are 1-based and inclusive, as in the SnapGene window.
 """
 from __future__ import annotations
 
 import html
+import lzma
 import re
 import struct
 from dataclasses import dataclass, field
@@ -22,6 +24,7 @@ from cli_anything.snapgene.errors import CliError
 PACKET_DNA = 0x00
 PACKET_PRIMERS = 0x05
 PACKET_NOTES = 0x06
+PACKET_HISTORY = 0x07
 PACKET_COOKIE = 0x09
 PACKET_FEATURES = 0x0A
 PACKET_PROTEIN = 0x15
@@ -52,6 +55,7 @@ class Segment:
     end: int
     name: str | None = None
     translated: bool = False
+    color: str | None = None   # kept so a written .dna draws the feature as before
 
     def to_dict(self) -> dict:
         return {"start": self.start, "end": self.end, "name": self.name, "translated": self.translated}
@@ -130,6 +134,7 @@ class SnapGeneFile:
     features: list[Feature]
     primers: list[Primer]
     notes: dict[str, str]
+    history: str | None = None   # the HistoryTree XML, if the file has one
 
     @property
     def name(self) -> str:
@@ -162,6 +167,7 @@ def plain_text(value: str | None) -> str:
     """SnapGene stores rich text as <html><body>...</body></html>. Return the words only."""
     if not value:
         return ""
+    value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
     return html.unescape(re.sub(r"<[^>]+>", "", value)).strip()
 
 
@@ -196,7 +202,8 @@ def _parse_features(blob: bytes, path: Path) -> list[Feature]:
             if seg.get("type") == "gap":
                 continue
             start, end = (int(x) for x in seg.get("range", "0-0").split("-"))
-            segments.append(Segment(start, end, seg.get("name"), seg.get("translated") == "1"))
+            segments.append(Segment(start, end, seg.get("name"), seg.get("translated") == "1",
+                                    seg.get("color")))
         if not segments:
             continue
         qualifiers: dict[str, list[str]] = {}
@@ -261,6 +268,19 @@ def _parse_notes(blob: bytes, path: Path) -> dict[str, str]:
     return notes
 
 
+def _history(blob: bytes) -> str | None:
+    """The history tree as text. SnapGene writes it plain or xz-compressed.
+
+    A history this module cannot read is left out rather than failing the
+    whole file: the sequence and features are still good without it.
+    """
+    try:
+        text = blob if blob[:1] == b"<" else lzma.decompress(blob)
+        return text.decode("utf-8")
+    except (lzma.LZMAError, UnicodeDecodeError):
+        return None
+
+
 def load(path: str | Path) -> SnapGeneFile:
     path = Path(path)
     if not path.is_file():
@@ -299,6 +319,7 @@ def load(path: str | Path) -> SnapGeneFile:
         features=_parse_features(by_type[PACKET_FEATURES], path) if PACKET_FEATURES in by_type else [],
         primers=_parse_primers(by_type[PACKET_PRIMERS], path) if PACKET_PRIMERS in by_type else [],
         notes=_parse_notes(by_type[PACKET_NOTES], path) if PACKET_NOTES in by_type else {},
+        history=_history(by_type[PACKET_HISTORY]) if PACKET_HISTORY in by_type else None,
     )
 
 

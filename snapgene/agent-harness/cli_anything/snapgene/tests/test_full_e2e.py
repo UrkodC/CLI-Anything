@@ -19,7 +19,7 @@ from Bio.Restriction import EcoRI, HindIII
 from Bio.Seq import Seq
 
 from cli_anything.snapgene.core import (
-    align, assemble, convert, cutting, dnafile, enzymes, gateway, infusion, seqtools,
+    align, assemble, convert, cutting, dnafile, dnawrite, enzymes, gateway, history, infusion, seqtools,
 )
 from cli_anything.snapgene.errors import CliError
 from cli_anything.snapgene.tests._helpers import ATTB1, ATTB2, entry_clone
@@ -324,3 +324,89 @@ def test_open_exported_genbank_in_snapgene(tmp_path):
         time.sleep(1)
     assert snapgene_backend.is_running()
     print(f"\n  Opened in SnapGene: {out}")
+
+
+# --- writing .dna files back out -------------------------------------------
+
+def test_every_shipped_file_survives_a_write_and_a_reread(tmp_path):
+    """Write all 200+ files SnapGene ships, read them back, compare."""
+    out = tmp_path / "again.dna"
+    checked = 0
+    for path in ALL_DNA:
+        sg = dnafile.load(path)
+        out.unlink(missing_ok=True)
+        dnawrite.write(sg, out)
+        again = dnafile.load(out)
+        assert again.sequence == sg.sequence, path
+        assert again.circular == sg.circular, path
+        assert [f.name for f in again.features] == [f.name for f in sg.features], path
+        assert [(f.start, f.end, f.strand) for f in again.features] == \
+               [(f.start, f.end, f.strand) for f in sg.features], path
+        assert [p.sequence for p in again.primers] == [p.sequence for p in sg.primers], path
+        checked += 1
+    assert checked == len(ALL_DNA)
+    print(f"\n  {checked} files written and read back unchanged")
+
+
+def test_biopython_reads_every_file_we_write(tmp_path):
+    out = tmp_path / "bio.dna"
+    for path in ALL_DNA:
+        sg = dnafile.load(path)
+        out.unlink(missing_ok=True)
+        dnawrite.write(sg, out)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            record = SeqIO.read(out, "snapgene")
+        assert str(record.seq).upper() == sg.sequence, path
+
+
+def test_a_shipped_history_is_carried_into_a_product(tmp_path):
+    """GFP Amplified was made by PCR in SnapGene; its product keeps that step."""
+    amplified = dnafile.load(GFP_PCR)
+    assert history.steps(amplified.history)[0]["operation"] == "amplifyFragment"
+    insert = assemble.take(amplified, 1, amplified.length, label="GFP")
+    opened = infusion.open_vector(dnafile.load(PUC19), ["EcoRI", "HindIII"])
+    product = infusion.design(opened, insert, insert_name="GFP")["_product"]
+    names = [(s["operation"], s["depth"]) for s in history.steps(product.history)]
+    assert names[:3] == [("inFusionCloning", 0), ("invalid", 1), ("amplifyFragment", 1)]
+    assert ("amplifyFragment", 2) in names      # the PCR SnapGene itself recorded
+    out = tmp_path / "pUC19-GFP.dna"
+    dnawrite.write(product, out)
+    assert len(history.steps(dnafile.load(out).history)) == len(names)
+
+
+def test_gateway_product_reads_back_as_a_snapgene_file(tmp_path):
+    entry, gene, _ = _gfp_entry_clone(tmp_path)
+    result = gateway.lr(entry, dnafile.load(PDEST14), Path("pDEST14-GFP"))
+    out = tmp_path / "pDEST14-GFP.dna"
+    report = dnawrite.write(result["_product"], out)
+    again = dnafile.load(out)
+    assert again.length == result["_product"].length and again.circular
+    assert seqtools.subseq(again, *result["att_sites"][0]["range"]) == ATTB1
+    gfp = dnafile.find_feature(again, "GFP")
+    # The protein still matches the one SnapGene saved in its own GFP file.
+    assert seqtools.translate(seqtools.subseq(again, gfp.start, gfp.end)) == \
+           seqtools.snapgene_translation(gene)
+    assert report["history_steps"] == 3
+    print(f"\n  SnapGene file: {out} ({report['bytes']:,} bytes, {report['history_steps']} history steps)")
+
+
+@pytest.mark.gui
+def test_snapgene_opens_a_product_we_wrote(tmp_path):
+    """The real check: SnapGene 8 quits on a malformed history, with no message."""
+    entry, _, _ = _gfp_entry_clone(tmp_path)
+    product = gateway.lr(entry, dnafile.load(PDEST14), Path("pDEST14-GFP"))["_product"]
+    out = tmp_path / "pDEST14-GFP.dna"
+    dnawrite.write(product, out)
+
+    snapgene_backend.open_in_app(PUC19)          # a known-good file, so the app is up
+    for _ in range(30):
+        if snapgene_backend.is_running():
+            break
+        time.sleep(1)
+    assert snapgene_backend.is_running(), "SnapGene did not start"
+
+    snapgene_backend.open_in_app(out)
+    time.sleep(8)
+    assert snapgene_backend.is_running(), f"SnapGene quit on {out.name}"
+    print(f"\n  SnapGene opened {out.name} and stayed up")

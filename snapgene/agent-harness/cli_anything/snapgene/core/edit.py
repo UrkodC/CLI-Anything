@@ -9,6 +9,7 @@ A feature that the change cuts in half is left out of the result and reported.
 from __future__ import annotations
 
 import dataclasses
+from datetime import date
 from pathlib import Path
 
 from cli_anything.snapgene.core import assemble, seqtools
@@ -81,6 +82,11 @@ def edit(sg: SnapGeneFile, sequence: str = "", at: int | None = None,
     product, dropped = assemble.assemble(pieces, output or sg.path.with_suffix(".gb"),
                                          circular=sg.circular, notes=dict(sg.notes))
     assemble.relocate_primers(product, sg.primers)
+    # The history tree describes the old sequence, so it is not carried on.
+    # The written story is, with this edit added to it.
+    line = f"Edited with cli-anything-snapgene on {date.today().isoformat()}: {sg.path.name}, {what}."
+    earlier = product.notes.get("description")
+    product.notes["description"] = f"{earlier}\n{line}" if earlier else line
     return {
         "input": str(sg.path),
         "change": what,

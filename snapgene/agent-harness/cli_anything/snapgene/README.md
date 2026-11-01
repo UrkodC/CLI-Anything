@@ -7,20 +7,22 @@ searches folders of plasmids, and opens files in the SnapGene app.
 
 It also does the work SnapGene keeps behind a paid licence: cut a plasmid, design
 Takara In-Fusion primers, run a Gateway LR reaction, build the product plasmid, check a
-fragment before you order it as synthetic DNA, edit a sequence, and add features. Those commands write GenBank,
-which the free SnapGene Viewer opens and draws as a map.
+fragment before you order it as synthetic DNA, edit a sequence, and add features. Those
+commands write a SnapGene `.dna` file, carrying the cloning history that SnapGene draws
+in its History view, or GenBank if you ask for a `.gb` name. The free SnapGene Viewer
+opens either one.
 
 ## What it uses from SnapGene
 
 SnapGene for macOS has no scripting interface and no headless mode. This tool uses:
 
-- **SnapGene's file format**, read directly (packets in the `.dna` file).
+- **SnapGene's file format**, read and written directly (packets in the `.dna` file).
 - **SnapGene's bundled aligners**: Clustal Omega and MUSCLE from
   `SnapGene.app/Contents/Resources/Tools`.
 - **The SnapGene app**, to open files for you to look at (`open` command).
 
-It does **not** edit `.dna` files. It never writes to an input file. Products and edits
-come out as GenBank.
+It never writes to an input file, and a product may not replace any file it was made
+from, even with `--overwrite`.
 
 Restriction sites come from REBASE (through Biopython), the same source SnapGene uses.
 Dam/Dcm methylation blocking is not applied.
@@ -89,7 +91,7 @@ cli-anything-snapgene cut pUC19.dna --enzyme EcoRI,HindIII
 
 # In-Fusion a gene into a cut vector: two primers, the fragment, the product
 cli-anything-snapgene infusion pUC19.dna --enzyme EcoRI --enzyme HindIII \
-    --insert pCMV-mCherry.dna --insert-feature mCherry -o pUC19-mCherry.gb
+    --insert pCMV-mCherry.dna --insert-feature mCherry -o pUC19-mCherry.dna
 
 # A fusion protein: leave the insert's stop codon out, and name the insert
 cli-anything-snapgene infusion pENTR1A-FKBP-GFP-CterLTK.dna --remove 834-1550 \
@@ -103,6 +105,10 @@ cli-anything-snapgene infusion pENTR1A.dna --remove 500-1200 --insert insert.dna
 cli-anything-snapgene infusion vector.dna --at 100 --insert gene.dna --overlap 25
 
 # Gateway LR: put an entry clone into a destination vector
+cli-anything-snapgene gateway pcDNA-DEST40.dna --entry pENTR1A-FKBP-GFP-CterLTK.dna \
+    --name FKBP-GFP-CterLTK
+
+# ... and the same product as GenBank instead, without the drawn history
 cli-anything-snapgene gateway pcDNA-DEST40.dna --entry pENTR1A-FKBP-GFP-CterLTK.dna \
     --name FKBP-GFP-CterLTK -o pcDNA40-FKBP-GFP-CterLTK.gb
 
@@ -132,8 +138,8 @@ size. `-o` writes a GenBank copy of the file with the pairs on it as primers.
 `primer-check` says where a primer matches exactly, on either strand, counting the origin,
 and gives its Tm, GC, hairpin and self dimer.
 
-`infusion` writes the product as GenBank next to the vector unless you give `-o`, and
-`--fragment-out` writes the fragment to order as FASTA. The fragment is the PCR product:
+`infusion` writes the product next to the vector as `<vector>-<insert>.dna` unless you
+give `-o`, and `--fragment-out` writes the fragment to order as FASTA. The fragment is the PCR product:
 forward primer, insert, reverse primer. Order it as a gBlock, or amplify it.
 
 Every join rebuilds the restriction site unless you pass `--no-restore-sites`, the same
@@ -148,10 +154,28 @@ product, so the map is not renumbered.
 the entry clone, drops the ccdB cassette between attR1 and attR2 of the destination
 vector, and writes the expression clone with a real attB1 and attB2 at the joins. It
 reports any tag next to the insert and whether the insert is in frame with it. Both
-files must be `.dna`: the CLI reads SnapGene files and writes GenBank, not the other
-way round.
+input files must be `.dna`: the CLI reads SnapGene files only.
 
 `edit`, `infusion` and `gateway` never touch the input files.
+
+### The cloning history
+
+`infusion` and `gateway` write the story of the cloning into the product, two ways:
+
+- **The History view.** Open the product in SnapGene and click **History**. It draws the
+  product over the files it came from, with the step named (In-Fusion Cloning, Gateway
+  LR Cloning), the primers of the PCR, and the new bases in red. A parent that has its
+  own history keeps it, so the tree goes all the way back.
+- **In words**, in the file's description: which vector, how it was opened, where the
+  insert came from, the primers, and what came out. `edit` adds a line there too.
+
+Give `-o name.gb` for GenBank instead. The words are kept (GenBank's DEFINITION line);
+the drawn history is not, because GenBank has nowhere to put it.
+
+SnapGene does not publish the history format. These rules were worked out from the files
+SnapGene ships and checked by opening written files in SnapGene 8.2.3: SnapGene quits as
+it opens a file whose history step has inputs but no matching input summary, with no
+error message, so the tool checks that before it writes and refuses to write a bad one.
 
 ### Errors
 
@@ -178,8 +202,9 @@ SNAPGENE_GUI=1 ~/.venvs/cli-anything-snapgene/bin/pytest snapgene/agent-harness/
 
 ## Not supported
 
-- Writing `.dna` files. Edits and products come out as GenBank, which SnapGene and the
-  free SnapGene Viewer open.
+- Writing the snapshots of parent files SnapGene keeps inside a `.dna` file. The history
+  is drawn without them; a parent just cannot be reopened out of the product.
+- Writing enzyme sets, display settings or alignment data into a `.dna` file.
 - Alignment (`.dnaln`), gel, trace and collection files as input.
 - Rendering maps (SnapGene draws maps only in its window). No `preview` command.
 - Reading GenBank or FASTA back in. Input is always a SnapGene file.

@@ -43,13 +43,19 @@ def _genbank_date(value: str | None) -> str | None:
     return f"{int(m.group(3)):02d}-{months[int(m.group(2)) - 1]}-{m.group(1)}"
 
 
+def _definition(sg: SnapGeneFile) -> str:
+    """The DEFINITION line: the description on one line. Biopython adds the closing period."""
+    text = " ".join(line.strip() for line in (sg.notes.get("description") or "").splitlines() if line.strip())
+    return text.rstrip(".") or sg.name
+
+
 def to_record(sg: SnapGeneFile, include_primers: bool = True) -> SeqRecord:
     locus = re.sub(r"[^A-Za-z0-9_.-]", "_", sg.name)[:16] or "sequence"
     record = SeqRecord(
         Seq(sg.sequence),
         id=locus,
         name=locus,
-        description=sg.notes.get("description") or sg.name,
+        description=_definition(sg),
     )
     record.annotations["molecule_type"] = MOLECULE[sg.kind]
     record.annotations["topology"] = "circular" if sg.circular else "linear"
