@@ -108,3 +108,38 @@ Limits of these results:
 - G5 used read calls in server A. A second server that starts during a write of server A was not tested.
 - The lease is not fair. In 3 of 5 repetitions of G5 the second start most likely waited for the whole group of ten reads of server A. This is derived from the time stamps (the second start ended about 0.6 s after server A's last read, and an idle start takes about 0.6 s); no time stamp of the lease take exists.
 - The server leaves a file `edit-plan-token-<hex>.claimed` in the bridge folder after an applied edit plan.
+
+## Live checks of Plan 2
+
+### Round 1, 2026-11-18: write path, clip list, effect get, effect set
+
+Premiere Pro 27.0.0 (build 88), panel 1.25.0, `premiere-pro-mcp` 1.25.0, project `fixture27 Claude.prproj`. All writes went to a duplicate sequence (`E2E copy`), which the run deleted at its end. The project was closed without saving. Command: `PREMIERE_LIVE_E2E=1 python -m pytest cli_anything/premiere/tests/test_live_e2e.py -q -s`. Result: 24 passed in 48 s. No recovery marker. The fixture sequence was unchanged at the end (ProcAmp Brightness 7.7 before and after).
+
+What the run showed:
+
+| Check | Result |
+|---|---|
+| `live run --write --verify` through the command | The write stored and the check script confirmed it. This is the first live write through the lease and signal code of the final review of Plan 1. |
+| `live clip list` | Two video clips, node IDs of the copy differ from the fixture's, render order ProcAmp, ASC CDL, Lumetri Color. With `--detail`: interpreted frame rate 23.976, the linked clip's node ID, `Motion.Rotation` as keyframed. |
+| `live effect get` | Lumetri Color: 130 properties in 0.4 s. Temperature, Saturation and Contrast occur more than once, so a write needs the index and the name. Motion Position reads as an array `[0.5, 0.5]`. |
+| `live effect set`, one negative value | ProcAmp Brightness from 5 to -2.6: zero was written first, stored at the first attempt. |
+| `live effect set --from PLAN.json` | 6 of 6 stored at the first attempt: ProcAmp Brightness -3.7, Lumetri Temperature -20, Tint -5, Exposure 0.4, Contrast 12, Blacks -8. |
+| Refusals | A wrong name at an index, Lumetri index 7, an audio clip by node ID, and a wrong `--expect-old` were each refused before any write. None left a recovery marker. |
+| `--dry-run` | The values were the same before and after. |
+| The two reads agree | The read-back of a write and a later `live effect get` gave the same values (Tint 3.3, ProcAmp Contrast 97.5). |
+| Control through the MCP tool | `set_effect_property` on the same clip: ProcAmp Brightness 5 then -2.6, Lumetri Temperature 5 then -40. All four verified. |
+
+What this means for the negative-value rule: on Premiere 27.0.0 no fault ("Illegal Parameter type") was seen through the CLI's own script or through the MCP tool. Every fault on record is on Premiere 26.5.2. The sample on 27.0.0 is small (about 130 raw writes in the gate run, 5 here, 4 through the tool here and 5 by the film session). The recipe keeps the rule of the design: zero first when a value crosses zero, a second attempt, then a near value; when nothing lands, the old value is put back.
+
+Measured for the next recipes:
+
+- `export_frame` (MCP tool) exports the active sequence only. With `expected_project_path` and `expected_cep_target` it took 0.85 s for one PNG, and a file name with a space worked.
+- `app.getEnableProxies()` returns the number 1 or 0. `app.setEnableProxies()` from a script switches proxy display for the whole app and reads back at once.
+- `app.project.activeSequence = seq` from a script switches the active sequence, and a later state read agrees. The MCP tool `duplicate_sequence` makes the new copy active.
+- A fresh Lumetri Color reads the single character U+FEFE at index 4 (an empty LUT slot). A slot that holds a LUT reads the full path with a trailing slash, while index 6 reads 0.
+
+Not shown by this run:
+
+- The name of a transition in `live clip list --detail` (the fixture has no transition).
+- A failed negative write on the real app, so the near-value step and the put-back have run only in unit tests.
+- A plan long enough to pass the 15 s lease limit (the breath between writes has run only in unit tests).
