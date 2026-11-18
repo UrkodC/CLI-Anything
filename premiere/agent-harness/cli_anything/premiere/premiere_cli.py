@@ -109,7 +109,7 @@ def status(ctx: click.Context) -> None:
         live_bridge = importlib.import_module("cli_anything.premiere.core.bridge")
         bridge_dir = live_bridge.default_bridge_dir()
         heartbeat = live_bridge.read_heartbeat(bridge_dir)
-        live = {"panel_heartbeat": "absent" if heartbeat is None else ("fresh" if heartbeat.fresh else "stale"),
+        live = {"panel_heartbeat": "absent" if heartbeat is None else ("fresh" if heartbeat.fresh else "waiting" if heartbeat.waiting else "stale"),
                 "bridge_dir": str(bridge_dir)}
         lines.append(f"Live panel heartbeat: {live['panel_heartbeat']} ({live['bridge_dir']})")
     except Exception as exc:

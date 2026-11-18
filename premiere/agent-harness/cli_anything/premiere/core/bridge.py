@@ -88,7 +88,13 @@ class Heartbeat:
 
     @property
     def fresh(self) -> bool:
-        return self.age_s <= HEARTBEAT_STALE_S and self.state in ("running", "waiting")
+        """The connector runs and the heartbeat is young: the panel takes commands."""
+        return self.age_s <= HEARTBEAT_STALE_S and self.state == "running"
+
+    @property
+    def waiting(self) -> bool:
+        """The panel is open and its heartbeat is young, but its connector is stopped: it takes no command."""
+        return self.age_s <= HEARTBEAT_STALE_S and self.state == "waiting"
 
 
 def _int(value: object) -> int | None:
@@ -471,8 +477,8 @@ class BridgeClient:
         if write:
             heartbeat = read_heartbeat(self.bridge_dir)
             if heartbeat is None or not heartbeat.fresh:
-                raise CliError("bridge_down", "The Premiere panel is not running (no fresh heartbeat). "
-                                              "Nothing was sent.")
+                raise CliError("bridge_down", "The Premiere panel is not ready (no fresh heartbeat from a running "
+                                              "connector). Nothing was sent.")
         cmd_id = str(uuid.uuid4())
         cmd = self.bridge_dir / f"cmd_{cmd_id}.jsx"
         staged = self.bridge_dir / f"cmd_{cmd_id}.jsx.staged"

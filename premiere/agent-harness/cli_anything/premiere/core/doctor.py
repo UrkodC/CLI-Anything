@@ -133,6 +133,7 @@ def _state_checks(state: object) -> list[dict]:
 def run_checks(client: BridgeClient, *, premiere: Callable[[], dict | None] = ui.running_premiere,
                panel: Callable[[], str | None] = guard.panel_version,
                which: Callable[[str], str | None] = shutil.which,
+               server: Callable[[], str | None] = guard.server_version,
                osascript: Callable[[str], str] = ui.run_osascript) -> list[dict]:
     """All twelve checks, in a fixed order. Never changes anything. The only CliError it raises is
     "interrupted", when a signal stops the state read; Interrupted and KeyboardInterrupt pass through.
@@ -191,8 +192,12 @@ def run_checks(client: BridgeClient, *, premiere: Callable[[], dict | None] = ui
                 fix = ""
             except CliError as err:
                 fix = err.message
-            what = ("absent" if heartbeat is None
-                    else f"stale ({heartbeat.age_s:.1f} s old, state {heartbeat.state})")
+            if heartbeat is None:
+                what = "absent"
+            elif heartbeat.waiting:
+                what = f"waiting ({heartbeat.age_s:.1f} s old)"
+            else:
+                what = f"stale ({heartbeat.age_s:.1f} s old, state {heartbeat.state})"
             found["panel_heartbeat"] = _check("panel_heartbeat", "fail", f"{what}. {fix}".strip())
             state_skip = "not checked, the panel heartbeat failed."
 
@@ -246,10 +251,17 @@ def run_checks(client: BridgeClient, *, premiere: Callable[[], dict | None] = ui
             found[name] = _check(name, "warn", state_skip)
 
     # mcp_server
-    if which(MCP_SERVER):
-        found["mcp_server"] = _check("mcp_server", "pass", f"{MCP_SERVER} is on PATH.")
-    else:
+    if not which(MCP_SERVER):
         found["mcp_server"] = _check("mcp_server", "warn", f"{MCP_SERVER} is not on PATH: the mcp commands will not work.")
+    else:
+        version = server()
+        if version in guard.TESTED_SERVER_VERSIONS:
+            found["mcp_server"] = _check("mcp_server", "pass", f"{MCP_SERVER} {version}")
+        elif version is None:
+            found["mcp_server"] = _check("mcp_server", "warn", f"{MCP_SERVER} is on PATH but its version cannot be "
+                                                               "read, so it is untested: read only.")
+        else:
+            found["mcp_server"] = _check("mcp_server", "warn", f"{MCP_SERVER} {version} is untested: read only.")
 
     # accessibility
     if app is None:

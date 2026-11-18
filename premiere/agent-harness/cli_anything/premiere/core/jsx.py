@@ -27,8 +27,12 @@ def load(name: str) -> str:
         raise CliError("script_missing", f"The script {name}.jsx is missing from {SCRIPTS_DIR}.") from None
 
 
-def build(body: str, args: dict | None = None) -> str:
-    """Wrap `body` with the helpers and `ARGS` (a JSON object, ASCII only) into one script expression."""
+def build(body: str, args: dict | None = None, include: tuple[str, ...] = ()) -> str:
+    """Wrap `body` with the helpers and `ARGS` (a JSON object, ASCII only) into one script expression.
+
+    Each name in `include` is loaded with `load` and put after the helpers, before `ARGS`: a script that
+    only defines functions and variables for the body. A name with no script raises script_missing.
+    """
     if args is None:
         args = {}
     if not isinstance(args, dict):
@@ -37,10 +41,12 @@ def build(body: str, args: dict | None = None) -> str:
         args_json = json.dumps(args, ensure_ascii=True, allow_nan=False)
     except (TypeError, ValueError, RecursionError) as exc:
         raise CliError("bad_args", f"Script arguments cannot be written as JSON: {exc}") from None
+    included = "".join(load(name).rstrip("\n") + "\n" for name in include)
     return ("(function () {\n"
             + load("helpers").rstrip("\n") + "\n"
+            + included
             + f"var ARGS = {args_json};\n"
             + "try {\n"
             + body.rstrip("\n") + "\n"
-            + "} catch (e) { return __fail(String(e)); }\n"
+            + '} catch (e) { return __fail(String(e) + (e && e.line ? " (line " + e.line + ")" : "")); }\n'
             + "})()")

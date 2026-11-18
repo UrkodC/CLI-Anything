@@ -21,8 +21,8 @@ from cli_anything.premiere.core.bridge import BridgeClient, mark_recovery
 from cli_anything.premiere.errors import CliError
 from cli_anything.premiere.premiere_cli import dispatch
 from cli_anything.premiere.tests.fakes import (  # noqa: F401
-    MARKER_SHAPES, FakePanel, bridge_dir, cmd_files, keep_signals, restore_marker_mode, signal_when,
-    unreadable_marker, write_heartbeat)
+    DEFAULT_HEARTBEAT, MARKER_SHAPES, FakePanel, bridge_dir, cmd_files, keep_signals, restore_marker_mode,
+    signal_when, unreadable_marker, write_heartbeat)
 
 LOCK = ".host-owner-lease"
 RECOVERY = ".host-recovery.json"
@@ -101,7 +101,7 @@ def _keep_signal_handlers(keep_signals):  # noqa: F811
 @pytest.fixture
 def stubs():
     return {"premiere": lambda: APP, "panel": lambda: "1.25.0", "which": lambda name: "/usr/local/bin/" + name,
-            "osascript": Osascript()}
+            "server": lambda: "1.25.0", "osascript": Osascript()}
 
 
 @pytest.fixture
@@ -119,6 +119,7 @@ def cli_stubs(bridge_dir, monkeypatch, stubs):  # noqa: F811
     monkeypatch.setattr(ui, "running_premiere", stubs["premiere"])
     monkeypatch.setattr(ui, "run_osascript", stubs["osascript"])
     monkeypatch.setattr(guard, "panel_version", stubs["panel"])
+    monkeypatch.setattr(guard, "server_version", stubs["server"])
     monkeypatch.setattr(shutil, "which", lambda name, *a, **k: "/usr/local/bin/" + name)
     return stubs
 
@@ -348,6 +349,59 @@ def test_untested_panel_protocol_and_no_mcp_server(bridge_dir, stubs):  # noqa: 
     assert found["mcp_server"]["status"] == "warn" and "the mcp commands will not work" in found["mcp_server"]["detail"]
 
 
+def test_doctor_shows_the_server_version(bridge_dir, panel, stubs):  # noqa: F811
+    found = by_name(doctor.run_checks(look(bridge_dir), **stubs))
+    assert found["mcp_server"] == {"name": "mcp_server", "status": "pass", "detail": "premiere-pro-mcp 1.25.0"}
+    stubs["server"] = lambda: "1.26.0"                 # a version that was not tested is a warning
+    other = by_name(doctor.run_checks(look(bridge_dir), **stubs))["mcp_server"]
+    assert other["status"] == "warn"
+    assert "premiere-pro-mcp 1.26.0" in other["detail"] and "untested: read only" in other["detail"]
+
+
+def test_an_mcp_server_whose_version_cannot_be_read_is_a_warning(bridge_dir, panel, stubs):  # noqa: F811
+    stubs["server"] = lambda: None
+    detail = by_name(doctor.run_checks(look(bridge_dir), **stubs))["mcp_server"]
+    assert detail["status"] == "warn"
+    assert "cannot be read" in detail["detail"] and "untested: read only" in detail["detail"]
+
+
+def test_a_missing_mcp_server_is_not_asked_for_its_version(bridge_dir, panel, stubs):  # noqa: F811
+    def boom():
+        raise AssertionError("the version of a server that is not on PATH was read")
+
+    stubs["which"] = lambda name: None
+    stubs["server"] = boom
+    detail = by_name(doctor.run_checks(look(bridge_dir), **stubs))["mcp_server"]
+    assert detail == {"name": "mcp_server", "status": "warn",
+                      "detail": "premiere-pro-mcp is not on PATH: the mcp commands will not work."}
+
+
+def test_the_doctor_command_reads_the_server_version_when_it_runs(bridge_dir, panel, capsys, cli_stubs,  # noqa: F811
+                                                                  monkeypatch):
+    monkeypatch.setattr(guard, "server_version", lambda *a, **k: "1.26.0")
+    code, out = run_json(capsys, ["doctor"])
+    found = by_name(out["checks"])
+    assert code == 0 and found["mcp_server"]["status"] == "warn"
+    assert "1.26.0" in found["mcp_server"]["detail"]
+
+
+def test_a_waiting_panel_is_a_failed_heartbeat(bridge_dir, stubs, capsys, cli_stubs):  # noqa: F811
+    p = FakePanel(bridge_dir, handler_for(), heartbeat={**DEFAULT_HEARTBEAT, "state": "waiting"})
+    p.start()
+    try:
+        found = by_name(doctor.run_checks(look(bridge_dir), **stubs))
+        code, out = run_json(capsys, ["doctor"])
+    finally:
+        p.stop()
+    beat = found["panel_heartbeat"]
+    assert beat["status"] == "fail" and "Start Bridge" in beat["detail"]
+    assert beat["detail"].startswith("waiting") and "stale" not in beat["detail"]
+    for name in STATE_CHECKS:
+        assert found[name]["status"] == "warn" and "not checked" in found[name]["detail"]
+    assert code == 1 and out["code"] == "doctor_failed" and "panel_heartbeat" in out["error"]
+    assert p.seen == []
+
+
 def test_missing_bridge_folder_never_raises(tmp_path, stubs):
     checks = doctor.run_checks(look(tmp_path / "missing"), **stubs)
     assert [c["name"] for c in checks] == NAMES
@@ -438,6 +492,27 @@ def test_status_reports_a_fresh_heartbeat(bridge_dir, monkeypatch, capsys):  # n
         p.stop()
     assert code == 0 and data["live"] == {"panel_heartbeat": "fresh", "bridge_dir": str(bridge_dir)}
     assert p.seen == [] and not (bridge_dir / LOCK).exists()
+
+
+@pytest.mark.parametrize("state, age_s, label", [
+    ("running", 0.1, "fresh"),
+    ("waiting", 0.1, "waiting"),
+    ("running", 10, "stale"),
+    ("waiting", 10, "stale"),
+    ("stopped", 0.1, "stale"),
+    (None, 0, "absent"),
+], ids=["running", "waiting", "old-running", "old-waiting", "stopped", "none"])
+def test_status_labels_the_heartbeat(bridge_dir, monkeypatch, capsys, state, age_s, label):  # noqa: F811
+    monkeypatch.setenv("PREMIERE_TEMP_DIR", str(bridge_dir))
+    if state is not None:
+        write_heartbeat(bridge_dir, {**DEFAULT_HEARTBEAT, "state": state})
+        if age_s > 3:
+            old = time.time() - age_s
+            os.utime(bridge_dir / "bridge-heartbeat.json", (old, old))
+    code, data = run_json(capsys, ["status"])
+    assert code == 0 and data["live"] == {"panel_heartbeat": label, "bridge_dir": str(bridge_dir)}
+    assert dispatch(["status"]) == 0
+    assert f"Live panel heartbeat: {label} (" in capsys.readouterr().out
 
 
 def test_status_survives_a_broken_bridge_module(monkeypatch, capsys):

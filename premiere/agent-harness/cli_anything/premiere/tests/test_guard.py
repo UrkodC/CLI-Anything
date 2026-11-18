@@ -1,6 +1,8 @@
 """Unit tests for the guards that run before every live command (pure checks, no Premiere needed)."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from cli_anything.premiere.core import guard
@@ -11,6 +13,15 @@ from cli_anything.premiere.tests.fakes import (  # noqa: F401
 
 COPY = ("Fall Claude.prproj", "/p/Fall Claude.prproj", True)
 OWN = ("Family film.prproj", "/p/Family film.prproj", True)
+
+
+REAL_SERVER_VERSION = guard.server_version      # the autouse fixture below replaces guard.server_version
+
+
+@pytest.fixture(autouse=True)
+def _tested_server(monkeypatch):
+    """No test here depends on the server installed on this machine."""
+    monkeypatch.setattr(guard, "server_version", lambda *a, **k: "1.25.0")
 
 
 def state(version="27.0.0", projects=(COPY,)):
@@ -64,6 +75,143 @@ def test_untested_panel(heartbeat, panel):
     assert len(allowed) == 1 and "--allow-untested" in allowed[0]
     # on a read the override changes nothing: still the same single warning
     assert len(guard.check_bridge(heartbeat, panel, write=False, allow_untested=True)) == 1
+
+
+WAITING = ("The panel is open but its connector is stopped. "
+           "Click Start Bridge in the MCP Bridge panel.")
+
+
+@pytest.mark.parametrize("write", [False, True])
+@pytest.mark.parametrize("allow_untested", [False, True])
+def test_waiting_heartbeat_is_bridge_down(write, allow_untested):
+    with pytest.raises(CliError) as e:
+        guard.check_bridge(beat(run_state="waiting"), "1.25.0", write=write, allow_untested=allow_untested)
+    assert e.value.code == "bridge_down"
+    assert e.value.message == WAITING and "Start Bridge" in e.value.message
+
+
+def test_an_old_waiting_heartbeat_is_the_stale_message():
+    with pytest.raises(CliError) as e:
+        guard.check_bridge(beat(run_state="waiting", age_s=10), "1.25.0", write=True, allow_untested=False)
+    assert e.value.code == "bridge_down" and e.value.message == STALE
+
+
+def test_untested_server_warns_a_read_and_refuses_a_write():
+    read = guard.check_bridge(beat(), "1.25.0", write=False, allow_untested=False, server="1.26.0")
+    assert len(read) == 1 and "1.26.0" in read[0] and "1.25.0" in read[0]
+    with pytest.raises(CliError) as e:
+        guard.check_bridge(beat(), "1.25.0", write=True, allow_untested=False, server="1.26.0")
+    assert e.value.code == "untested_bridge"
+    assert "1.26.0" in e.value.message and "--allow-untested" in e.value.message
+    allowed = guard.check_bridge(beat(), "1.25.0", write=True, allow_untested=True, server="1.26.0")
+    assert len(allowed) == 1 and "1.26.0" in allowed[0] and "--allow-untested" in allowed[0]
+    assert guard.check_bridge(beat(), "1.25.0", write=False, allow_untested=True, server="1.26.0") == read
+
+
+def test_missing_server_refuses_a_write():
+    read = guard.check_bridge(beat(), "1.25.0", write=False, allow_untested=False, server=None)
+    assert len(read) == 1 and "unknown" in read[0]
+    with pytest.raises(CliError) as e:
+        guard.check_bridge(beat(), "1.25.0", write=True, allow_untested=False, server=None)
+    assert e.value.code == "untested_bridge" and "unknown" in e.value.message
+    allowed = guard.check_bridge(beat(), "1.25.0", write=True, allow_untested=True, server=None)
+    assert len(allowed) == 1 and "--allow-untested" in allowed[0]
+
+
+def test_a_tested_server_adds_nothing():
+    assert guard.check_bridge(beat(), "1.25.0", write=True, allow_untested=False, server="1.25.0") == []
+
+
+def test_every_untested_version_is_named_by_one_error():
+    heartbeat = beat(protocol=2)
+    with pytest.raises(CliError) as e:
+        guard.check_bridge(heartbeat, "1.26.0", write=True, allow_untested=False, server="1.27.0")
+    assert e.value.code == "untested_bridge"
+    for part in ("protocol 2", "panel version 1.26.0", "1.27.0"):
+        assert part in e.value.message
+    # a read gets one warning for the panel side and one for the server, an allowed write the same two
+    read = guard.check_bridge(heartbeat, "1.26.0", write=False, allow_untested=False, server="1.27.0")
+    assert len(read) == 2 and "protocol 2" in read[0] and "1.27.0" in read[1]
+    allowed = guard.check_bridge(heartbeat, "1.26.0", write=True, allow_untested=True, server="1.27.0")
+    assert len(allowed) == 2 and all("--allow-untested" in w for w in allowed)
+
+
+def test_unset_server_is_looked_up_when_called(monkeypatch):
+    monkeypatch.setattr(guard, "server_version", lambda *a, **k: "1.26.0")
+    warnings = guard.check_bridge(beat(), "1.25.0", write=False, allow_untested=False)
+    assert len(warnings) == 1 and "1.26.0" in warnings[0]
+    # a value given by the caller wins, None included
+    assert guard.check_bridge(beat(), "1.25.0", write=False, allow_untested=False, server="1.25.0") == []
+    assert len(guard.check_bridge(beat(), "1.25.0", write=False, allow_untested=False, server=None)) == 1
+
+
+@pytest.mark.parametrize("heartbeat", [None, beat(age_s=10), beat(run_state="waiting"), beat(run_state="stopped")],
+                         ids=["none", "stale", "waiting", "stopped"])
+def test_a_down_bridge_never_looks_up_the_server(heartbeat, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("the server was looked up")
+
+    monkeypatch.setattr(guard, "server_version", boom)
+    with pytest.raises(CliError) as e:
+        guard.check_bridge(heartbeat, "1.25.0", write=False, allow_untested=False)
+    assert e.value.code == "bridge_down"
+
+
+# ---------- server_version ----------
+def install(tmp_path, package=None):
+    """A fake npm install: bin/premiere-pro-mcp is a symlink to lib/premiere-pro-mcp/dist/index.js."""
+    root = tmp_path / "lib" / "premiere-pro-mcp"
+    (root / "dist").mkdir(parents=True)
+    (root / "dist" / "index.js").write_text("#!/usr/bin/env node\n")
+    if package is not None:
+        (root / "package.json").write_text(package)
+    (tmp_path / "bin").mkdir()
+    link = tmp_path / "bin" / "premiere-pro-mcp"
+    link.symlink_to("../lib/premiere-pro-mcp/dist/index.js")
+    return link
+
+
+def test_server_version_reads_package_json(tmp_path):
+    link = install(tmp_path, json.dumps({"name": "premiere-pro-mcp", "version": "1.25.0"}))
+    asked = []
+
+    def which(name):
+        asked.append(name)
+        return str(link)
+
+    assert REAL_SERVER_VERSION(which=which) == "1.25.0"
+    assert asked == ["premiere-pro-mcp"]
+
+
+def test_server_version_missing_parts_give_none(tmp_path):
+    assert REAL_SERVER_VERSION(which=lambda name: None) is None                                # no binary
+    assert REAL_SERVER_VERSION(which=lambda name: str(tmp_path / "gone")) is None              # binary not on disk
+    assert REAL_SERVER_VERSION(which=lambda name: str(install(tmp_path))) is None             # no package.json
+
+
+@pytest.mark.parametrize("package", [
+    json.dumps({"name": "other-server", "version": "1.25.0"}),            # other package name
+    json.dumps({"version": "1.25.0"}),                                    # no name
+    json.dumps({"name": "premiere-pro-mcp"}),                             # no version
+    json.dumps({"name": "premiere-pro-mcp", "version": 1.25}),            # version is not a string
+    json.dumps({"name": "premiere-pro-mcp", "version": ""}),              # empty version
+    json.dumps(["premiere-pro-mcp", "1.25.0"]),                           # not an object
+    "{not json",
+    "",
+], ids=["other-name", "no-name", "no-version", "number", "empty", "list", "bad-json", "empty-file"])
+def test_server_version_unusable_package_json_gives_none(tmp_path, package):
+    link = install(tmp_path, package)
+    assert REAL_SERVER_VERSION(which=lambda name: str(link)) is None
+
+
+def test_server_version_unreadable_package_json_gives_none(tmp_path):
+    link = install(tmp_path)
+    (tmp_path / "lib" / "premiere-pro-mcp" / "package.json").mkdir()                          # a folder
+    assert REAL_SERVER_VERSION(which=lambda name: str(link)) is None
+    folder = tmp_path / "lib" / "premiere-pro-mcp" / "package.json"
+    folder.rmdir()
+    folder.write_bytes(b"\xff\xfe not utf-8")
+    assert REAL_SERVER_VERSION(which=lambda name: str(link)) is None
 
 
 # ---------- check_state: Premiere version ----------

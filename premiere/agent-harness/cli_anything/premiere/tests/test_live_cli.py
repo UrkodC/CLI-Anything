@@ -16,7 +16,8 @@ from cli_anything.premiere.core import guard
 from cli_anything.premiere.core.bridge import BridgeClient, mark_recovery
 from cli_anything.premiere.premiere_cli import LazyGroup, cli, dispatch
 from cli_anything.premiere.tests.fakes import (  # noqa: F401
-    MARKER_SHAPES, FakePanel, bridge_dir, keep_signals, restore_marker_mode, signal_when, unreadable_marker)
+    DEFAULT_HEARTBEAT, MARKER_SHAPES, FakePanel, bridge_dir, keep_signals, restore_marker_mode, signal_when,
+    unreadable_marker)
 
 ROOT = Path(__file__).resolve().parents[3]
 LOCK = ".host-owner-lease"
@@ -64,6 +65,7 @@ def _no_real_bridge(monkeypatch, tmp_path):
 def live(bridge_dir, monkeypatch):  # noqa: F811
     monkeypatch.setattr(live_cli, "make_client", lambda wait, **kw: BridgeClient(bridge_dir, wait, **kw))
     monkeypatch.setattr(guard, "panel_version", lambda *a, **k: "1.25.0")
+    monkeypatch.setattr(guard, "server_version", lambda *a, **k: "1.25.0")
     return bridge_dir
 
 
@@ -144,6 +146,12 @@ def test_live_help_lists_state_and_run(capsys):
     assert dispatch(["live", "--help"]) == 0
     out = capsys.readouterr().out
     assert "state" in out and "run" in out
+
+
+def test_allow_untested_help_names_the_server(capsys):
+    assert dispatch(["live", "state", "--help"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Premiere, panel or MCP server version" in out and "\u2014" not in out
 
 
 @click.group(invoke_without_command=True)
@@ -242,6 +250,7 @@ def test_live_state_bridge_missing(monkeypatch, tmp_path, capsys):
     gone = tmp_path / "no-bridge"
     monkeypatch.setattr(live_cli, "make_client", lambda wait, **kw: BridgeClient(gone, wait, **kw))
     monkeypatch.setattr(guard, "panel_version", lambda *a, **k: "1.25.0")
+    monkeypatch.setattr(guard, "server_version", lambda *a, **k: "1.25.0")
     code, out = run_json(capsys, ["live", "state"])
     assert code == 1 and out["code"] == "bridge_missing"
     assert not gone.exists()
@@ -251,6 +260,21 @@ def test_live_state_bridge_down(live, capsys):
     code, out = run_json(capsys, ["live", "state", "--lease-wait", "0"])
     assert code == 1 and out["code"] == "bridge_down"
     assert lease_free(live)
+
+
+def test_live_state_with_a_waiting_panel_is_bridge_down(live, capsys):
+    with panel_on(live, handler=handler_for(), heartbeat={**DEFAULT_HEARTBEAT, "state": "waiting"}) as panel:
+        code, out = run_json(capsys, ["live", "state", "--lease-wait", "0"])
+    assert code == 1 and out["code"] == "bridge_down" and "Start Bridge" in out["error"]
+    assert panel.seen == [] and lease_free(live)
+
+
+def test_live_state_warns_on_an_untested_server(live, monkeypatch, capsys):
+    monkeypatch.setattr(guard, "server_version", lambda *a, **k: "1.26.0")
+    with panel_on(live, handler=handler_for()) as panel:
+        code, out = run_json(capsys, ["live", "state"])
+    assert code == 0 and len(out["warnings"]) == 1 and "1.26.0" in out["warnings"][0]
+    assert len(panel.seen) == 1
 
 
 # ---------- live run ----------
@@ -326,6 +350,19 @@ def test_live_run_write_refused_on_premiere_26(live, tmp_path, capsys):
         code, out = run_json(capsys, ["live", "run", body, "--write"])
     assert code == 1 and out["code"] == "untested_premiere"
     assert len(panel.seen) == 1 and STATE_MARK in panel.seen[0]
+    assert lease_free(live)
+
+
+def test_live_run_write_refused_on_an_untested_server(live, tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(guard, "server_version", lambda *a, **k: None)
+    body = script_file(tmp_path, "body.jsx", BODY)
+    with panel_on(live, handler=handler_for()) as panel:
+        code, out = run_json(capsys, ["live", "run", body, "--write"])
+        assert code == 1 and out["code"] == "untested_bridge" and "unknown" in out["error"]
+        assert panel.seen == []
+        code, out = run_json(capsys, ["live", "run", body, "--write", "--allow-untested"])
+    assert code == 0 and out["data"] == {"answer": 42}
+    assert any("--allow-untested" in w for w in out["warnings"])
     assert lease_free(live)
 
 

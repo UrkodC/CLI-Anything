@@ -22,7 +22,7 @@ from pathlib import Path
 from cli_anything.premiere.core import bridge
 from cli_anything.premiere.errors import CliError
 from cli_anything.premiere.tests.fakes import (  # noqa: F401
-    HEARTBEAT_FILE, MARKER_SHAPES, SIGNAL_CHILD, FakePanel, bridge_dir, keep_signals, restore_marker_mode,
+    DEFAULT_HEARTBEAT, HEARTBEAT_FILE, MARKER_SHAPES, SIGNAL_CHILD, FakePanel, bridge_dir, keep_signals, restore_marker_mode,
     signal_when, unreadable_marker)
 
 LOCK = ".host-owner-lease"
@@ -249,6 +249,44 @@ def test_write_refused_without_heartbeat(bridge_dir):
         os.utime(heartbeat, (old, old))
         assert send_error(client, write=True).code == "bridge_down"
     assert panel.seen == [] and leftovers(bridge_dir) == [HEARTBEAT_FILE]
+
+
+def test_write_refused_on_a_waiting_heartbeat(bridge_dir):
+    """A panel whose connector is stopped has a young heartbeat, but it runs no command."""
+    client = bridge.BridgeClient(bridge_dir)
+    with running(FakePanel(bridge_dir, heartbeat={**DEFAULT_HEARTBEAT, "state": "waiting"})) as panel:
+        err = send_error(client, write=True)
+    assert err.code == "bridge_down" and "Nothing was sent" in err.message
+    assert "is not running" not in err.message           # the panel is open: the message must stay true
+    assert panel.seen == [] and leftovers(bridge_dir) == [HEARTBEAT_FILE]
+    assert bridge.read_recovery(bridge_dir) is None
+
+
+def test_waiting_heartbeat_is_not_fresh():
+    beat = bridge.Heartbeat(protocol_version=1, command_schema_version=1, receipt_version=1,
+                            state="waiting", age_s=0.1)
+    assert beat.fresh is False and beat.waiting is True
+
+
+@pytest.mark.parametrize("state, age_s, fresh, waiting", [
+    ("running", 0.1, True, False),
+    ("waiting", 0.1, False, True),
+    ("running", 3.0, True, False),
+    ("waiting", 3.0, False, True),
+    ("running", 3.1, False, False),
+    ("waiting", 3.1, False, False),
+    ("stopped", 0.1, False, False),
+])
+def test_heartbeat_fresh_and_waiting(state, age_s, fresh, waiting):
+    beat = bridge.Heartbeat(protocol_version=1, command_schema_version=1, receipt_version=1,
+                            state=state, age_s=age_s)
+    assert beat.fresh is fresh and beat.waiting is waiting
+
+
+def test_read_heartbeat_keeps_the_waiting_state(bridge_dir):
+    with running(FakePanel(bridge_dir, heartbeat={**DEFAULT_HEARTBEAT, "state": "waiting"})):
+        beat = bridge.read_heartbeat(bridge_dir)
+    assert beat is not None and beat.state == "waiting" and beat.waiting and not beat.fresh
 
 
 def test_read_timeout_has_no_marker_and_names_a_dialog(bridge_dir):

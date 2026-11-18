@@ -84,7 +84,7 @@ def guarded_state(client: BridgeClient, *, write: bool, project: str | None, any
 def live_options(func):
     """The options every live command shares."""
     func = click.option("--allow-untested", is_flag=True,
-                        help="Go on with a Premiere or panel version this CLI was not tested with.")(func)
+                        help="Go on with a Premiere, panel or MCP server version this CLI was not tested with.")(func)
     func = click.option("--timeout", "timeout", type=click.FloatRange(min=0, min_open=True),
                         default=DEFAULT_HARD_LIMIT_S, show_default=True, metavar="SECONDS",
                         help="Longest time to wait for one script while Premiere still works on it.")(func)
@@ -519,7 +519,8 @@ def doctor(ctx: click.Context) -> None:
     # The helpers are looked up here, at each call, so tests can replace them on their modules.
     try:
         checks = doctor_core.run_checks(client, premiere=ui_core.running_premiere, panel=guard.panel_version,
-                                        which=shutil.which, osascript=ui_core.run_osascript)
+                                        which=shutil.which, server=guard.server_version,
+                                        osascript=ui_core.run_osascript)
     except CliError as err:                  # interrupted: the only CliError run_checks lets through
         _fail(ctx, err)
         return

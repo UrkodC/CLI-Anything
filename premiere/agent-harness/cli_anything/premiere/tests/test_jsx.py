@@ -25,6 +25,22 @@ def run_in_node(script: str, prelude: str = "") -> dict:
     return json.loads(out)
 
 
+CATCH = '} catch (e) { return __fail(String(e) + (e && e.line ? " (line " + e.line + ")" : "")); }'
+
+# ExtendScript gives an Error a `line`, counted in the evaluated script. Node does not, so this stub adds a getter
+# that reads the line from the stack and takes off the lines of the prelude that node counts too.
+LINE_STUB = r"""
+Object.defineProperty(Error.prototype, "line", {configurable: true, get: function () {
+  var m = /\[eval\]:(\d+):\d+/.exec(String(this.stack));
+  return m ? Number(m[1]) - PRELUDE_LINES : undefined;
+}});
+"""
+
+
+def line_prelude() -> str:
+    return LINE_STUB.replace("PRELUDE_LINES", str(LINE_STUB.count("\n") + 1))
+
+
 # Builds the object shape the Premiere DOM uses: a collection has numTracks/numItems plus numbered members.
 STUB_HELPERS = """
 function coll(key, items) { var c = {}; c[key] = items.length; for (var i = 0; i < items.length; i++) c[i] = items[i]; return c; }
@@ -42,7 +58,40 @@ def test_build_has_the_documented_shape():
     helpers = jsx.load("helpers").rstrip("\n")
     s = jsx.build("return __ok(1);")
     assert s == ("(function () {\n" + helpers + "\nvar ARGS = {};\ntry {\nreturn __ok(1);\n"
-                 "} catch (e) { return __fail(String(e)); }\n})()")
+                 + CATCH + "\n})()")
+
+
+@pytest.fixture
+def scripts_dir(tmp_path, monkeypatch):
+    """A scripts folder of its own: the real helpers plus a `find` and a `two` script."""
+    (tmp_path / "helpers.jsx").write_text(jsx.load("helpers"), encoding="utf-8")
+    (tmp_path / "find.jsx").write_text("function __find(n) { return n + 1; }\n", encoding="utf-8")
+    (tmp_path / "two.jsx").write_text("var __two = 2;", encoding="utf-8")      # no newline at the end
+    monkeypatch.setattr(jsx, "SCRIPTS_DIR", tmp_path)
+    return tmp_path
+
+
+def test_build_includes_named_scripts(scripts_dir):
+    helpers = jsx.load("helpers").rstrip("\n")
+    body = "return __ok(__find(__two));"
+    s = jsx.build(body, {"k": 1}, include=("find", "two"))
+    assert s == ("(function () {\n" + helpers + "\nfunction __find(n) { return n + 1; }\nvar __two = 2;\n"
+                 'var ARGS = {"k": 1};\ntry {\n' + body + "\n" + CATCH + "\n})()")
+    assert s.index("function __find") < s.index("var ARGS")
+    assert jsx.build(body, include=()) == jsx.build(body)
+
+
+@needs_node
+def test_included_scripts_run_inside_the_wrapper(scripts_dir):
+    reply = run_in_node(jsx.build("return __ok(__find(__two));", include=["find", "two"]))
+    assert reply == {"success": True, "data": 3}
+
+
+@pytest.mark.parametrize("name", ["nope", "../helpers", "a/b", "", "find.jsx"])
+def test_build_include_of_a_missing_name_is_script_missing(scripts_dir, name):
+    with pytest.raises(CliError) as e:
+        jsx.build("return __ok(1);", include=("find", name))
+    assert e.value.code == "script_missing"
 
 
 @pytest.mark.parametrize("args", [[1], "x", 5, (1, 2)])
@@ -74,6 +123,21 @@ def test_args_round_trip_through_the_helpers():
 @needs_node
 def test_a_thrown_error_becomes_a_failure_reply():
     assert run_in_node(jsx.build("throw new Error('boom');")) == {"success": False, "error": "Error: boom"}
+
+
+@needs_node
+def test_script_failure_carries_the_line():
+    script = jsx.build('var a = 1;\nthrow new Error("x");')
+    line = script.split("\n").index('throw new Error("x");') + 1
+    assert run_in_node(script, line_prelude()) == {"success": False, "error": f"Error: x (line {line})"}
+
+
+@needs_node
+@pytest.mark.parametrize("thrown, text", [("'plain'", "plain"), ("null", "null"), ("undefined", "undefined"),
+                                          ("{message: 'm'}", "[object Object]")])
+def test_a_failure_without_a_line_has_no_suffix(thrown, text):
+    reply = run_in_node(jsx.build(f"throw {thrown};"), line_prelude())
+    assert reply == {"success": False, "error": text}
 
 
 @needs_node

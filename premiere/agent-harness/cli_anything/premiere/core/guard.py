@@ -1,13 +1,15 @@
 """Safety checks that every live command runs before it talks to Premiere.
 
-Each check looks at values that another module already read (the panel heartbeat, the panel version,
-the state script's reply, the recovery marker). Nothing here talks to Premiere. A check returns a list
-of warnings and raises CliError when the command must not go on. A read command warns where a write
-command refuses.
+Each check looks at values that another module already read (the panel heartbeat, the panel and server
+versions, the state script's reply, the recovery marker). Nothing here talks to Premiere. A check returns
+a list of warnings and raises CliError when the command must not go on. A read command warns where a
+write command refuses.
 """
 from __future__ import annotations
 
+import json
 import os
+import shutil
 from pathlib import Path
 
 from defusedxml import ElementTree as SafeET
@@ -17,11 +19,16 @@ from cli_anything.premiere.errors import CliError
 
 TESTED_PREMIERE_PREFIXES = ("27.0.",)
 TESTED_PANEL_VERSIONS = ("1.25.0",)
+TESTED_SERVER_VERSIONS = ("1.25.0",)
+SERVER_NAME = "premiere-pro-mcp"
 PANEL_MANIFEST = Path.home() / "Library/Application Support/Adobe/CEP/extensions/MCPBridgeCEP/CSXS/manifest.xml"
 
 PROTOCOL_VERSION = 1
 COMMAND_SCHEMA_VERSION = 1
 OVERRIDE = "--allow-untested"
+UNSET = object()        # check_bridge(server=UNSET): look the server version up when the check runs
+WAITING = ("The panel is open but its connector is stopped. "
+           "Click Start Bridge in the MCP Bridge panel.")
 
 
 def panel_version(manifest: Path = PANEL_MANIFEST) -> str | None:
@@ -44,17 +51,48 @@ def _gate(warnings: list[str], code: str, message: str, *, write: bool, allow_un
         raise CliError(code, f"{message} {hint}".strip())
 
 
+def server_version(which=shutil.which) -> str | None:
+    """The version of the premiere-pro-mcp server installed on PATH, or None when it cannot be read.
+
+    It follows the binary to its real file, reads the package.json two folders up (the package folder) and
+    returns its "version". None when there is no binary, no such file, no "version" string, or the
+    package in that file is not premiere-pro-mcp.
+    """
+    binary = which(SERVER_NAME)
+    if not binary:
+        return None
+    package = Path(os.path.realpath(binary)).parent.parent / "package.json"
+    try:
+        value = json.loads(package.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):        # UnicodeDecodeError is a ValueError
+        return None
+    if not isinstance(value, dict) or value.get("name") != SERVER_NAME:
+        return None
+    version = value.get("version")
+    return version if isinstance(version, str) and version else None
+
+
 def check_bridge(heartbeat: Heartbeat | None, panel: str | None, *, write: bool,
-                 allow_untested: bool) -> list[str]:
-    """Is the panel in Premiere alive, and of a version this CLI was tested with?"""
+                 allow_untested: bool, server: str | None | object = UNSET) -> list[str]:
+    """Is the panel in Premiere alive and running, and are its versions and the server's ones tested?
+
+    `server` is the string from server_version() or None. UNSET (the default) means: call server_version()
+    now. The checks run in this order: no heartbeat or an old one, a heartbeat that says "waiting", then the
+    protocol, panel and server versions. A version that was not tested is a warning on a read; on a write
+    it raises untested_bridge, once, naming all of them, unless allow_untested is set.
+    """
     if heartbeat is not None and heartbeat.age_s > HEARTBEAT_STALE_S:
         raise CliError("bridge_down", f"The MCP panel in Premiere does not answer: its last heartbeat is "
                                       f"{heartbeat.age_s:.0f} s old. A dialog in Premiere may block it: close the "
                                       "dialog. If no dialog is open, open Window > Extensions > MCP for Adobe "
                                       "Premiere Pro.")
+    if heartbeat is not None and heartbeat.waiting:
+        raise CliError("bridge_down", WAITING)
     if heartbeat is None or not heartbeat.fresh:
         raise CliError("bridge_down", "Premiere is not running its MCP panel. "
                                       "Open Window > Extensions > MCP for Adobe Premiere Pro.")
+    if server is UNSET:
+        server = server_version()
     found = []
     if heartbeat.protocol_version != PROTOCOL_VERSION:
         found.append(f"protocol {heartbeat.protocol_version}")
@@ -62,13 +100,20 @@ def check_bridge(heartbeat: Heartbeat | None, panel: str | None, *, write: bool,
         found.append(f"command schema {heartbeat.command_schema_version}")
     if panel not in TESTED_PANEL_VERSIONS:
         found.append(f"panel version {panel or 'unknown'}")
-    warnings: list[str] = []
+    findings = []
     if found:
-        message = (f"The Premiere panel is untested ({', '.join(found)}). Tested: protocol {PROTOCOL_VERSION}, "
-                   f"command schema {COMMAND_SCHEMA_VERSION}, panel {', '.join(TESTED_PANEL_VERSIONS)}.")
-        _gate(warnings, "untested_bridge", message, write=write, allow_untested=allow_untested,
-              hint=f"Use {OVERRIDE} to go on anyway.")
-    return warnings
+        findings.append(f"The Premiere panel is untested ({', '.join(found)}). Tested: protocol {PROTOCOL_VERSION}, "
+                        f"command schema {COMMAND_SCHEMA_VERSION}, panel {', '.join(TESTED_PANEL_VERSIONS)}.")
+    if server not in TESTED_SERVER_VERSIONS:
+        findings.append(f"The {SERVER_NAME} server is untested (server version {server or 'unknown'}). "
+                        f"Tested: {', '.join(TESTED_SERVER_VERSIONS)}.")
+    if not write:
+        return findings
+    if allow_untested:
+        return [f"{message} Continuing because {OVERRIDE} was given." for message in findings]
+    if findings:
+        raise CliError("untested_bridge", f"{' '.join(findings)} Use {OVERRIDE} to go on anyway.")
+    return []
 
 
 def _path(entry: dict) -> str:
