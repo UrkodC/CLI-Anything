@@ -720,3 +720,52 @@ def test_a_failing_cleanup_does_not_lose_the_signal(keep_signals):  # noqa: F811
     assert isinstance(e.value.__context__, CliError)
     with bridge.hold_signals() as section:          # nothing is left over for a later section
         assert not section.signalled
+
+
+# ---------- plan 2: a marker that cannot be written keeps the lock (M1.1) ----------
+def _cannot_mark(monkeypatch) -> list[str]:
+    calls: list[str] = []
+
+    def cannot_write(folder, reason):
+        calls.append(reason)
+        raise OSError(13, "Permission denied")
+    monkeypatch.setattr(bridge, "mark_recovery", cannot_write)
+    return calls
+
+
+def test_an_unknown_outcome_without_a_marker_keeps_the_lock(bridge_dir, monkeypatch):
+    calls = _cannot_mark(monkeypatch)
+    client = bridge.BridgeClient(bridge_dir)
+    lock = bridge_dir / LOCK
+    with running(FakePanel(bridge_dir, handler=lambda s: None)):
+        err = send_error(client, write=True, timeout_s=0.3)
+    assert calls == ["unknown_command_outcome"]
+    assert err.code == "unknown_outcome" and err.message.startswith(bridge.DIALOG)
+    assert err.message.endswith(f" The recovery marker could not be written, so the lock is kept. "
+                                f"Delete {lock} after you checked Premiere.")
+    lease = client.lease()
+    assert lease.retained and not lease.held
+    assert lock.is_dir() and bridge.read_owner(lock / "owner.json")[0] == os.getpid()
+    lease.release()                                  # does nothing
+    assert lock.is_dir() and (lock / "owner.json").is_file()
+    assert leftovers(bridge_dir) == [LOCK, HEARTBEAT_FILE]
+    with pytest.raises(RuntimeError):
+        client.send("1", write=False)
+
+
+def test_a_bad_write_reply_without_a_marker_keeps_the_lock(bridge_dir, monkeypatch):
+    _cannot_mark(monkeypatch)
+    client = bridge.BridgeClient(bridge_dir)
+    lock = bridge_dir / LOCK
+    with running(FakePanel(bridge_dir, handler=lambda s: "{")):
+        err = send_error(client, write=True)
+    assert err.code == "bad_reply" and "so the lock is kept" in err.message
+    assert client.lease().retained and lock.is_dir() and (lock / "owner.json").is_file()
+
+
+def test_a_written_marker_still_frees_the_lock(bridge_dir):
+    client = bridge.BridgeClient(bridge_dir)
+    with running(FakePanel(bridge_dir, handler=lambda s: None)):
+        err = send_error(client, write=True, timeout_s=0.3)
+    assert err.code == "unknown_outcome" and "lock is kept" not in err.message
+    assert not client.lease().retained and not (bridge_dir / LOCK).exists()

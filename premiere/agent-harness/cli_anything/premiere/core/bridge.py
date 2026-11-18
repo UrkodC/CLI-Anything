@@ -311,6 +311,13 @@ class Lease:
         self._token: str | None = None
         self._pid = 0
         self._since = 0.0
+        self.retained = False
+
+    def retain(self) -> None:
+        """Keep the lock folder and owner record for good (a marker could not be written): this lease
+        counts as not held from now on, and release() leaves both in place."""
+        self._token = None
+        self.retained = True
 
     @property
     def held(self) -> bool:
@@ -508,10 +515,10 @@ class BridgeClient:
                                                       "Nothing was changed.")
                     raise CliError("not_applied", "Premiere did not pick up the command. Nothing was changed.")
                 if write:
-                    mark_recovery(self.bridge_dir, "unknown_command_outcome")
+                    kept = self._mark_unknown()
                     message = ("Stopped while Premiere ran the edit; its result is unknown. "
                                "Check Premiere before another edit." if interrupted else DIALOG)
-                    raise CliError("unknown_outcome", message)
+                    raise CliError("unknown_outcome", message + kept)
                 if interrupted:
                     raise CliError("interrupted", "Stopped while Premiere ran a read-only script.")
                 raise CliError("timeout", DIALOG)
@@ -548,10 +555,20 @@ class BridgeClient:
             except (OSError, ValueError, RecursionError):
                 reply = None
         if not isinstance(reply, dict) or not isinstance(reply.get("success"), bool):
-            if write:
-                mark_recovery(self.bridge_dir, "unknown_command_outcome")
-            raise CliError("bad_reply", "Premiere sent a reply that is not valid JSON or is too large.")
+            kept = self._mark_unknown() if write else ""
+            raise CliError("bad_reply", "Premiere sent a reply that is not valid JSON or is too large." + kept)
         return reply
+
+    def _mark_unknown(self) -> str:
+        """Write the marker of an unknown outcome. When it cannot be written, keep the lock instead, so no
+        program edits before someone checks Premiere, and return the sentence that says so."""
+        try:
+            mark_recovery(self.bridge_dir, "unknown_command_outcome")
+        except OSError:
+            self._lease.retain()
+            return (" The recovery marker could not be written, so the lock is kept. "
+                    f"Delete {self._lease._lock} after you checked Premiere.")
+        return ""
 
 
 def _busy_fresh(busy: Path) -> bool:

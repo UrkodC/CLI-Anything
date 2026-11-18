@@ -25,7 +25,10 @@ def run_in_node(script: str, prelude: str = "") -> dict:
     return json.loads(out)
 
 
-CATCH = '} catch (e) { return __fail(String(e) + (e && e.line ? " (line " + e.line + ")" : "")); }'
+def catch(before: int) -> str:
+    """The catch line of a built script whose body starts after `before` lines."""
+    return ('} catch (e) { return __fail(String(e) + (e && e.line > %d ? " (line " + (e.line - %d) + ")" : "")); }'
+            % (before, before))
 
 # ExtendScript gives an Error a `line`, counted in the evaluated script. Node does not, so this stub adds a getter
 # that reads the line from the stack and takes off the lines of the prelude that node counts too.
@@ -57,8 +60,8 @@ def test_build_puts_args_in_as_ascii_json():
 def test_build_has_the_documented_shape():
     helpers = jsx.load("helpers").rstrip("\n")
     s = jsx.build("return __ok(1);")
-    assert s == ("(function () {\n" + helpers + "\nvar ARGS = {};\ntry {\nreturn __ok(1);\n"
-                 + CATCH + "\n})()")
+    prefix = "(function () {\n" + helpers + "\nvar ARGS = {};\ntry {\n"
+    assert s == prefix + "return __ok(1);\n" + catch(prefix.count("\n")) + "\n})()"
 
 
 @pytest.fixture
@@ -75,8 +78,9 @@ def test_build_includes_named_scripts(scripts_dir):
     helpers = jsx.load("helpers").rstrip("\n")
     body = "return __ok(__find(__two));"
     s = jsx.build(body, {"k": 1}, include=("find", "two"))
-    assert s == ("(function () {\n" + helpers + "\nfunction __find(n) { return n + 1; }\nvar __two = 2;\n"
-                 'var ARGS = {"k": 1};\ntry {\n' + body + "\n" + CATCH + "\n})()")
+    prefix = ("(function () {\n" + helpers + "\nfunction __find(n) { return n + 1; }\nvar __two = 2;\n"
+              'var ARGS = {"k": 1};\ntry {\n')
+    assert s == prefix + body + "\n" + catch(prefix.count("\n")) + "\n})()"
     assert s.index("function __find") < s.index("var ARGS")
     assert jsx.build(body, include=()) == jsx.build(body)
 
@@ -126,10 +130,19 @@ def test_a_thrown_error_becomes_a_failure_reply():
 
 
 @needs_node
-def test_script_failure_carries_the_line():
+def test_script_failure_carries_the_line_of_the_body():
     script = jsx.build('var a = 1;\nthrow new Error("x");')
-    line = script.split("\n").index('throw new Error("x");') + 1
-    assert run_in_node(script, line_prelude()) == {"success": False, "error": f"Error: x (line {line})"}
+    assert run_in_node(script, line_prelude()) == {"success": False, "error": "Error: x (line 2)"}
+    first = jsx.build('throw new Error("y");', {"k": "a\nb"})
+    assert run_in_node(first, line_prelude()) == {"success": False, "error": "Error: y (line 1)"}
+
+
+@needs_node
+def test_a_failure_thrown_before_the_body_has_no_line(scripts_dir):
+    (scripts_dir / "thrower.jsx").write_text('function __throw() {\n  throw new Error("in an include");\n}\n',
+                                              encoding="utf-8")
+    script = jsx.build("var a = 1;\n__throw();", include=("thrower",))
+    assert run_in_node(script, line_prelude()) == {"success": False, "error": "Error: in an include"}
 
 
 @needs_node
@@ -289,3 +302,163 @@ def test_load_refuses_names_that_leave_the_scripts_folder():
         with pytest.raises(CliError) as e:
             jsx.load(name)
         assert e.value.code == "script_missing"
+
+
+# ---------- find.jsx: the target finders of the recipe scripts ----------
+# Two sequences hold a clip with the same node id "N1"; the active sequence is the second one, so a finder
+# that walked the active sequence instead of the given one would give the wrong clip.
+FIND_PRELUDE = STUB_HELPERS + """
+function comp(display, match, tag, props) {
+  return {displayName: display, matchName: match, tag: tag, properties: coll("numItems", props || [])};
+}
+function prop(name, tag) { return {displayName: name, tag: tag}; }
+function fclip(id, name, comps) { return {nodeId: id, name: name, components: coll("numItems", comps || [])}; }
+var lumetriProps = [];
+for (var i = 0; i < 20; i++) lumetriProps.push(prop("P" + i, "p" + i));
+lumetriProps[4] = prop(" ", "lut");
+lumetriProps[14] = prop("Tint", "tint");
+var graded = fclip("N1", "Graded", [comp("Opacity", "AE.ADBE Opacity", "c0"), comp("Motion", "AE.ADBE Motion", "c1"),
+  comp("Lumetri Color", "AE.ADBE Lumetri", "c2", lumetriProps), comp("Lumetri Color", "AE.ADBE Lumetri", "c3", lumetriProps)]);
+var seqA = {sequenceID: "S-A", name: "Cut A",
+  videoTracks: coll("numTracks", [track([clip("V0", "Intro")]), track([clip("V1", "Title"), graded])]),
+  audioTracks: coll("numTracks", [track([clip("A0", "Music"), clip("A9", "Room tone")])])};
+var seqB = {sequenceID: "S-B", name: "Cut B",
+  videoTracks: coll("numTracks", [track([fclip("N1", "Other clip")])]),
+  audioTracks: coll("numTracks", [])};
+var app = {project: {path: "/p/X Claude.prproj", sequences: coll("numSequences", [seqA, seqB]), activeSequence: seqB}};
+"""
+EXPECT = {"project_path": "/p/X Claude.prproj", "sequence_id": "S-A", "sequence_name": "Cut A"}
+
+
+def run_find(body: str, args: dict | None = None, prelude: str = FIND_PRELUDE) -> dict:
+    return run_in_node(jsx.build(body, args, include=("find",)), prelude)
+
+
+def refused(reply: dict) -> str:
+    """The text of a precondition refusal, without the "Error: " that String(e) puts in front."""
+    assert reply["success"] is False, reply
+    assert reply["error"].startswith("Error: precondition: "), reply
+    return reply["error"][len("Error: precondition: "):]
+
+
+def test_find_starts_with_its_comment_line():
+    assert jsx.load("find").split("\n")[0] == "// find.jsx: target finders for recipe scripts"
+
+
+@needs_node
+def test_find_runs_nothing_when_it_loads():
+    # Only definitions: with no app at all the script still loads and the body runs.
+    assert run_in_node(jsx.build("return __ok(typeof __expect);", include=("find",))) == {"success": True, "data": "function"}
+
+
+@needs_node
+def test_expect_returns_the_sequence_or_null():
+    body = "var seq = __expect(ARGS.expect);\nreturn __ok(seq ? seq.name : null);"
+    assert run_find(body, {"expect": EXPECT})["data"] == "Cut A"
+    assert run_find(body, {"expect": {**EXPECT, "sequence_name": None}})["data"] == "Cut A"
+    assert run_find(body, {"expect": {**EXPECT, "sequence_id": None, "sequence_name": None}})["data"] is None
+
+
+@needs_node
+def test_expect_refuses_another_project():
+    body = "__expect(ARGS.expect);\nreturn __ok(1);"
+    other = {**EXPECT, "project_path": "/p/Y Claude.prproj"}
+    assert refused(run_find(body, {"expect": other})) == "the active project is /p/X Claude.prproj, not /p/Y Claude.prproj"
+    no_project = "var app = {project: null};"
+    assert refused(run_find(body, {"expect": EXPECT}, no_project)) == "no saved project is active"
+    assert refused(run_find(body, {})) == "the script got no expectation"
+
+
+@needs_node
+def test_expect_refuses_a_renamed_sequence():
+    body = "__expect(ARGS.expect);\nreturn __ok(1);"
+    renamed = {**EXPECT, "sequence_name": "Cut A old"}
+    assert refused(run_find(body, {"expect": renamed})) == "sequence S-A is named Cut A, not Cut A old"
+    gone = {**EXPECT, "sequence_id": "S-Z"}
+    assert refused(run_find(body, {"expect": gone})) == "no sequence has the ID S-Z"
+
+
+@needs_node
+def test_sequence_by_id():
+    body = "var s = __sequenceById(ARGS.id);\nreturn __ok(s ? s.name : null);"
+    assert run_find(body, {"id": "S-B"})["data"] == "Cut B"
+    assert run_find(body, {"id": "S-Z"})["data"] is None
+
+
+@needs_node
+def test_clip_by_index_and_by_node_id():
+    body = ("var seq = __sequenceById(ARGS.seq);\nvar f = __clip(seq, ARGS.target);\n"
+            "return __ok({name: f.clip.name, track_type: f.track_type, track: f.track, index: f.index});")
+    assert run_find(body, {"seq": "S-A", "target": {"track": 1, "clip": 1}})["data"] == \
+        {"name": "Graded", "track_type": "video", "track": 1, "index": 1}
+    assert run_find(body, {"seq": "S-A", "target": {"track_type": "audio", "track": 0, "clip": 1}})["data"] == \
+        {"name": "Room tone", "track_type": "audio", "track": 0, "index": 1}
+    assert run_find(body, {"seq": "S-A", "target": {"node_id": "N1"}})["data"] == \
+        {"name": "Graded", "track_type": "video", "track": 1, "index": 1}
+    assert run_find(body, {"seq": "S-A", "target": {"node_id": "A9"}})["data"] == \
+        {"name": "Room tone", "track_type": "audio", "track": 0, "index": 1}
+    assert run_find(body, {"seq": "S-B", "target": {"node_id": "N1"}})["data"]["name"] == "Other clip"
+    assert refused(run_find(body, {"seq": "S-B", "target": {"node_id": "V0"}})) == \
+        "no clip has the node ID V0 in sequence Cut B"
+
+
+@needs_node
+@pytest.mark.parametrize("target, text", [
+    ({"track": 2, "clip": 0}, "the sequence has no video track 2"),
+    ({"track": 0, "clip": 1}, "video track 0 has no clip 1"),
+    ({"track_type": "audio", "track": 1, "clip": 0}, "the sequence has no audio track 1"),
+    ({"track_type": "titles", "track": 0, "clip": 0}, "track_type must be video or audio, not titles"),
+    ({"track": -1, "clip": 0}, "track must be a whole number of 0 or more, not -1"),
+    ({"track": 0, "clip": 0.5}, "clip must be a whole number of 0 or more, not 0.5"),
+    ({"track": "0", "clip": 0}, "track must be a whole number of 0 or more, not 0"),
+])
+def test_clip_refuses_a_target_that_is_not_there(target, text):
+    body = "__clip(__sequenceById('S-A'), ARGS.target);\nreturn __ok(1);"
+    assert refused(run_find(body, {"target": target})) == text
+
+
+@needs_node
+def test_effect_twice_needs_effect_index():
+    body = ("var clip = __clip(__sequenceById('S-A'), {track: 1, clip: 1}).clip;\n"
+            "var e = __effect(clip, ARGS.name, ARGS.index);\nreturn __ok({index: e.index, tag: e.component.tag});")
+    assert refused(run_find(body, {"name": "Lumetri Color", "index": None})) == \
+        "ambiguous_effect: 2 effects are named Lumetri Color; pass effect_index"
+    assert refused(run_find(body, {"name": "AE.ADBE Lumetri", "index": None})) == \
+        "ambiguous_effect: 2 effects are named AE.ADBE Lumetri; pass effect_index"
+    assert run_find(body, {"name": "Lumetri Color", "index": 3})["data"] == {"index": 3, "tag": "c3"}
+    assert run_find(body, {"name": "AE.ADBE Lumetri", "index": 2})["data"] == {"index": 2, "tag": "c2"}
+    assert run_find(body, {"name": "Motion", "index": None})["data"] == {"index": 1, "tag": "c1"}
+    assert run_find(body, {"name": "AE.ADBE Opacity"})["data"] == {"index": 0, "tag": "c0"}
+    assert refused(run_find(body, {"name": "Lumetri Color", "index": 1})) == \
+        "effect 1 of this clip is Motion, not Lumetri Color"
+    assert refused(run_find(body, {"name": "Lumetri Color", "index": 4})) == "this clip has no effect at index 4"
+    assert refused(run_find(body, {"name": "ProcAmp", "index": None})) == "no effect named ProcAmp on this clip"
+    assert refused(run_find(body, {"name": "lumetri color", "index": None})) == \
+        "no effect named lumetri color on this clip"
+
+
+@needs_node
+def test_property_checks_the_name_at_the_index():
+    body = ("var clip = __clip(__sequenceById('S-A'), {track: 1, clip: 1}).clip;\n"
+            "var comp = __effect(clip, 'Lumetri Color', 2).component;\n"
+            "return __ok(__property(comp, ARGS.index, ARGS.name).tag);")
+    assert refused(run_find(body, {"index": 14, "name": "Temperature"})) == \
+        "property 14 of Lumetri Color is named Tint, not Temperature"
+    assert run_find(body, {"index": 14, "name": "Tint"})["data"] == "tint"
+    assert run_find(body, {"index": 4, "name": " "})["data"] == "lut"           # a blank name, not trimmed
+    assert refused(run_find(body, {"index": 4, "name": ""})) == "property 4 of Lumetri Color is named  , not "
+    assert refused(run_find(body, {"index": 20, "name": "P20"})) == "Lumetri Color has no property 20"
+    assert refused(run_find(body, {"index": 1.5, "name": "P1"})) == \
+        "property index must be a whole number of 0 or more, not 1.5"
+
+
+@needs_node
+def test_ticks_is_a_string():
+    body = "return __ok([__ticks({ticks: 254016000000}), __ticks({ticks: '10594584000'}), __ticks(null), __ticks({ticks: 'x'})]);"
+    assert run_find(body)["data"] == ["254016000000", "10594584000", None, None]
+
+
+def test_find_is_es3():
+    text = jsx.load("find")
+    for pattern in BANNED + [r"\.indexOf\(", r"\bObject\.", r"\.reduce\(", r"\.some\(", r"\.every\("]:
+        assert not re.search(pattern, text), pattern

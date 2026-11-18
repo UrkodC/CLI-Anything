@@ -12,17 +12,17 @@ from pathlib import Path
 
 import click
 
-from cli_anything.premiere.core import bridge, guard, jsx
+from cli_anything.premiere.core import bridge, guard
 from cli_anything.premiere.core import doctor as doctor_core   # `doctor` below is the click group
 from cli_anything.premiere.core import ui as ui_core      # `ui` below is the click group
-from cli_anything.premiere.core.bridge import (BridgeClient, install_signal_handlers, read_heartbeat,
-                                               restore_signal_handlers)
+from cli_anything.premiere.core.bridge import BridgeClient, install_signal_handlers, restore_signal_handlers
 from cli_anything.premiere.core.mcp_client import McpSession
+# guarded_state and run_script live in core/session.py; these names stay importable from here.
+from cli_anything.premiere.core.session import (DEFAULT_HARD_LIMIT_S, SOFT_TIMEOUT_S, guarded_state,  # noqa: F401
+                                                run_script)
 from cli_anything.premiere.errors import CliError
 from cli_anything.premiere.premiere_cli import _emit, _fail, _json, json_option
 
-SOFT_TIMEOUT_S = 30.0       # after this, wait on only while the panel says the script still runs
-DEFAULT_HARD_LIMIT_S = 120.0
 DEFAULT_LEASE_WAIT_S = 30.0
 
 
@@ -54,31 +54,6 @@ def make_client(lease_wait: float, *, reap: bool = True) -> BridgeClient:
 
     reap=False: a lease held by a dead process counts as busy (for the commands that only look)."""
     return BridgeClient(lease_wait_s=lease_wait, reap=reap)
-
-
-def run_script(client: BridgeClient, body: str, args: dict | None, *, write: bool, timeout_s: float,
-               hard_limit_s: float) -> object:
-    """Build one script from a body and its arguments and run it. The caller holds the lease."""
-    return client.send(jsx.build(body, args), write=write, timeout_s=timeout_s, hard_limit_s=hard_limit_s)
-
-
-def guarded_state(client: BridgeClient, *, write: bool, project: str | None, any_project: bool,
-                  allow_untested: bool, hard_limit_s: float = DEFAULT_HARD_LIMIT_S) -> tuple[dict, list[str]]:
-    """Run the safety checks and read Premiere's state, inside the lease the caller holds.
-
-    Order: the panel heartbeat and version, the recovery marker, the state script (always a read),
-    then the checks on that state. Returns (state, warnings of all three checks in that order).
-    """
-    warnings = guard.check_bridge(read_heartbeat(client.bridge_dir), guard.panel_version(),
-                                  write=write, allow_untested=allow_untested)
-    warnings += guard.check_recovery(client.bridge_dir, write=write)
-    state = run_script(client, jsx.load("state"), None, write=False,
-                       timeout_s=min(SOFT_TIMEOUT_S, hard_limit_s), hard_limit_s=hard_limit_s)
-    if not isinstance(state, dict):
-        raise CliError("bad_state", "The state script did not return an object.")
-    warnings += guard.check_state(state, write=write, project=project, any_project=any_project,
-                                  allow_untested=allow_untested)
-    return state, warnings
 
 
 def live_options(func):

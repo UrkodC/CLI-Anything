@@ -42,11 +42,15 @@ def build(body: str, args: dict | None = None, include: tuple[str, ...] = ()) ->
     except (TypeError, ValueError, RecursionError) as exc:
         raise CliError("bad_args", f"Script arguments cannot be written as JSON: {exc}") from None
     included = "".join(load(name).rstrip("\n") + "\n" for name in include)
-    return ("(function () {\n"
-            + load("helpers").rstrip("\n") + "\n"
-            + included
-            + f"var ARGS = {args_json};\n"
-            + "try {\n"
+    prefix = ("(function () {\n"
+              + load("helpers").rstrip("\n") + "\n"
+              + included
+              + f"var ARGS = {args_json};\n"
+              + "try {\n")
+    # ExtendScript counts e.line from the top of this script. Report it from the top of the body; an
+    # error thrown in the helpers or an included script gets no line.
+    before = prefix.count("\n")
+    return (prefix
             + body.rstrip("\n") + "\n"
-            + '} catch (e) { return __fail(String(e) + (e && e.line ? " (line " + e.line + ")" : "")); }\n'
+            + f'}} catch (e) {{ return __fail(String(e) + (e && e.line > {before} ? " (line " + (e.line - {before}) + ")" : "")); }}\n'
             + "})()")
