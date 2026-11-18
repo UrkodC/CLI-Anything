@@ -1,0 +1,8 @@
+# Real Premiere projects and media used by the local end-to-end tests. They hold
+# absolute paths of the machine that made them, so they never go into the repo.
+cli_anything/premiere/tests/fixtures_local/
+*.egg-info/
+.pytest_cache/
+__pycache__/
+# Result file of the gate tests (local run evidence, may hold local paths).
+cli_anything/premiere/tests/gates/gates_result.json

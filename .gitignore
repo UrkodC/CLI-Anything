@@ -59,6 +59,7 @@
 !/obs-studio/
 !/nslogger/
 !/kdenlive/
+!/premiere/
 !/shotcut/
 !/anygen/
 !/zoom/
@@ -128,6 +129,8 @@
 /nslogger/.*
 /kdenlive/*
 /kdenlive/.*
+/premiere/*
+/premiere/.*
 /shotcut/*
 /shotcut/.*
 /anygen/*
@@ -238,6 +241,7 @@
 !/obs-studio/agent-harness/
 !/nslogger/agent-harness/
 !/kdenlive/agent-harness/
+!/premiere/agent-harness/
 !/shotcut/agent-harness/
 !/anygen/agent-harness/
 !/zoom/agent-harness/
