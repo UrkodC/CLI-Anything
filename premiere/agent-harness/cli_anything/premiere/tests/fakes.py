@@ -241,6 +241,81 @@ def content(data, text=None):
             "structuredContent": data}
 
 
+# export_frame, shaped like the real reply (measures.md section 1). The file name steers it:
+# FAIL: a tool error, no file. EMPTY: an empty file and a success. GUARD: the server's target guard refusal.
+# MARKER: writes the recovery marker into the bridge folder, then a tool error. NOFILE: a success that writes
+# nothing. OTHERPATH: a success whose outputPath is another path. SLOW: sleeps 30 s first. With SECOND in the
+# name as well (FAILSECOND), the word steers the second call and the later ones only.
+# GUARD also writes the recovery marker first, as the real server does (measures.md section 5).
+# Modes for the reported outputPath (the file is written at the given path): NFD: the path in decomposed
+# Unicode. REAL: os.path.realpath of the path. NOPATH: no outputPath. OTHER: another existing file next to it.
+# Every call is appended to fake_mcp_calls.jsonl next to this file, with lease_held: whether the bridge lease
+# existed at the moment of the call. The tool "calls" returns that list.
+import time
+import unicodedata
+CALLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_mcp_calls.jsonl")
+GUARD_TEXT = "Expected target guard refused: active sequence changed; nothing was changed."
+
+
+def recorded_calls():
+    if not os.path.exists(CALLS):
+        return []
+    with open(CALLS, encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def tool_error(request_id, text):
+    reply(request_id, {"content": [{"type": "text", "text": text}], "isError": True})
+
+
+def export_frame(request_id, arguments):
+    path = str(arguments.get("output_path") or "")
+    held = os.path.exists(os.path.join(BRIDGE, ".host-owner-lease"))
+    with open(CALLS, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"arguments": arguments, "lease_held": held}) + "\n")
+    base = os.path.basename(path)
+    if "SECOND" in base and len(recorded_calls()) < 2:
+        base = ""                   # SECOND: the words below steer the second call and later ones only
+    if "SLOW" in base:
+        time.sleep(30)
+    if "MARKER" in base:
+        with open(os.path.join(BRIDGE, ".host-recovery.json"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"version": 1, "reason": "unknown_command_outcome", "nonce": "fake"}))
+        tool_error(request_id, "Frame export produced no file on disk.")
+        return
+    if "GUARD" in base:
+        with open(os.path.join(BRIDGE, ".host-recovery.json"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"version": 1, "reason": "unknown_command_outcome", "nonce": "fake-guard"}))
+        tool_error(request_id, GUARD_TEXT)
+        return
+    if "FAIL" in base:
+        tool_error(request_id, "fake export failure")
+        return
+    if "NOFILE" not in base:
+        with open(path, "wb") as fh:
+            fh.write(b"" if "EMPTY" in base else b"\x89PNG fake still " + base.encode("utf-8"))
+    reported = path
+    if "OTHERPATH" in base:
+        reported = path + ".elsewhere"
+    elif "OTHER" in base:
+        reported = path + ".other.png"
+        with open(reported, "wb") as fh:
+            fh.write(b"another still")
+    elif "NFD" in base:
+        reported = unicodedata.normalize("NFD", path)
+    elif "REAL" in base:
+        reported = os.path.realpath(path)
+    data = {"exported": True, "outputPath": reported, "method": "qe",
+            "renderVerified": False, "verificationScope": "Output file exists only; fake.", "hasAlpha": True,
+            "alphaNote": "PNG stills keep the sequence's transparency as straight alpha.", "lease_held": held}
+    if "NOPATH" in base:
+        del data["outputPath"]
+    receipt = {"version": 1, "dispatch": "dispatched", "outcome": "committed_unverified",
+               "verification": {"boundary": "Output file exists only; fake.", "renderVerified": False},
+               "affectedTargets": [], "partialSteps": [], "outputEvidence": None, "nextSafeAction": "none"}
+    reply(request_id, content({"ok": True, "tool": "export_frame", "data": data, "receipt": receipt}))
+
+
 initialized = False
 for line in sys.stdin:
     line = line.strip()
@@ -282,6 +357,10 @@ for line in sys.stdin:
         elif name == "env":
             value = os.environ.get("PREMIERE_MCP_CAPABILITIES")
             reply(rid, content({"value": value}, text=value or ""))
+        elif name == "export_frame":    # not in TOOLS, so the tool list stays as the mcp tests pin it
+            export_frame(rid, arguments)
+        elif name == "calls":
+            reply(rid, content({"calls": recorded_calls()}))
         else:
             fail(rid, -32602, "Unknown tool: " + str(name))
     else:

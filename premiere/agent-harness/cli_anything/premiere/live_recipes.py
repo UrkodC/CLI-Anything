@@ -17,10 +17,11 @@ from pathlib import Path
 
 import click
 
-from cli_anything.premiere.core.recipes import clips, effects
+from cli_anything.premiere import live_cli
+from cli_anything.premiere.core.recipes import clips, effects, frames
 from cli_anything.premiere.errors import CliError
-from cli_anything.premiere.live_cli import (STOPPED_LOOK, STOPPED_RUN, _client, _warning_lines, live, live_options,
-                                            stops_cleanly)
+from cli_anything.premiere.live_cli import (DEFAULT_LEASE_WAIT_S, STOPPED_LOOK, STOPPED_RUN, _client, _warning_lines,
+                                            live, live_options, stops_cleanly)
 from cli_anything.premiere.premiere_cli import _emit, _fail, _json, json_option
 
 
@@ -434,4 +435,221 @@ def live_effect_set(ctx: click.Context, plan_path: Path | None, dry_run: bool, p
         _set_failure(ctx, "not_stored", message, payload, requested)
         return
     lines = _set_lines(payload, requested) + [f"Stored: {payload['ran']} of {payload['total']} entries."]
+    _emit(ctx, payload, "\n".join(lines + _warning_lines(payload["warnings"])))
+
+
+# ---------- live frame export ----------
+def _frame_options(func):
+    """The options of live_options, with a longer --timeout: here it is the longest wait for one frame."""
+    func = click.option("--allow-untested", is_flag=True,
+                        help="Go on with a Premiere, panel or MCP server version this CLI was not tested with.")(func)
+    func = click.option("--timeout", "timeout", type=click.FloatRange(min=0, min_open=True),
+                        default=frames.EXPORT_TIMEOUT_S, show_default=True, metavar="SECONDS",
+                        help="Longest time to wait for one frame. When it runs out, the run stops, and the next "
+                             "program that talks to Premiere may find an open recovery.")(func)
+    func = click.option("--lease-wait", "lease_wait", type=click.FloatRange(min=0),
+                        default=DEFAULT_LEASE_WAIT_S, show_default=True, metavar="SECONDS",
+                        help="Longest time to wait for another program to give Premiere back.")(func)
+    return func
+
+
+@live.group("frame")
+def live_frame() -> None:
+    """Export still frames of a sequence from the running Premiere."""
+
+
+def _frame_lines(payload: dict) -> list[str]:
+    """1.000 s -> /path/frame_00001000ms.png (204050 bytes), then the switches that were put back."""
+    lines = [f"{f['time_seconds']:.3f} s -> {f['path']} ({f['bytes']} bytes)" for f in payload.get("frames") or []]
+    if payload.get("left_switched") is not None:
+        return lines
+    proxies = payload.get("proxies") or {}
+    if proxies.get("before") is True and proxies.get("during") is False and proxies.get("after") is True:
+        lines.append("Proxy display: off for the export, then on again.")
+    active = payload.get("active_sequence") or {}
+    seq = payload.get("sequence") or {}
+    if active.get("before") is not None and active.get("before") != seq.get("id") \
+            and active.get("after") == active.get("before"):
+        lines.append(f"Active sequence: {seq.get('name')} ({seq.get('id')}) for the export, then "
+                     f"{active['before']} again.")
+    return lines
+
+
+def _frame_failure(ctx: click.Context, err: CliError, payload: dict) -> None:
+    """Exit 1 with the failure and what was written, as `mcp batch` does."""
+    if _json(ctx):
+        click.echo(json.dumps({"ok": False, "error": err.message, "code": err.code, **payload}, indent=2,
+                              ensure_ascii=False))
+    else:
+        lines = _frame_lines(payload)
+        if lines:
+            click.echo("\n".join(lines))
+        click.echo(f"Error: {err.message}", err=True)
+        for line in _warning_lines(payload.get("warnings") or []):
+            click.echo(line, err=True)
+    ctx.exit(1)
+
+
+@live_frame.command("export")
+@click.option("--sequence", "sequence_id", required=True, metavar="ID", help="ID of the sequence (see `live state`).")
+@click.option("--sequence-name", "sequence_name", metavar="NAME",
+              help="The name the sequence must have. Nothing is switched or exported when it is named otherwise.")
+@click.option("--time", "times", type=float, multiple=True, metavar="SECONDS",
+              help="Sequence time of a frame, in seconds. Give it once per frame.")
+@click.option("--out-dir", "out_dir", required=True, type=click.Path(path_type=Path), metavar="DIR",
+              help="Folder for the frames. It is made when it does not exist.")
+@click.option("--prefix", default="frame", show_default=True, metavar="NAME",
+              help="Start of each file name: NAME_00001000ms.png for 1 s. No folder separator.")
+@click.option("--format", "fmt", type=click.Choice(frames.FORMATS), default="png", show_default=True,
+              help="File format. The extension picks it.")
+@click.option("--overwrite", is_flag=True, help="Replace frames that exist already. Without it, they are refused.")
+@click.option("--proxies", type=click.Choice(frames.PROXY_CHOICES), default="off", show_default=True,
+              help="off: switch the proxy display off for the export and put it back after. keep: leave it as it is.")
+@click.option("--dry-run", "dry_run", is_flag=True,
+              help="Check the times and the files, read what would be switched, and change nothing: no folder is "
+                   "made, nothing is switched or exported.")
+@click.option("--project", help="Path of the project that must be the active one.")
+@click.option("--any-project", is_flag=True, help="Allow a project that is not a Claude working copy. Needs --project.")
+@_frame_options
+@json_option
+@click.pass_context
+@stops_cleanly(STOPPED_RUN)
+def live_frame_export(ctx: click.Context, sequence_id: str, sequence_name: str | None, times: tuple, out_dir: Path,
+                      prefix: str, fmt: str, overwrite: bool, proxies: str, dry_run: bool, project: str | None,
+                      any_project: bool, lease_wait: float, timeout: float, allow_untested: bool) -> None:
+    """Export still frames of one sequence, one file per --time, in one call.
+
+    The command makes the output folder. It switches proxy display off and puts it back after the export
+    (--proxies keep leaves it alone). The export works on the active sequence only, so when another sequence is
+    active, the command makes this one active and puts the old one back after.
+
+    file check: each file exists and is not empty. It is not a check of the picture.
+
+    The first frame that fails stops the run. The output lists the frames that were written. After a failed
+    export Premiere may open a recovery. Then nothing more is written: the proxy display and the active sequence
+    may stay switched, and the output says how to put them back after the recovery, with
+    `cli-anything-premiere live app proxies on` and `cli-anything-premiere live app activate --sequence ID`.
+
+    A time at or after the end of the sequence is refused. --timeout is the longest wait for one frame (600
+    seconds by default). A PNG still can carry alpha: composite it over black before you measure it.
+    """
+    try:
+        client = _client(lease_wait)
+        payload = frames.export_frames(client, live_cli.make_session, sequence_id=sequence_id,
+                                       sequence_name=sequence_name, times=list(times), out_dir=out_dir, prefix=prefix,
+                                       fmt=fmt, overwrite=overwrite, proxies=proxies, dry_run=dry_run, project=project,
+                                       any_project=any_project, allow_untested=allow_untested, hard_limit_s=timeout)
+    except CliError as err:
+        carried = getattr(err, "payload", None)
+        if carried is None:
+            _fail(ctx, err)
+            return
+        _frame_failure(ctx, err, carried)
+        return
+    if payload.get("dry_run"):
+        lines = [f"{p['time_seconds']:.3f} s -> {p['path']}" for p in payload["planned"]]
+        if not payload["out_dir"]["exists"]:
+            lines.append(f"The folder {payload['out_dir']['path']} does not exist yet. The real run will make it.")
+        if payload["proxies"]["switch"]:
+            lines.append("Proxy display: would be switched off for the export.")
+        if payload["active_sequence"]["switch"]:
+            lines.append(f"Active sequence: would be switched from {payload['active_sequence']['before'] or 'none'} "
+                         f"to {payload['sequence']['id']} for the export.")
+        lines.append("Dry run: nothing was switched or exported.")
+        _emit(ctx, payload, "\n".join(lines + _warning_lines(payload["warnings"])))
+        return
+    _emit(ctx, payload, "\n".join(_frame_lines(payload) + _warning_lines(payload["warnings"])))
+
+
+# ---------- live app ----------
+@live.group("app")
+def live_app() -> None:
+    """Switch the proxy display and the active sequence of the running Premiere."""
+
+
+def _app_failure(ctx: click.Context, err: CliError) -> None:
+    carried = getattr(err, "payload", None)
+    if carried is None:
+        _fail(ctx, err)
+        return
+    if _json(ctx):
+        click.echo(json.dumps({"ok": False, "error": err.message, "code": err.code, **carried}, indent=2,
+                              ensure_ascii=False))
+    else:
+        click.echo(f"Error: {err.message}", err=True)
+        for line in _warning_lines(carried.get("warnings") or []):
+            click.echo(line, err=True)
+    ctx.exit(1)
+
+
+def _on_off(value) -> str:
+    return "unknown" if value is None else ("on" if value else "off")
+
+
+@live_app.command("proxies")
+@click.argument("state", type=click.Choice(["on", "off"]))
+@click.option("--dry-run", "dry_run", is_flag=True, help="Read the proxy display and change nothing.")
+@click.option("--project", help="Path of the project that must be the active one.")
+@click.option("--any-project", is_flag=True, help="Allow a project that is not a Claude working copy. Needs --project.")
+@live_options
+@json_option
+@click.pass_context
+@stops_cleanly(STOPPED_RUN)
+def live_app_proxies(ctx: click.Context, state: str, dry_run: bool, project: str | None, any_project: bool,
+                     lease_wait: float, timeout: float, allow_untested: bool) -> None:
+    """Switch the proxy display of Premiere on or off, and read it back.
+
+    stored: the proxy display reads back as wanted. The proxy display is app-wide: it holds for every project.
+    """
+    try:
+        client = _client(lease_wait)
+        payload = frames.set_proxies(client, state == "on", dry_run=dry_run, project=project, any_project=any_project,
+                                     allow_untested=allow_untested, hard_limit_s=timeout)
+    except CliError as err:
+        _app_failure(ctx, err)
+        return
+    if payload.get("dry_run"):
+        lines = [f"Proxy display: {_on_off(payload['proxies']['before'])}. Dry run: nothing was switched."]
+    else:
+        lines = [f"Proxy display: {_on_off(payload['proxies']['after'])} (was {_on_off(payload['proxies']['before'])}). "
+                 "Stored: yes"]
+    _emit(ctx, payload, "\n".join(lines + _warning_lines(payload["warnings"])))
+
+
+def _sequence_text(ref) -> str:
+    return "none" if not isinstance(ref, dict) else f"{ref.get('name') or '?'} ({ref.get('id')})"
+
+
+@live_app.command("activate")
+@click.option("--sequence", "sequence_id", required=True, metavar="ID", help="ID of the sequence (see `live state`).")
+@click.option("--sequence-name", "sequence_name", metavar="NAME",
+              help="The name the sequence must have. Nothing is switched when it is named otherwise.")
+@click.option("--dry-run", "dry_run", is_flag=True, help="Find the sequence, read the active one, and change nothing.")
+@click.option("--project", help="Path of the project that must be the active one.")
+@click.option("--any-project", is_flag=True, help="Allow a project that is not a Claude working copy. Needs --project.")
+@live_options
+@json_option
+@click.pass_context
+@stops_cleanly(STOPPED_RUN)
+def live_app_activate(ctx: click.Context, sequence_id: str, sequence_name: str | None, dry_run: bool,
+                      project: str | None, any_project: bool, lease_wait: float, timeout: float,
+                      allow_untested: bool) -> None:
+    """Make a sequence the active one in Premiere.
+
+    stored: the script reads the sequence back as active, and a fresh read of Premiere's state shows it too.
+    """
+    try:
+        client = _client(lease_wait)
+        payload = frames.activate_sequence(client, sequence_id, sequence_name, dry_run=dry_run, project=project,
+                                           any_project=any_project, allow_untested=allow_untested,
+                                           hard_limit_s=timeout)
+    except CliError as err:
+        _app_failure(ctx, err)
+        return
+    before = payload["active_sequence"]["before"]
+    if payload.get("dry_run"):
+        lines = [f"Active sequence: {_sequence_text(before)}. Dry run: nothing was switched."]
+    else:
+        lines = [f"Active sequence: {_sequence_text(payload['active_sequence']['after'])} "
+                 f"(was {_sequence_text(before)}). Stored: yes"]
     _emit(ctx, payload, "\n".join(lines + _warning_lines(payload["warnings"])))
