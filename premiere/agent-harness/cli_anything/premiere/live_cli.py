@@ -515,3 +515,12 @@ def doctor(ctx: click.Context) -> None:
         click.echo("\n".join(lines))
         click.echo(f"Error: {message}", err=True)
     ctx.exit(1)
+
+# The recipe commands (live_recipes.py) attach to the `live` group above. A fault in them must not take the
+# other groups down: the import is guarded, and `live --help` says why the recipe commands are missing.
+RECIPES_ERROR = None
+try:
+    from . import live_recipes  # noqa: F401,E402
+except Exception as exc:
+    RECIPES_ERROR = f"{type(exc).__name__}: {exc}"
+    live.epilog = f"The recipe commands are not available: {RECIPES_ERROR}"

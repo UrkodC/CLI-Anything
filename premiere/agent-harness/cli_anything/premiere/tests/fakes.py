@@ -390,3 +390,53 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 '''
+
+
+# ---------- panels for the recipe scripts ----------
+RECIPE_STATE_MARK = "playhead_ticks: playhead"    # occurs in state.jsx only
+RECIPE_STATE = {"version": "27.0.0", "build": "88",
+                "projects": [{"name": "X Claude.prproj", "path": "/p/X Claude.prproj", "active": True}],
+                "active_sequence": {"id": "s1", "name": "Main"}, "playhead_ticks": "0", "selection": []}
+
+
+def script_args(script: str) -> dict:
+    """The ARGS of a built script: the JSON object on its `var ARGS = ...;` line."""
+    import re
+    found = re.search(r"^var ARGS = (.*);$", script, re.MULTILINE)
+    assert found, "this script has no ARGS line"
+    return json.loads(found.group(1))
+
+
+def recipe_handler(replies: dict, *, state: dict | None = None) -> Callable[[str], str]:
+    """A FakePanel handler for recipe scripts. Use it as `FakePanel(bridge_dir, handler=recipe_handler({...}))`.
+
+    `replies` maps a marker to the answer for the script that holds that marker (each recipe script has a
+    first-line comment such as `// recipe: clip_list`; the marker is `"recipe: clip_list"`). The answer is
+      - a data object (anything JSON): sent as {"success": true, "data": <it>};
+      - a function that takes the full script text and returns the data object (or an Exception);
+      - an Exception: sent as a failure, {"success": false, "error": str(it)}. The text of a refusal from a
+        script is "Error: precondition: <text>", which the CLI reports with the code "precondition".
+    The state script (the one that holds RECIPE_STATE_MARK) is answered with `state`, by default a valid
+    Premiere 27 state with one project named "X Claude.prproj". Any other script, or a function that raises,
+    gets a failure reply that says so, so the panel thread never dies. script_args(script) reads the ARGS.
+    """
+    shown = RECIPE_STATE if state is None else state
+
+    def reply(data: object) -> str:
+        if isinstance(data, Exception):
+            return json.dumps({"success": False, "error": str(data)})
+        return json.dumps({"success": True, "data": data})
+
+    def handler(script: str) -> str:
+        if RECIPE_STATE_MARK in script:
+            return reply(shown)
+        for marker, answer in replies.items():
+            if marker in script:
+                if not callable(answer):
+                    return reply(answer)
+                try:
+                    return reply(answer(script))
+                except Exception as exc:     # a panel thread that raises never answers
+                    return reply(Exception(f"recipe_handler: the reply function for {marker!r} raised {exc!r}"))
+        return reply(Exception(f"recipe_handler has no reply for this script: {script[:80]!r}"))
+    return handler
