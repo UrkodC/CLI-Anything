@@ -1,4 +1,4 @@
-"""Tests for `live effect get`: the recipe (core/recipes/effects.py), its script (core/scripts/effect_get.jsx)
+"""Tests for `live effect get` and `live effect set`: the recipes (core/recipes/effects.py), its script (core/scripts/effect_get.jsx)
 and the command (live_recipes.py).
 
 The command runs against a fake panel in a temp folder. The script runs in node with a stub `app`, alone
@@ -19,8 +19,9 @@ from cli_anything.premiere.core.bridge import BridgeClient
 from cli_anything.premiere.core.recipes import effects
 from cli_anything.premiere.errors import CliError
 from cli_anything.premiere.premiere_cli import dispatch
+from cli_anything.premiere.core import bridge
 from cli_anything.premiere.tests.fakes import (  # noqa: F401
-    RECIPE_STATE, FakePanel, bridge_dir, keep_signals, recipe_handler, script_args)
+    RECIPE_STATE, EffectModel, FakePanel, bridge_dir, keep_signals, recipe_handler, script_args)
 from cli_anything.premiere.tests.test_jsx import BANNED, NODE, STUB_HELPERS, needs_node
 
 MARK = "recipe: effect_get"
@@ -509,7 +510,7 @@ TITLE = {"track_type": "video", "track": 1, "clip": 0}
 def run_get(target=INTRO, *, sequence_id="S-A", effect=None, effect_index=None, prelude="") -> tuple[dict, dict]:
     """Run effect_get.jsx in node against the stub app. Returns (the parsed reply, what the stub saw)."""
     args = {"sequence_id": sequence_id, "target": target, "effect": effect, "effect_index": effect_index}
-    script = jsx.build(jsx.load("effect_get"), args, include=("find",))
+    script = jsx.build(jsx.load("effect_get"), args, include=("find", "values"))
     code = (GET_PRELUDE + prelude + "\nprocess.stdout.write(JSON.stringify({reply: String(" + script
             + "), writes: writes, reads: valueReads, colors: colorReads}));")
     out = subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=30, check=True).stdout
@@ -807,3 +808,1095 @@ def test_a_real_character_outside_the_bmp_passes_unchanged(live, capsys):
     assert lines[0].startswith("V1[0] 000f4243 Scene " + CLAPPER + ", sequence s1")
     assert lines[1] == "[0] Title " + CLAPPER + " (AE." + CLAPPER + "), 2 properties"
     assert lines[2:4] == [f'  0 {CLAPPER} = "take {CLAPPER} one"', f"  1 Clap{CLAPPER}per = 1"]
+
+
+# =====================================================================================================
+# live effect set
+# =====================================================================================================
+RESOLVE = "recipe: effect_resolve"
+WRITE = "recipe: effect_write"
+RECOVERY = ".host-recovery.json"
+SET = ["live", "effect", "set"]
+BRIGHTNESS = ["--sequence", "s1", "--track", "0", "--clip", "0", "--effect", "ProcAmp", "--index", "0",
+              "--name", "Brightness"]
+EXPECT_S1 = {"project_path": "/p/X Claude.prproj", "sequence_id": "s1", "sequence_name": None}
+NOT_PROOF = "Read-back is not proof for this change."
+
+
+def effect_set(live, capsys, model, *argv, state=None, extra=None):  # noqa: F811
+    """Run `live effect set` against a panel that plays `model`; returns (code, payload, panel)."""
+    replies = model.replies()
+    replies.update(extra or {})
+    with panel_on(live, handler=recipe_handler(replies, state=state)) as panel:
+        code, out = run_json(capsys, [*SET, *argv])
+    return code, out, panel
+
+
+def scripts(panel, mark) -> list[dict]:
+    """The ARGS of every script with this marker that the panel got."""
+    return [script_args(text) for text in panel.seen if mark in text]
+
+
+def plan_file(tmp_path, plan, name="plan.json"):
+    path = tmp_path / name
+    path.write_text(plan if isinstance(plan, str) else json.dumps(plan), encoding="utf-8")
+    return str(path)
+
+
+def write_of(track, clip, effect, index, name, value, **more) -> dict:
+    return {"track": track, "clip": clip, "effect": effect, "index": index, "name": name, "value": value, **more}
+
+
+def nothing_written(live, model, panel) -> None:
+    assert model.writes == [] and not scripts(panel, WRITE)
+    assert not (live / RECOVERY).exists() and not (live / LOCK).exists()
+
+
+# ---------- the brief's tests ----------
+def test_one_write_is_stored(live, capsys, sends):
+    model = EffectModel()
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3.0")
+    assert code == 0 and out.pop("ok") is True
+    assert list(out) == ["sequence", "resolved", "results", "ran", "total", "stored", "rendered", "warnings"]
+    assert out["sequence"] == {"id": "s1", "name": "Main"}
+    assert out["resolved"] == [{"entry": 0, "clip": {"node_id": "000f4243", "name": "testclip.mp4", "track": 0, "clip": 0,
+                                                     "start_seconds": 0.0},
+                                "effect": "ProcAmp", "effect_index": 4, "index": 0, "name": "Brightness", "value_now": 7.7}]
+    assert out["results"] == [{"entry": 0, "requested": 3.0, "before": 7.7, "value": 3.0, "stored": True, "attempts": 1,
+                               "zero_first": False, "landed": None, "restored": None, "now": 3.0, "error": None}]
+    assert (out["ran"], out["total"], out["stored"], out["rendered"], out["warnings"]) == (1, 1, True, None, [])
+    assert model.prop(0, 0, 4, 0)["value"] == 3.0 and model.writes == [("000f4243", 4, 0, 3.0)]
+    assert len(panel.seen) == 3 and sends == [False, False, True]          # state, resolve, write
+    assert scripts(panel, RESOLVE) == [{"sequence_id": "s1", "entries": [
+        {"target": {"track_type": "video", "track": 0, "clip": 0}, "effect": "ProcAmp", "effect_index": None,
+         "index": 0, "name": "Brightness"}], "expect": EXPECT_S1}]
+    assert scripts(panel, WRITE) == [{"sequence_id": "s1", "target": {"track_type": "video", "track": 0, "clip": 0},
+                                      "node_id": "000f4243", "effect": "ProcAmp", "effect_index": None,
+                                      "found_effect_index": 4, "index": 0, "name": "Brightness", "value": 3.0,
+                                      "tolerance": 0.001, "expect": EXPECT_S1}]
+    for text in panel.seen[1:]:
+        assert FIND_MARK in text
+    assert "// values.jsx" in panel.seen[1] and "// values.jsx" not in panel.seen[2]
+    assert not (live / RECOVERY).exists() and not (live / LOCK).exists()
+
+
+def test_readback_uses_the_tolerance(live, capsys):
+    model = EffectModel()
+    model.prop(0, 0, 4, 0)["value"] = 1.0
+    model.readback[7.7] = 7.69999980926514
+    code, out, _ = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "7.7")
+    assert code == 0 and out["stored"] is True
+    assert out["results"][0]["value"] == 7.69999980926514 and out["results"][0]["stored"] is True
+
+
+def test_same_value_is_the_one_rule():
+    same = effects.same_value
+    assert same(3.0, 3.0009) and same(3, 3.0) and same(-2.6, -2.6004) and same(0, -0.0)
+    assert not same(3.0, 3.0011) and not same(3.0, 2.5)
+    assert same("a", "a") and not same("a", "a ") and not same("", " ")
+    assert same(True, True) and same(False, False) and not same(True, False)
+    assert not same(True, 1) and not same(1, True) and not same(0, False) and not same("1", 1)
+    assert not same(None, None) and not same(None, 0) and not same([1], [1])
+    assert not same(float("nan"), float("nan")) and not same(float("inf"), float("inf"))
+    assert effects.VALUE_TOLERANCE == 0.001
+    assert effects.REFUSED_LUMETRI_INDEXES == (7, 32, 34) and effects.LUMETRI_MATCH == "AE.ADBE Lumetri"
+
+
+def test_zero_is_written_first_when_crossing(live, capsys):
+    model = EffectModel()
+    model.prop(0, 0, 4, 0)["value"] = 5.0
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "-2.6")
+    assert code == 0 and out["stored"] is True
+    assert [args["value"] for args in scripts(panel, WRITE)] == [-2.6]      # the script does the zero step itself
+    assert model.writes == [("000f4243", 4, 0, 0), ("000f4243", 4, 0, -2.6)]
+    assert out["results"][0] == {"entry": 0, "requested": -2.6, "before": 5.0, "value": -2.6, "stored": True,
+                                 "attempts": 1, "zero_first": True, "landed": None, "restored": None, "now": -2.6,
+                                 "error": None}
+
+
+def test_negative_fault_retries_then_lands_near(live, capsys):
+    model = EffectModel()
+    model.fail(-2.6, times=2)
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "-2.6")
+    assert code == 1 and out["ok"] is False and out["code"] == "not_stored"
+    assert [args["value"] for args in scripts(panel, WRITE)] == [-2.6, -2.6, -2.496]
+    result = out["results"][0]
+    assert (result["attempts"], result["landed"], result["stored"], result["value"]) == (3, -2.496, False, -2.496)
+    assert result["zero_first"] is True and result["before"] == 7.7 and result["requested"] == -2.6
+    assert "Illegal Parameter type" in result["error"] and "-2.496" in result["error"]
+    assert (result["restored"], result["now"]) == (None, -2.496)                 # a near value that landed is kept
+    assert len(model.writes) == 4 and model.writes[-1][3] == -2.496             # 0, -2.6, -2.6, -2.496: no put-back
+    assert (out["ran"], out["total"], out["stored"]) == (1, 1, False)
+    assert "entry 0" in out["error"] and "not stored" in out["error"]
+    assert not (live / RECOVERY).exists() and not (live / LOCK).exists()
+
+
+def test_negative_fault_that_never_lands(live, capsys):
+    model = EffectModel()
+    model.fail(-2.6, times=2)
+    model.fail(-2.496, times=1, error="Illegal Parameter type, again")
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "-2.6")
+    assert code == 1 and out["code"] == "not_stored"
+    result = out["results"][0]
+    assert (result["attempts"], result["landed"], result["stored"]) == (3, None, False)
+    assert "Illegal Parameter type" in result["error"]
+    # the zero step left 0 there, so the old 7.7 is put back with a fourth write
+    assert [args["value"] for args in scripts(panel, WRITE)] == [-2.6, -2.6, -2.496, 7.7]
+    assert (result["value"], result["restored"], result["now"]) == (0, True, 7.7)
+    assert model.prop(0, 0, 4, 0)["value"] == 7.7
+
+
+def test_positive_failure_gets_one_attempt(live, capsys):
+    model = EffectModel()
+    model.readback[3.0] = 2.5
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3.0")
+    assert code == 1 and out["code"] == "not_stored"
+    result = out["results"][0]
+    assert (result["attempts"], result["stored"], result["value"], result["landed"]) == (1, False, 2.5, None)
+    assert result["error"] == "wanted 3.0, read back 2.5"
+    assert [args["value"] for args in scripts(panel, WRITE)] == [3.0, 7.7]          # one attempt, then the put-back
+    assert (result["restored"], result["now"]) == (True, 7.7)
+
+
+def test_a_negative_that_reads_back_wrong_also_gets_the_near_value(live, capsys):
+    model = EffectModel()
+    model.readback[-2.6] = -2.0
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "-2.6")
+    assert [args["value"] for args in scripts(panel, WRITE)] == [-2.6, -2.6, -2.496]
+    assert out["results"][0]["landed"] == -2.496 and out["results"][0]["stored"] is False
+
+
+def test_batch_stops_at_the_first_failure(live, capsys, tmp_path):
+    model = EffectModel()
+    model.readback[4.0] = 1.0
+    plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 3.0),
+                                            write_of(0, 1, "ProcAmp", 0, "Brightness", 4.0),
+                                            write_of(0, 0, "ProcAmp", 1, "Contrast", 50.0)]}
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 1 and out["code"] == "not_stored"
+    assert (out["ran"], out["total"], out["stored"]) == (2, 3, False)
+    assert [r["stored"] for r in out["results"]] == [True, False]
+    assert [args["value"] for args in scripts(panel, WRITE)] == [3.0, 4.0, 5.0]     # 5.0 is the put-back; the third never sent
+    assert model.prop(0, 0, 4, 1)["value"] == 100.0
+    assert len(out["resolved"]) == 3 and len(scripts(panel, RESOLVE)) == 1          # one read for every entry
+    assert "entry 1" in out["error"]
+
+
+def test_two_lumetri_need_effect_index(live, capsys):
+    model = EffectModel()
+    clip = model.clips[(0, 0)]
+    clip["effects"].append({"name": "Lumetri Color", "match_name": "AE.ADBE Lumetri", "properties": [
+        {"name": "Temperature", "value": 3.0, "kind": "number", "keyframed": False}]})
+    lumetri = ["--sequence", "s1", "--track", "0", "--clip", "0", "--effect", "Lumetri Color", "--index", "14",
+               "--name", "Temperature", "--value", "-20"]
+    code, out, panel = effect_set(live, capsys, model, *lumetri)
+    assert code == 1 and out["code"] == "precondition"
+    assert out["error"] == "entry 0: ambiguous_effect: 2 effects are named Lumetri Color; pass effect_index"
+    assert (out["ran"], out["results"]) == (0, [])
+    nothing_written(live, model, panel)
+    code, out, panel = effect_set(live, capsys, model, *lumetri, "--effect-index", "2")
+    assert code == 0 and out["stored"] is True and out["resolved"][0]["effect_index"] == 2
+    assert model.writes == [("000f4243", 2, 14, 0), ("000f4243", 2, 14, -20)]        # 10 -> -20 crosses zero
+    assert scripts(panel, WRITE)[0]["effect_index"] == 2 and scripts(panel, WRITE)[0]["found_effect_index"] == 2
+
+
+def test_missing_clip_index_fails_before_any_write(live, capsys, tmp_path):
+    model = EffectModel()
+    plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 3.0),
+                                            write_of(0, 9, "ProcAmp", 0, "Brightness", 3.0)]}
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 1 and out["code"] == "precondition"
+    assert out["error"] == "entry 1: video track 0 has no clip 9"
+    assert (out["ran"], out["total"], out["results"], out["resolved"]) == (0, 2, [], [])
+    nothing_written(live, model, panel)
+
+
+def _lumetri(index, name, value):
+    return ["--sequence", "s1", "--track", "0", "--clip", "0", "--effect", "Lumetri Color", "--index", str(index),
+            "--name", name, "--value", value]
+
+
+def _keyframed(model):
+    model.prop(0, 0, 4, 0)["keyframed"] = True
+
+
+def _unknown_keys(model):
+    model.prop(0, 0, 4, 0)["keyframed"] = None
+
+
+def _gyroflow(model):
+    model.clips[(0, 0)]["effects"].append({"name": "Gyroflow Stabilizer", "match_name": "Gyroflow.Stab", "properties": [
+        {"name": "Smoothness", "value": 0.5, "kind": "number", "keyframed": False}]})
+
+
+def _gyroflow_by_match(model):
+    model.clips[(0, 0)]["effects"].append({"name": "Stabilizer", "match_name": "com.gyroflow.toolbox", "properties": [
+        {"name": "Smoothness", "value": 0.5, "kind": "number", "keyframed": False}]})
+
+
+def _unreadable(model):
+    model.prop(0, 0, 4, 0).update(kind="unreadable", value=None)
+
+
+@pytest.mark.parametrize("setup, argv, words", [
+    (_keyframed, [*BRIGHTNESS, "--value", "3"], "keyframes"),
+    (_unknown_keys, [*BRIGHTNESS, "--value", "3"], "keyframes"),
+    (_gyroflow, ["--sequence", "s1", "--node-id", "000f4243", "--effect", "Gyroflow Stabilizer", "--index", "0",
+                 "--name", "Smoothness", "--value", "0.2"], "Gyroflow"),
+    (_gyroflow_by_match, ["--sequence", "s1", "--node-id", "000f4243", "--effect", "Stabilizer", "--index", "0",
+                          "--name", "Smoothness", "--value", "0.2"], "Gyroflow"),
+    (None, _lumetri(7, "Input LUT", "1"), "index 7"),
+    (None, _lumetri(32, " ", '"/luts/a.cube/"'), "index 32"),
+    (None, _lumetri(34, "Look", "1"), "index 34"),
+    (None, [*BRIGHTNESS, "--value", '"bright"'], "number"),
+    (None, [*BRIGHTNESS, "--value", "true"], "number"),
+    (None, _lumetri(4, " ", "3"), "string"),
+    (None, ["--sequence", "s1", "--track", "0", "--clip", "0", "--effect", "ProcAmp", "--index", "4",
+            "--name", "Split Screen", "--value", "1"], "boolean"),
+    (None, _lumetri(13, "White Balance", "5"), "color"),
+    (None, ["--sequence", "s1", "--track", "0", "--clip", "0", "--effect", "Motion", "--index", "0",
+            "--name", "Position", "--value", "0.5"], "array"),
+    (_unreadable, [*BRIGHTNESS, "--value", "3"], "unreadable"),
+])
+def test_refused_parameters(live, capsys, setup, argv, words):
+    model = EffectModel()
+    if setup:
+        setup(model)
+    code, out, panel = effect_set(live, capsys, model, *argv)
+    assert code == 1 and out["code"] == "refused_parameter", out
+    assert out["error"].startswith("entry 0: ") and words in out["error"] and "Nothing was changed." in out["error"]
+    assert (out["ran"], out["results"]) == (0, [])
+    nothing_written(live, model, panel)
+
+
+def test_a_kind_refusal_names_what_can_be_written(live, capsys):
+    code, out, _ = effect_set(live, capsys, EffectModel(), *_lumetri(13, "White Balance", "5"))
+    assert "only numbers, strings and booleans can be written" in out["error"]
+
+
+def test_a_refusal_anywhere_in_the_plan_stops_it_before_the_first_write(live, capsys, tmp_path):
+    model = EffectModel()
+    plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 3.0),
+                                            write_of(0, 0, "Lumetri Color", 7, "Input LUT", 1)]}
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 1 and out["code"] == "refused_parameter" and out["error"].startswith("entry 1: ")
+    nothing_written(live, model, panel)
+
+
+def test_expect_old_mismatch(live, capsys, tmp_path):
+    model = EffectModel()
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3", "--expect-old", "1.0")
+    assert code == 1 and out["code"] == "precondition"
+    assert out["error"].startswith("entry 0: ") and "1.0" in out["error"] and "7.7" in out["error"]
+    nothing_written(live, model, panel)
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3", "--expect-old", "7.7004")
+    assert code == 0 and out["stored"] is True
+    plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 4, expect_old=3)]}
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 0 and out["stored"] is True
+    plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 5, expect_old="4")]}
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 1 and out["code"] == "precondition"
+
+
+def test_dry_run_sends_reads_only(live, capsys, sends):
+    model = EffectModel()
+    model.prop(0, 0, 4, 0)["value"] = 5.0
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "-2.6", "--dry-run")
+    assert code == 0 and out["dry_run"] is True
+    assert sends and not any(sends) and model.writes == [] and not scripts(panel, WRITE)
+    assert out["resolved"][0]["value_now"] == 5.0
+    assert out["planned"] == [{"entry": 0, "value_now": 5.0, "requested": -2.6, "crosses_zero": True}]
+    assert out["sequence"] == {"id": "s1", "name": "Main"} and out["warnings"] == []
+    code, out, panel = effect_set(live, capsys, model, *_lumetri(7, "Input LUT", "1"), "--dry-run")
+    assert code == 1 and out["code"] == "refused_parameter"                 # a dry run refuses what a write would
+
+
+def test_own_film_is_refused(live, capsys):
+    model = EffectModel()
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3", state=STATE_OWN)
+    assert code == 1 and out["code"] == "project_guard"
+    assert len(panel.seen) == 1 and "playhead_ticks: playhead" in panel.seen[0]
+    nothing_written(live, model, panel)
+
+
+GOOD_ENTRY = {"track": 0, "clip": 0, "effect": "ProcAmp", "index": 0, "name": "Brightness", "value": 3}
+
+
+@pytest.mark.parametrize("plan, words", [
+    ("{not json", "not valid JSON"),
+    ("[]", "JSON object"),
+    ('{"sequence_id": "s1", "writes": [{"track": 0, "clip": 0, "effect": "ProcAmp", "index": 0, '
+     '"name": "Brightness", "value": NaN}]}', "not valid JSON"),
+    ({"sequence_id": "s1", "writes": [GOOD_ENTRY], "save": True}, "save"),
+    ({"sequence_id": "s1", "writes": []}, "writes"),
+    ({"sequence_id": "s1"}, "writes"),
+    ({"writes": [GOOD_ENTRY]}, "sequence_id"),
+    ({"sequence_id": "", "writes": [GOOD_ENTRY]}, "sequence_id"),
+    ({"sequence_id": "s1", "sequence_name": 5, "writes": [GOOD_ENTRY]}, "sequence_name"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "track_type": "audio"}]}, "video"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "speed": 2}]}, "speed"),
+    ({"sequence_id": "s1", "writes": [{k: v for k, v in GOOD_ENTRY.items() if k != "name"}]}, "name"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "name": 5}]}, "name"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "value": None}]}, "value"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "value": [1, 2]}]}, "value"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "value": {"a": 1}}]}, "value"),
+    ({"sequence_id": "s1", "writes": [{k: v for k, v in GOOD_ENTRY.items() if k != "value"}]}, "value"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "expect_old": None}]}, "expect_old"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "index": -1}]}, "index"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "index": True}]}, "index"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "effect_index": 1.5}]}, "effect_index"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "effect": ""}]}, "effect"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "clip": "0"}]}, "clip"),
+    ({"sequence_id": "s1", "writes": [{k: v for k, v in GOOD_ENTRY.items() if k != "clip"}]}, "clip"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "node_id": "000f4243"}]}, "node_id"),
+    ({"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "value": "a\ud800b"}]}, "value"),
+    ({"sequence_id": "s1", "writes": ["not an object"]}, "entry 0"),
+])
+def test_plan_file_faults(live, capsys, tmp_path, plan, words):
+    model = EffectModel()
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 1 and out["code"] == "bad_plan", out
+    assert words in out["error"] and "Nothing was sent." in out["error"]
+    assert panel.seen == [] and model.writes == []
+
+
+def test_a_plan_fault_names_the_entry(live, capsys, tmp_path):
+    plan = {"sequence_id": "s1", "writes": [GOOD_ENTRY, {**GOOD_ENTRY, "value": None}]}
+    code, out, panel = effect_set(live, capsys, EffectModel(), "--from", plan_file(tmp_path, plan))
+    assert out["code"] == "bad_plan" and "entry 1" in out["error"]
+    code, out, panel = effect_set(live, capsys, EffectModel(), "--from", str(tmp_path / "missing.json"))
+    assert out["code"] == "bad_plan" and panel.seen == []
+
+
+@pytest.mark.parametrize("value", [1e400, -1e400, 4294967296, -4294967296.0, 5e12])
+def test_a_number_out_of_range_is_refused_before_anything_is_sent(live, capsys, tmp_path, value):
+    plan = '{"sequence_id": "s1", "writes": [{"track": 0, "clip": 0, "effect": "ProcAmp", "index": 0, ' \
+           '"name": "Brightness", "value": %s}]}' % ("1e400" if value == 1e400 else "-1e400" if value == -1e400 else repr(value))
+    model = EffectModel()
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 1 and out["code"] == "refused_parameter" and "Nothing was sent." in out["error"]
+    assert panel.seen == []
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "4294967296")
+    assert out["code"] == "refused_parameter" and panel.seen == []
+
+
+def test_lut_path_write_warns(live, capsys):
+    model = EffectModel()
+    code, out, panel = effect_set(live, capsys, model, *_lumetri(4, " ", '"/luts/Example Look.cube/"'))
+    assert code == 0 and out["stored"] is True
+    assert model.prop(0, 0, 2, 4)["value"] == "/luts/Example Look.cube/"
+    assert len(out["warnings"]) == 1 and NOT_PROOF in out["warnings"][0] and "entry 0" in out["warnings"][0]
+    code, out, panel = effect_set(live, capsys, model, *_lumetri(6, "Input LUT", "1"))
+    assert code == 0 and NOT_PROOF in out["warnings"][0]
+    code, out, panel = effect_set(live, capsys, model, *_lumetri(14, "Temperature", "12"))
+    assert code == 0 and out["warnings"] == []
+
+
+def test_breathe_then_moved_target(live, capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_HOLD_S", 0.0)
+    model = EffectModel()
+
+    def moved():
+        model.clips[(0, 1)]["node_id"] = "000f9999"
+    model.moves[2] = moved
+    plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 3.0),
+                                            write_of(0, 1, "ProcAmp", 0, "Brightness", 4.0)]}
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 1 and out["code"] == "target_moved"
+    assert "entry 1" in out["error"] and "000f4250" in out["error"] and "000f9999" in out["error"]
+    assert (out["ran"], out["total"]) == (1, 2) and [r["stored"] for r in out["results"]] == [True]
+    assert model.writes == [("000f4243", 4, 0, 3.0)] and model.resolves == 2
+    assert sum("playhead_ticks: playhead" in text for text in panel.seen) == 2       # the guards ran again
+
+
+def test_breathe_then_moved_effect(live, capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_HOLD_S", 0.0)
+    model = EffectModel()
+
+    def moved():
+        model.clips[(0, 1)]["effects"].insert(0, {"name": "Opacity", "match_name": "AE.ADBE Opacity", "properties": []})
+    model.moves[2] = moved
+    plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 3.0),
+                                            write_of(0, 1, "ProcAmp", 0, "Brightness", 4.0)]}
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 1 and out["code"] == "target_moved" and "index 0 and is at 1" in out["error"]
+    assert model.writes == [("000f4243", 4, 0, 3.0)]
+
+
+def test_breathe_with_the_same_targets_goes_on(live, capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_HOLD_S", 0.0)
+    model = EffectModel()
+    plan = {"sequence_id": "s1", "sequence_name": "Main",
+            "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 3.0), {"node_id": "000f4250", "effect": "ProcAmp",
+                                                                         "index": 0, "name": "Brightness", "value": 4.0}]}
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 0 and out["stored"] is True and model.resolves == 2
+    assert scripts(panel, WRITE)[1]["target"] == {"node_id": "000f4250"}
+    assert scripts(panel, RESOLVE)[0]["expect"]["sequence_name"] == "Main"
+
+
+def test_near_value():
+    assert effects.near_value(-2.6) == -2.496
+    assert effects.near_value(-40) == -38.4
+    assert effects.near_value(-0.077) == -0.074
+    assert effects.near_value(-0.002) == -0.001
+    assert effects.near_value(-3.7) == -3.552
+
+
+# ---------- failures in the middle of a batch ----------
+def _two_entries(tmp_path) -> str:
+    return plan_file(tmp_path, {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 3.0),
+                                                                write_of(0, 1, "ProcAmp", 0, "Brightness", 4.0)]})
+
+
+def test_a_precondition_of_the_write_script_stops_the_batch_with_what_ran(live, capsys, tmp_path):
+    model = EffectModel()
+    calls = []
+
+    def write(script):
+        calls.append(script)
+        if len(calls) == 2:
+            return Exception("Error: precondition: the clip at this place changed")
+        return model.write(script)
+    code, out, panel = effect_set(live, capsys, model, "--from", _two_entries(tmp_path), extra={WRITE: write})
+    assert code == 1 and out["code"] == "precondition" and out["ok"] is False
+    assert "the clip at this place changed" in out["error"] and "entry 1" in out["error"]
+    assert "may have landed" not in out["error"]                     # attempt 1 refused: nothing was changed
+    assert (out["ran"], out["total"], len(out["resolved"])) == (1, 2, 2)
+    assert out["results"][0]["stored"] is True and len(out["results"]) == 1
+    assert not (live / RECOVERY).exists()
+
+
+@pytest.mark.parametrize("reply", [
+    "not a dict",
+    {"before": 1, "zero_first": False, "set_error": None, "value": 3.0},                      # no read_error
+    {"before": 1, "zero_first": "no", "set_error": None, "value": 3.0, "read_error": None},
+    {"before": 1, "zero_first": False, "set_error": 5, "value": 3.0, "read_error": None},
+    {"before": 1, "zero_first": False, "set_error": None, "value": 3.0, "read_error": []},
+    {"before": 1, "zero_first": False, "set_error": None, "value": {"a": 1}, "read_error": None},
+    {"before": [1], "zero_first": False, "set_error": None, "value": 3.0, "read_error": None},
+])
+def test_a_write_reply_of_the_wrong_shape_is_bad_reply(live, capsys, tmp_path, reply):
+    model = EffectModel()
+    calls = []
+
+    def write(script):
+        calls.append(script)
+        return reply if len(calls) == 2 else model.write(script)
+    code, out, panel = effect_set(live, capsys, model, "--from", _two_entries(tmp_path), extra={WRITE: write})
+    assert code == 1 and out["code"] == "bad_reply"
+    assert "entry 1" in out["error"] and "Check" in out["error"]
+    assert out["ran"] == 1 and [r["entry"] for r in out["results"]] == [0, 1]   # entry 1 is not claimed as not stored
+    unknown = out["results"][1]
+    assert (unknown["stored"], unknown["now"], unknown["restored"], unknown["attempts"]) == (None, None, None, 0)
+    assert unknown["error"].startswith("bad_reply: entry 1, attempt 1")
+
+
+def test_a_write_that_gets_no_answer_stops_the_batch(live, capsys, tmp_path):
+    model = EffectModel()
+    calls = []
+
+    def write(script):
+        calls.append(script)
+        return model.write(script) if len(calls) == 1 else None
+    replies = {**model.replies(), WRITE: write}
+
+    def handler(script):
+        if WRITE in script and len(calls) >= 1:
+            calls.append(script)
+            return None
+        return recipe_handler(replies)(script)
+    with panel_on(live, handler=handler):
+        code, out = run_json(capsys, [*SET, "--from", _two_entries(tmp_path), "--timeout", "0.5"])
+    assert code == 1 and out["code"] == "unknown_outcome"
+    assert out["ran"] == 1 and out["results"][0]["stored"] is True and "entry 1" in out["error"]
+    assert (live / RECOVERY).exists()
+
+
+def test_a_resolve_reply_of_the_wrong_shape_is_bad_reply(live, capsys):
+    model = EffectModel()
+    good = model.resolve
+
+    def resolve(script):
+        reply = good(script)
+        reply["entries"][0]["property"]["name"] = "Contrast"                 # not the property that was asked for
+        return reply
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3", extra={RESOLVE: resolve})
+    assert code == 1 and out["code"] == "bad_reply"
+    nothing_written(live, model, panel)
+
+    def no_node(script):
+        reply = good(script)
+        reply["entries"][0]["clip"]["node_id"] = None
+        return reply
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3", extra={RESOLVE: no_node})
+    assert code == 1 and out["code"] == "bad_reply"
+    nothing_written(live, model, panel)
+
+    def other_effect(script):
+        reply = good(script)
+        reply["entries"][0]["effect"]["name"] = "Lumetri Color"
+        reply["entries"][0]["effect"]["match_name"] = "AE.ADBE Lumetri"
+        return reply
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3", extra={RESOLVE: other_effect})
+    assert code == 1 and out["code"] == "bad_reply"
+    nothing_written(live, model, panel)
+
+    def other_clip(script):
+        reply = good(script)
+        reply["entries"][0]["clip"]["clip"] = 1
+        return reply
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3", extra={RESOLVE: other_clip})
+    assert code == 1 and out["code"] == "bad_reply"
+    nothing_written(live, model, panel)
+
+    def short(script):
+        reply = good(script)
+        reply["entries"] = []
+        return reply
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3", extra={RESOLVE: short})
+    assert code == 1 and out["code"] == "bad_reply"
+    nothing_written(live, model, panel)
+
+
+def test_a_lone_surrogate_from_premiere_never_reaches_the_output(live, capsys):
+    model = EffectModel()
+    model.clips[(0, 0)]["name"] = "clip\ud800"
+    model.readback["abc"] = "ab\udc00"
+    code, out, panel = effect_set(live, capsys, model, *_lumetri(4, " ", '"abc"'))
+    assert code == 1 and out["code"] == "not_stored"
+    assert out["resolved"][0]["clip"]["name"] == "clip�"
+    assert out["results"][0]["value"] == "ab�" and out["results"][0]["stored"] is False
+    with panel_on(live, handler=recipe_handler(model.replies())):
+        assert dispatch([*SET, *_lumetri(4, " ", '"abc"')]) == 1
+    capsys.readouterr()
+
+
+# ---------- the command line ----------
+@pytest.mark.parametrize("argv, words", [
+    (["--from", "p.json", "--sequence", "s1"], "--from"),
+    (["--from", "p.json", "--value", "3"], "--from"),
+    (["--from", "p.json", "--track", "0"], "--from"),
+    (["--from", "p.json", "--expect-old", "3"], "--from"),
+    (["--sequence", "s1", "--track", "0", "--clip", "0", "--effect", "ProcAmp", "--index", "0", "--name", "Brightness"],
+     "--value"),
+    (["--track", "0", "--clip", "0", "--effect", "ProcAmp", "--index", "0", "--name", "Brightness", "--value", "3"],
+     "--sequence"),
+    (["--sequence", "s1", "--effect", "ProcAmp", "--index", "0", "--name", "Brightness", "--value", "3"], "--node-id"),
+    (["--sequence", "s1", "--track", "0", "--effect", "ProcAmp", "--index", "0", "--name", "Brightness", "--value", "3"],
+     "--node-id"),
+    (["--sequence", "s1", "--node-id", "n", "--track", "0", "--clip", "0", "--effect", "ProcAmp", "--index", "0",
+      "--name", "Brightness", "--value", "3"], "--node-id"),
+    (["--sequence", "s1", "--track", "0", "--clip", "0", "--index", "0", "--name", "Brightness", "--value", "3"], "--effect"),
+    (["--sequence", "s1", "--track", "0", "--clip", "0", "--effect", "ProcAmp", "--name", "Brightness", "--value", "3"],
+     "--index"),
+    (["--sequence", "s1", "--track", "0", "--clip", "0", "--effect", "ProcAmp", "--index", "0", "--value", "3"], "--name"),
+    ([*BRIGHTNESS, "--value", "abc"], "--value"),
+    ([*BRIGHTNESS, "--value", "null"], "--value"),
+    ([*BRIGHTNESS, "--value", "[1, 2]"], "--value"),
+    ([*BRIGHTNESS, "--value", '{"a": 1}'], "--value"),
+    ([*BRIGHTNESS, "--value", "NaN"], "--value"),
+    ([*BRIGHTNESS, "--value", "3", "--expect-old", "null"], "--expect-old"),
+    ([*BRIGHTNESS, "--value", "3", "--expect-old", "x"], "--expect-old"),
+    ([], "--from"),
+])
+def test_effect_set_bad_command_lines_send_nothing(live, capsys, argv, words):
+    model = EffectModel()
+    code, out, panel = effect_set(live, capsys, model, *argv)
+    assert code == 1 and out["code"] == "bad_args", out
+    assert words in out["error"] and "Nothing was sent." in out["error"]
+    assert panel.seen == []
+
+
+def test_effect_set_takes_the_node_id_and_the_sequence_name(live, capsys):
+    model = EffectModel()
+    code, out, panel = effect_set(live, capsys, model, "--sequence", "s1", "--sequence-name", "Main", "--node-id",
+                                  "000f4250", "--effect", "AE.ADBE ProcAmp", "--index", "0", "--name", "Brightness",
+                                  "--value", "-1")
+    assert code == 0 and out["stored"] is True
+    assert out["resolved"][0]["clip"] == {"node_id": "000f4250", "name": "second.mp4", "track": 0, "clip": 1,
+                                          "start_seconds": 6.006}
+    assert scripts(panel, RESOLVE)[0]["entries"][0]["target"] == {"node_id": "000f4250"}
+    assert scripts(panel, RESOLVE)[0]["expect"]["sequence_name"] == "Main"
+    code, out, panel = effect_set(live, capsys, model, "--sequence", "s1", "--sequence-name", "Other", "--node-id",
+                                  "000f4250", "--effect", "ProcAmp", "--index", "0", "--name", "Brightness", "--value", "2")
+    assert code == 1 and out["code"] == "precondition" and "is named Main, not Other" in out["error"]
+
+
+def test_effect_set_human_lines(live, capsys, tmp_path):
+    model = EffectModel()
+    model.prop(0, 0, 4, 0)["value"] = 5.0
+    model.fail(-2.6, times=1)
+    model.readback[4.0] = 1.0
+    with panel_on(live, handler=recipe_handler(model.replies())):
+        assert dispatch([*SET, *BRIGHTNESS, "--value", "-2.6"]) == 0
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == [
+            "entry 0: V1[0] testclip.mp4 at 0.000 s, ProcAmp[4].Brightness[0] = 5.0 -> -2.6",
+            "entry 0: stored -2.6 (2 attempts, zero first)",
+            "Stored: 1 of 1 entries."]
+        plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 1, "Contrast", 50),
+                                                write_of(0, 1, "ProcAmp", 0, "Brightness", 4.0)]}
+        assert dispatch([*SET, "--from", plan_file(tmp_path, plan)]) == 1
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == [
+            "entry 0: V1[0] testclip.mp4 at 0.000 s, ProcAmp[4].Contrast[1] = 100.0 -> 50",
+            "entry 1: V1[1] second.mp4 at 6.006 s, ProcAmp[0].Brightness[0] = 5.0 -> 4.0",
+            "entry 0: stored 50 (1 attempt)",
+            "entry 1: NOT stored: wanted 4.0. The old value 5.0 was put back."]
+        assert "Error: " in captured.err and "not stored" in captured.err
+        model.fail(-2.6, times=2)
+        model.prop(0, 0, 4, 0)["value"] = -1.0
+        assert dispatch([*SET, *BRIGHTNESS, "--value", "-2.6"]) == 1
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[-1] == "entry 0: NOT stored: -2.496 landed, -2.6 did not (was -1.0)"
+        assert dispatch([*SET, *_lumetri(4, " ", '"/luts/a.cube/"'), "--dry-run"]) == 0
+        lines = capsys.readouterr().out.splitlines()
+        assert lines == ['entry 0: V1[0] testclip.mp4 at 0.000 s, Lumetri Color[2]." "[4] = "" -> "/luts/a.cube/"',
+                         "Dry run: nothing was written."]
+
+
+def test_effect_set_help(capsys):
+    assert dispatch(["live", "effect", "set", "--help"]) == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert "stored: the value read back from Premiere equals the value written. It is not a render check." in text
+    assert "A property whose value cannot be read is refused." in text
+    assert "A number that is not finite, or is 4294967296 or more in size, is refused." in text
+    assert "within 0.001 of the value wanted" in text and "the old value is written back once" in text
+    for word in ("keyframe", "Gyroflow", "Lumetri", "7, 32", "34", "array", "colour", "--from", "--dry-run",
+                 "first write that is not stored", "--expect-old", "--project", "--any-project"):
+        assert word in text, word
+    assert "—" not in text
+    assert dispatch(["live", "effect", "--help"]) == 0
+    assert "set" in capsys.readouterr().out
+
+
+def test_set_effects_checks_the_plan_before_the_lease(live):
+    client = BridgeClient(live, 0.0)
+    with pytest.raises(CliError) as err:
+        effects.set_effects(client, {"sequence_id": "s1", "writes": []})
+    assert err.value.code == "bad_plan" and not (live / LOCK).exists()
+
+
+def test_load_plan_returns_the_checked_plan(tmp_path):
+    plan = effects.load_plan(plan_file(tmp_path, {"sequence_id": "s1", "writes": [{**GOOD_ENTRY, "effect_index": 4}]}))
+    assert plan == {"sequence_id": "s1", "sequence_name": None,
+                    "writes": [{"track": 0, "clip": 0, "effect": "ProcAmp", "effect_index": 4, "index": 0,
+                                "name": "Brightness", "value": 3}]}
+
+
+# ---------- the scripts, in node with a stub app ----------
+SET_PRELUDE = STUB_HELPERS + """
+var writes = [];            // [property name, value, the second argument] of every setValue
+var readsBack = 0;          // getValue() calls without arguments
+function wprop(name, value, extra) {
+  extra = extra || {};
+  var p = {displayName: name};
+  p.getValue = function (t, s) {
+    if (arguments.length === 0) { readsBack++; if (extra.readThrows) throw new Error("no read"); }
+    return value;
+  };
+  p.getColorValue = function () { if (extra.color) return extra.color; throw new Error("not a colour"); };
+  p.isTimeVarying = function () { if (extra.varying === "throws") throw new Error("no keys"); return extra.varying === true; };
+  p.setValue = function (v, notify) {
+    writes.push([name, v, notify]);
+    if (extra.fails && extra.fails(v)) throw new Error("Illegal Parameter type");
+    value = extra.store ? extra.store(v) : v;
+  };
+  p.setColorValue = function () { writes.push([name, "colour"]); };
+  return p;
+}
+function wcomp(name, match, props) { return {displayName: name, matchName: match, properties: coll("numItems", props)}; }
+function wclip(id, name, comps) { return {nodeId: id, name: name, start: {ticks: "0"}, components: coll("numItems", comps)}; }
+var seqA = {sequenceID: "S-A", name: "Cut A",
+  videoTracks: coll("numTracks", [{clips: coll("numItems", [
+    wclip("v0c0", "Intro", [wcomp("Opacity", "AE.ADBE Opacity", [wprop("Opacity", 100)]),
+                            wcomp("ProcAmp", "AE.ADBE ProcAmp", [wprop("Brightness", 7.7), wprop("Contrast", 100)]),
+                            wcomp("Lumetri Color", "AE.ADBE Lumetri", [wprop(" ", "", {}), wprop("Temperature", 10),
+                                                                       wprop("White Balance", 0, {color: [255, 1, 2, 3]})]),
+                            wcomp("Lumetri Color", "AE.ADBE Lumetri", [wprop(" ", ""), wprop("Temperature", 5)])]),
+    wclip("v0c1", "Middle", [wcomp("ProcAmp", "AE.ADBE ProcAmp", [wprop("Brightness", 5)])])])}]),
+  audioTracks: coll("numTracks", [{clips: coll("numItems", [
+    wclip("a0c0", "Music", [wcomp("Volume", "AE.ADBE Volume", [wprop("Level", -3)])])])}])};
+var seqB = {sequenceID: "S-B", name: "Cut B",
+  videoTracks: coll("numTracks", [{clips: coll("numItems", [
+    wclip("v0c0", "Other", [wcomp("Opacity", "AE.ADBE Opacity", [wprop("Opacity", 100)]),
+                            wcomp("ProcAmp", "AE.ADBE ProcAmp", [wprop("Brightness", 1)])])])}]),
+  audioTracks: coll("numTracks", [])};
+var app = {project: {path: "/p/X Claude.prproj", sequences: coll("numSequences", [seqA, seqB]), activeSequence: seqB}};
+"""
+PROCAMP = "seqA.videoTracks[0].clips[0].components[1]"
+SET_EXPECT = {"project_path": "/p/X Claude.prproj", "sequence_id": "S-A", "sequence_name": "Cut A"}
+WRITE_ARGS = {"sequence_id": "S-A", "target": {"track_type": "video", "track": 0, "clip": 0}, "node_id": "v0c0",
+              "effect": "ProcAmp", "effect_index": None, "found_effect_index": 1, "index": 0, "name": "Brightness",
+              "value": 3, "tolerance": 0.001, "expect": SET_EXPECT}
+
+
+def run_set_script(name: str, args: dict, prelude: str = "") -> tuple[dict, dict]:
+    """Run effect_resolve.jsx or effect_write.jsx in node. Returns (the parsed reply, {writes, readsBack})."""
+    include = ("find", "values") if name == "effect_resolve" else ("find",)
+    script = jsx.build(jsx.load(name), args, include=include)
+    code = (SET_PRELUDE + prelude + "\nvar __reply = String(" + script + ");\n"
+            + "process.stdout.write(JSON.stringify({reply: __reply, writes: writes, readsBack: readsBack}));")
+    out = json.loads(subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=30, check=True).stdout)
+    return json.loads(out["reply"]), out
+
+
+def run_write(prelude: str = "", **over) -> tuple[dict, dict]:
+    return run_set_script("effect_write", {**WRITE_ARGS, **over}, prelude)
+
+
+def brightness(value, extra: str = "{}") -> str:
+    return f"{PROCAMP}.properties[0] = wprop('Brightness', {value}, {extra});"
+
+
+@needs_node
+def test_effect_scripts_are_es3_and_run_in_node():
+    for name in ("effect_resolve", "effect_write", "values"):
+        text = jsx.load(name)
+        for pattern in BANNED + [r"\.indexOf\(", r"\.reduce\(", r"\.some\(", r"\.every\(", r"\bArray\.", r"\.isArray"]:
+            assert not re.search(pattern, text), (name, pattern)
+    assert jsx.load("effect_resolve").split("\n")[0] == "// recipe: effect_resolve"
+    assert jsx.load("effect_write").split("\n")[0] == "// recipe: effect_write"
+    assert "recipe:" not in jsx.load("values") and "recipe:" not in jsx.load("find")
+    # a plain write: set, read back, no zero step
+    reply, seen = run_write()
+    assert reply == {"success": True, "data": {"before": 7.7, "zero_first": False, "set_error": None, "value": 3,
+                                               "read_error": None}}
+    assert seen["writes"] == [["Brightness", 3, True]] and seen["readsBack"] == 2      # before and after
+    # crossing zero: 0 first, then the value, in one round trip
+    reply, seen = run_write(brightness(5), value=-2.6)
+    assert reply["data"] == {"before": 5, "zero_first": True, "set_error": None, "value": -2.6, "read_error": None}
+    assert seen["writes"] == [["Brightness", 0, True], ["Brightness", -2.6, True]]
+    # a setValue that throws is caught into set_error, and the read back still comes
+    reply, seen = run_write(brightness(-1, "{fails: function (v) { return v === -2.6; }}"), value=-2.6)
+    assert reply["success"] is True
+    assert reply["data"] == {"before": -1, "zero_first": False, "set_error": "Error: Illegal Parameter type",
+                             "value": -1, "read_error": None}
+
+
+@needs_node
+def test_effect_write_script_zero_step_that_fails_stops_there():
+    reply, seen = run_write(brightness(5, "{fails: function (v) { return v === 0; }}"), value=-2.6)
+    assert reply["data"]["zero_first"] is True and reply["data"]["set_error"] == "zero step failed: Error: Illegal Parameter type"
+    assert seen["writes"] == [["Brightness", 0, True]]                     # the value itself was never written
+    reply, seen = run_write(brightness(5, "{store: function (v) { return v === 0 ? 0.5 : v; }}"), value=-2.6)
+    assert reply["data"]["set_error"] == "zero step failed: read back 0.5" and reply["data"]["value"] == 0.5
+    assert seen["writes"] == [["Brightness", 0, True]]
+    reply, seen = run_write(brightness(5, "{store: function (v) { return v === 0 ? 0.0004 : v; }}"), value=-2.6)
+    assert reply["data"]["set_error"] is None and seen["writes"][-1] == ["Brightness", -2.6, True]   # within the tolerance
+    reply, seen = run_write(brightness(0, "{}"), value=-2.6)
+    assert reply["data"]["zero_first"] is False and seen["writes"] == [["Brightness", -2.6, True]]  # 0 does not cross
+
+
+@needs_node
+def test_effect_write_script_read_errors():
+    reply, seen = run_write(brightness(7.7, "{readThrows: true}"))
+    assert reply["data"]["before"] is None and reply["data"]["read_error"] == "Error: no read"
+    assert reply["data"]["value"] is None and seen["writes"] == [["Brightness", 3, True]]
+    reply, seen = run_write(brightness(5, "{readThrows: true}"), value=-2.6)        # before unknown: no zero step
+    assert reply["data"]["zero_first"] is False
+
+
+@needs_node
+def test_effect_write_script_strings_and_booleans():
+    reply, seen = run_write(f"{PROCAMP}.properties[1] = wprop('Contrast', true);", index=1, name="Contrast", value=False)
+    assert reply["data"]["value"] is False and seen["writes"] == [["Contrast", False, True]]
+    reply, seen = run_write(effect="Lumetri Color", effect_index=2, found_effect_index=2, index=0, name=" ",
+                            value="/luts/a.cube/")
+    assert reply["data"] == {"before": "", "zero_first": False, "set_error": None, "value": "/luts/a.cube/",
+                             "read_error": None}
+
+
+@pytest.mark.parametrize("prelude, over, text", [
+    ("app.project.path = '/p/Family film.prproj';", {},
+     "the active project is /p/Family film.prproj, not /p/X Claude.prproj"),
+    ("seqA.name = 'Renamed';", {}, "sequence S-A is named Renamed, not Cut A"),
+    ("", {"node_id": "v0c1"}, "the clip at this place changed"),
+    ("seqA.videoTracks[0].clips[0].nodeId = 'zz';", {}, "the clip at this place changed"),
+    ("", {"found_effect_index": 2}, "the effect at this place changed"),
+    ("", {"effect": "Lumetri Color", "found_effect_index": 2, "index": 1, "name": "Temperature"},
+     "ambiguous_effect: 2 effects are named Lumetri Color; pass effect_index"),
+    ("", {"name": "Contrast"}, "property 0 of ProcAmp is named Brightness, not Contrast"),
+    ("", {"target": {"track_type": "video", "track": 0, "clip": 5}}, "video track 0 has no clip 5"),
+    (brightness(7.7, "{varying: true}"), {}, "property is keyframed"),
+    (brightness(7.7, "{varying: 'throws'}"), {}, "the animation state of the property could not be read"),
+    (f"{PROCAMP}.properties[0].isTimeVarying = undefined;", {}, "the animation state of the property could not be read"),
+    ("", {"sequence_id": "S-B"}, "the script was sent for sequence S-B, but it expects S-A"),
+    ("", {"value": [1, 2]}, "the value must be a number, a string or a boolean"),
+    ("", {"value": None}, "the value must be a number, a string or a boolean"),
+])
+@needs_node
+def test_effect_write_script_refuses_before_any_write(prelude, over, text):
+    reply, seen = run_write(prelude, **over)
+    assert reply["success"] is False and reply["error"] == "Error: precondition: " + text
+    assert seen["writes"] == []
+
+
+@needs_node
+def test_effect_write_script_takes_the_given_sequence_not_the_active_one():
+    reply, seen = run_write()
+    assert seen["writes"] == [["Brightness", 3, True]]
+    reply, _ = run_set_script("effect_write", {**WRITE_ARGS, "sequence_id": "S-B", "found_effect_index": 1,
+                                               "expect": {**SET_EXPECT, "sequence_id": "S-B", "sequence_name": "Cut B"}},
+                              "")
+    assert reply["data"]["before"] == 1                                    # S-B's own v0c0, read by ID
+
+
+RESOLVE_ENTRY = {"target": {"track_type": "video", "track": 0, "clip": 0}, "effect": "ProcAmp", "effect_index": None,
+                 "index": 0, "name": "Brightness"}
+
+
+def run_resolve(entries, prelude: str = "", **over) -> tuple[dict, dict]:
+    return run_set_script("effect_resolve", {"sequence_id": "S-A", "entries": entries, "expect": SET_EXPECT, **over},
+                          prelude)
+
+
+@needs_node
+def test_effect_resolve_script_resolves_every_entry_in_one_read():
+    entries = [RESOLVE_ENTRY,
+               {"target": {"node_id": "v0c1"}, "effect": "AE.ADBE ProcAmp", "effect_index": None, "index": 0,
+                "name": "Brightness"},
+               {"target": {"track_type": "video", "track": 0, "clip": 0}, "effect": "Lumetri Color", "effect_index": 2,
+                "index": 2, "name": "White Balance"},
+               {"target": {"track_type": "video", "track": 0, "clip": 0}, "effect": "Lumetri Color", "effect_index": 3,
+                "index": 0, "name": " "}]
+    reply, seen = run_resolve(entries, brightness(7.7, "{varying: true}"))
+    assert reply["success"] is True and seen["writes"] == []
+    data = reply["data"]
+    assert data["sequence"] == {"id": "S-A", "name": "Cut A"}
+    assert data["entries"] == [
+        {"clip": {"node_id": "v0c0", "name": "Intro", "track_type": "video", "track": 0, "clip": 0, "start_ticks": "0"},
+         "effect": {"effect_index": 1, "name": "ProcAmp", "match_name": "AE.ADBE ProcAmp"},
+         "property": {"index": 0, "name": "Brightness", "value": 7.7, "kind": "number", "keyframed": True}},
+        {"clip": {"node_id": "v0c1", "name": "Middle", "track_type": "video", "track": 0, "clip": 1, "start_ticks": "0"},
+         "effect": {"effect_index": 0, "name": "ProcAmp", "match_name": "AE.ADBE ProcAmp"},
+         "property": {"index": 0, "name": "Brightness", "value": 5, "kind": "number", "keyframed": False}},
+        {"clip": {"node_id": "v0c0", "name": "Intro", "track_type": "video", "track": 0, "clip": 0, "start_ticks": "0"},
+         "effect": {"effect_index": 2, "name": "Lumetri Color", "match_name": "AE.ADBE Lumetri"},
+         "property": {"index": 2, "name": "White Balance", "value": [255, 1, 2, 3], "kind": "color", "keyframed": False}},
+        {"clip": {"node_id": "v0c0", "name": "Intro", "track_type": "video", "track": 0, "clip": 0, "start_ticks": "0"},
+         "effect": {"effect_index": 3, "name": "Lumetri Color", "match_name": "AE.ADBE Lumetri"},
+         "property": {"index": 0, "name": " ", "value": "", "kind": "string", "keyframed": False}}]
+    reply, _ = run_resolve([RESOLVE_ENTRY], f"{PROCAMP}.properties[0].isTimeVarying = function () {{ throw new Error('x'); }};")
+    assert reply["data"]["entries"][0]["property"]["keyframed"] is None
+
+
+@needs_node
+def test_effect_resolve_script_fails_whole_on_the_first_bad_entry():
+    bad = {**RESOLVE_ENTRY, "target": {"track_type": "video", "track": 0, "clip": 9}}
+    reply, _ = run_resolve([RESOLVE_ENTRY, bad, {**RESOLVE_ENTRY, "name": "Nope"}])
+    assert reply == {"success": False, "error": "Error: precondition: entry 1: video track 0 has no clip 9"}
+    reply, _ = run_resolve([{**RESOLVE_ENTRY, "effect": "Lumetri Color", "index": 1, "name": "Temperature"}])
+    assert reply["error"] == "Error: precondition: entry 0: ambiguous_effect: 2 effects are named Lumetri Color; pass effect_index"
+    reply, _ = run_resolve([RESOLVE_ENTRY, {**RESOLVE_ENTRY, "name": "Hue"}])
+    assert reply["error"] == "Error: precondition: entry 1: property 0 of ProcAmp is named Brightness, not Hue"
+    reply, _ = run_resolve([RESOLVE_ENTRY], "app.project.path = '/p/Other.prproj';")
+    assert reply["error"] == "Error: precondition: the active project is /p/Other.prproj, not /p/X Claude.prproj"
+    reply, _ = run_resolve([RESOLVE_ENTRY], sequence_id="S-B")
+    assert reply["error"] == "Error: precondition: the script was sent for sequence S-B, but it expects S-A"
+    # a host call that throws is not a precondition, but it still names the entry
+    reply, _ = run_resolve([RESOLVE_ENTRY], "Object.defineProperty(seqA.videoTracks[0].clips[0], 'components', "
+                                            "{get: function () { throw new Error('host'); }});")
+    assert reply["success"] is False and reply["error"].startswith("Error: entry 0: Error: host")
+
+
+@needs_node
+def test_effect_set_runs_end_to_end_through_the_command(live, capsys):
+    """The command and the real scripts together: the panel runs effect_resolve.jsx and effect_write.jsx in node
+    against a fresh stub each time (a single write needs no memory between the two)."""
+    state = {**RECIPE_STATE, "active_sequence": {"id": "S-B", "name": "Cut B"}}
+
+    def in_node(script: str):
+        code = SET_PRELUDE + "\nprocess.stdout.write(String(" + script + "));"
+        reply = json.loads(subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=30, check=True).stdout)
+        return reply["data"] if reply["success"] else Exception(reply["error"])
+    with panel_on(live, handler=recipe_handler({RESOLVE: in_node, WRITE: in_node}, state=state)) as panel:
+        code, out = run_json(capsys, [*SET, "--sequence", "S-A", "--track", "0", "--clip", "0", "--effect", "ProcAmp",
+                                      "--index", "0", "--name", "Brightness", "--value", "-2.6"])
+        code2, out2 = run_json(capsys, [*SET, "--sequence", "S-A", "--track", "0", "--clip", "0", "--effect", "ProcAmp",
+                                        "--index", "1", "--name", "Brightness", "--value", "3"])
+    assert code == 0 and out["stored"] is True
+    assert out["results"][0] == {"entry": 0, "requested": -2.6, "before": 7.7, "value": -2.6, "stored": True,
+                                 "attempts": 1, "zero_first": True, "landed": None, "restored": None, "now": -2.6,
+                                 "error": None}
+    assert out["resolved"][0]["clip"]["node_id"] == "v0c0" and out["resolved"][0]["effect_index"] == 1
+    assert code2 == 1 and out2["code"] == "precondition"
+    assert out2["error"] == "entry 0: property 1 of ProcAmp is named Contrast, not Brightness"
+    assert sum(WRITE in text for text in panel.seen) == 1
+
+
+# ---------- fix round 1 ----------
+RESERVED = ("abstract", "boolean", "byte", "char", "class", "const", "default", "double", "enum", "export", "extends",
+            "final", "float", "goto", "implements", "import", "int", "interface", "long", "native", "package",
+            "private", "protected", "public", "short", "static", "super", "synchronized", "throws", "transient",
+            "volatile", "delete", "in", "new", "this", "typeof", "void", "with")
+UNQUOTED_RESERVED_KEY = r"[{,]\s*(%s)\s*:" % "|".join(RESERVED)
+
+
+@pytest.mark.parametrize("name", ["effect_resolve", "effect_write", "values", "effect_get", "find"])
+def test_recipe_scripts_have_no_reserved_word_as_an_unquoted_key(name):
+    code = "\n".join(line for line in jsx.load(name).splitlines() if not line.lstrip().startswith("//"))
+    assert not re.search(UNQUOTED_RESERVED_KEY, code), name
+    assert not re.search(r"\.(%s)\b" % "|".join(RESERVED), code), name
+
+
+# I5.1: video clips only, also by node ID
+@needs_node
+def test_both_scripts_refuse_an_audio_clip_named_by_node_id():
+    text = "Error: precondition: entry 0: this clip is on an audio track; effect set writes video clips only"
+    reply, seen = run_resolve([{"target": {"node_id": "a0c0"}, "effect": "Volume", "effect_index": None, "index": 0,
+                                "name": "Level"}])
+    assert reply == {"success": False, "error": text} and seen["writes"] == []
+    reply, seen = run_write(target={"node_id": "a0c0"}, node_id="a0c0", effect="Volume", found_effect_index=0,
+                            name="Level", value=-6)
+    assert reply == {"success": False, "error": text.replace("entry 0: ", "")} and seen["writes"] == []
+
+
+def test_an_audio_clip_by_node_id_is_refused_before_any_write(live, capsys):
+    model = EffectModel()
+    model.audio[(0, 0)] = {"node_id": "000f4300", "name": "music.wav"}
+    code, out, panel = effect_set(live, capsys, model, "--sequence", "s1", "--node-id", "000f4300", "--effect", "Volume",
+                                  "--index", "0", "--name", "Level", "--value", "-6")
+    assert code == 1 and out["code"] == "precondition"
+    assert out["error"] == "entry 0: this clip is on an audio track; effect set writes video clips only"
+    nothing_written(live, model, panel)
+
+    def audio_record(script):              # a resolve that does not refuse: Python still requires "video"
+        reply = model.resolve(script)
+        reply["entries"][0]["clip"]["track_type"] = "audio"
+        return reply
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3", extra={RESOLVE: audio_record})
+    assert code == 1 and out["code"] == "bad_reply"
+    nothing_written(live, model, panel)
+
+
+# Q13: the old value is put back when nothing landed
+def test_nothing_lands_and_the_put_back_fails(live, capsys):
+    model = EffectModel()
+    model.fail(-2.6, times=2)
+    model.fail(-2.496, times=1)
+    model.fail(7.7, times=1, error="Illegal Parameter type, put back")
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "-2.6")
+    assert code == 1 and out["code"] == "not_stored"
+    result = out["results"][0]
+    assert (result["stored"], result["restored"], result["now"], result["before"]) == (False, False, 0, 7.7)
+    assert "Putting the old value back failed: Illegal Parameter type, put back" in result["error"]
+    assert [args["value"] for args in scripts(panel, WRITE)] == [-2.6, -2.6, -2.496, 7.7]      # one put-back only
+    assert model.prop(0, 0, 4, 0)["value"] == 0
+    with panel_on(live, handler=recipe_handler(model.replies())):
+        model.prop(0, 0, 4, 0)["value"] = 5.0
+        model.fail(-2.6, times=2)
+        model.fail(-2.496, times=1)
+        model.fail(5.0, times=1, error="no")
+        assert dispatch([*SET, *BRIGHTNESS, "--value", "-2.6"]) == 1
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        "entry 0: NOT stored: wanted -2.6. The property now holds 0 (was 5.0). Putting the old value back failed: no")
+
+
+def test_nothing_lands_and_the_old_value_is_put_back_in_human_lines(live, capsys):
+    model = EffectModel()
+    model.prop(0, 0, 4, 0)["value"] = 5.0
+    model.fail(-2.6, times=2)
+    model.fail(-2.496, times=1)
+    with panel_on(live, handler=recipe_handler(model.replies())):
+        assert dispatch([*SET, *BRIGHTNESS, "--value", "-2.6"]) == 1
+    assert capsys.readouterr().out.splitlines()[-1] == "entry 0: NOT stored: wanted -2.6. The old value 5.0 was put back."
+    assert model.prop(0, 0, 4, 0)["value"] == 5.0
+
+
+def test_a_failure_that_left_the_old_value_needs_no_put_back(live, capsys):
+    model = EffectModel()
+    model.fail(3.0, times=1)                       # setValue throws; the property still holds 7.7
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3.0")
+    result = out["results"][0]
+    assert code == 1 and (result["stored"], result["restored"], result["now"], result["value"]) == (False, None, 7.7, 7.7)
+    assert [args["value"] for args in scripts(panel, WRITE)] == [3.0]
+    with panel_on(live, handler=recipe_handler(model.replies())):
+        model.fail(3.0, times=1)
+        assert dispatch([*SET, *BRIGHTNESS, "--value", "3.0"]) == 1
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        "entry 0: NOT stored: wanted 3.0. Illegal Parameter type. The property now holds 7.7 (was 7.7).")
+
+
+def test_a_read_back_that_is_near_the_old_value_needs_no_put_back(live, capsys):
+    model = EffectModel()
+    model.readback[3.0] = 7.7004                   # not 3.0, but the same as before by the tolerance
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3.0")
+    assert out["results"][0]["restored"] is None and len(scripts(panel, WRITE)) == 1
+
+
+# a CliError in the middle of an entry
+def test_an_error_in_the_middle_of_an_entry_keeps_what_is_known(live, capsys):
+    model = EffectModel()
+    model.fail(-2.6, times=2)
+    calls = []
+
+    def write(script):
+        calls.append(script)
+        if len(calls) == 2:
+            return Exception("Error: precondition: the clip at this place changed")
+        return model.write(script)
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "-2.6", extra={WRITE: write})
+    assert code == 1 and out["code"] == "precondition"
+    assert "entry 0, attempt 2" in out["error"] and "may have landed" in out["error"]
+    assert out["ran"] == 0 and len(out["results"]) == 1
+    assert out["results"][0] == {"entry": 0, "requested": -2.6, "before": 7.7, "value": 0, "stored": None, "attempts": 1,
+                                 "zero_first": True, "landed": None, "restored": None, "now": None,
+                                 "error": out["results"][0]["error"]}
+    assert out["results"][0]["error"].startswith("precondition: entry 0, attempt 2")
+    assert len(calls) == 2                          # no put-back after an error
+    with panel_on(live, handler=recipe_handler({**model.replies(), WRITE: write})):
+        calls.clear()
+        model.prop(0, 0, 4, 0)["value"] = 7.7
+        model.fail(-2.6, times=2)
+        assert dispatch([*SET, *BRIGHTNESS, "--value", "-2.6"]) == 1
+    assert capsys.readouterr().out.splitlines()[-1].startswith(
+        "entry 0: outcome unknown after 1 finished attempts: precondition: entry 0, attempt 2")
+
+
+def test_an_error_while_putting_back_reports_the_entry_as_not_stored(live, capsys):
+    model = EffectModel()
+    model.readback[3.0] = 2.5
+    calls = []
+
+    def write(script):
+        calls.append(script)
+        return Exception("Error: precondition: property is keyframed") if len(calls) == 2 else model.write(script)
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3.0", extra={WRITE: write})
+    assert code == 1 and out["code"] == "precondition" and "putting the old value back" in out["error"]
+    result = out["results"][0]
+    assert (result["stored"], result["restored"], result["now"], result["value"]) == (False, None, None, 2.5)
+    assert "Putting the old value back failed: precondition" in result["error"] and out["ran"] == 1
+
+
+def test_a_failure_payload_keeps_the_warnings(live, capsys, tmp_path):
+    model = EffectModel()
+    calls = []
+
+    def write(script):
+        calls.append(script)
+        return Exception("Error: precondition: the clip at this place changed") if len(calls) == 2 else model.write(script)
+    plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "Lumetri Color", 4, " ", "/luts/a.cube/"),
+                                            write_of(0, 1, "ProcAmp", 0, "Brightness", 4.0)]}
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan), "--allow-untested",
+                                  extra={WRITE: write}, state=STATE_26)
+    assert code == 1 and out["code"] == "precondition"
+    assert any("27.0" in w for w in out["warnings"])                       # the guard's warning
+    assert any(NOT_PROOF in w for w in out["warnings"])                    # the Lumetri warning of entry 0
+
+
+def test_a_huge_integer_is_refused_without_a_crash(live, capsys, tmp_path):
+    big = "1" + "0" * 400
+    plan = ('{"sequence_id": "s1", "writes": [{"track": 0, "clip": 0, "effect": "ProcAmp", "index": 0, '
+            '"name": "Brightness", "value": %s}]}' % big)
+    model = EffectModel()
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 1 and out["code"] == "refused_parameter" and panel.seen == []
+    plan = plan.replace('"value": %s' % big, '"value": 3, "expect_old": -%s' % big)
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 1 and out["code"] == "bad_plan" and panel.seen == []
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", big)
+    assert code == 1 and out["code"] == "refused_parameter" and panel.seen == []
+    assert effects.same_value(10 ** 400, 1.0) is False and effects.same_value(10 ** 400, 10 ** 400) is False

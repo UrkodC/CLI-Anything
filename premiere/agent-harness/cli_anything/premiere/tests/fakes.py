@@ -440,3 +440,190 @@ def recipe_handler(replies: dict, *, state: dict | None = None) -> Callable[[str
                     return reply(Exception(f"recipe_handler: the reply function for {marker!r} raised {exc!r}"))
         return reply(Exception(f"recipe_handler has no reply for this script: {script[:80]!r}"))
     return handler
+
+
+# ---------- an effect model behind the fake panel (live effect set) ----------
+class EffectModel:
+    """A small Premiere for `effect_resolve.jsx` and `effect_write.jsx`, played in Python by the fake panel.
+
+    It reads the ARGS of the script text it gets and answers as the real scripts do: the same reply shapes
+    and the same "precondition:" texts for the faults the tests use. Values stay between calls.
+
+        model = EffectModel()                       # sequence s1 "Main", V1[0] 000f4243 with ProcAmp at index 4
+        model.fail(-2.6, times=2)                   # setValue(-2.6) throws "Illegal Parameter type" twice
+        model.readback[3.0] = 2.5                   # a stored 3.0 reads back as 2.5
+        panel = FakePanel(bridge_dir, handler=recipe_handler(model.replies()))
+
+    clips maps (track, clip) to {"node_id", "name", "start_ticks", "effects": [{"name", "match_name",
+    "properties": [{"name", "value", "kind", "keyframed"}]}]}. `writes` lists every setValue in order, as
+    (node_id, effect_index, property index, value). `resolves` counts the resolve scripts, and `moves` maps a
+    resolve number (1 is the first) to a function run before that resolve answers.
+    """
+
+    def __init__(self) -> None:
+        self.sequence = {"id": "s1", "name": "Main"}
+        procamp = {"name": "ProcAmp", "match_name": "AE.ADBE ProcAmp", "properties": [
+            {"name": "Brightness", "value": 7.7, "kind": "number", "keyframed": False},
+            {"name": "Contrast", "value": 100.0, "kind": "number", "keyframed": False},
+            {"name": "Hue", "value": 0.0, "kind": "number", "keyframed": False},
+            {"name": "Saturation", "value": 100.0, "kind": "number", "keyframed": False},
+            {"name": "Split Screen", "value": False, "kind": "boolean", "keyframed": False}]}
+        self.clips: dict[tuple[int, int], dict] = {
+            (0, 0): {"node_id": "000f4243", "name": "testclip.mp4", "start_ticks": "0",
+                     "effects": [{"name": "Opacity", "match_name": "AE.ADBE Opacity", "properties": [
+                                     {"name": "Opacity", "value": 100.0, "kind": "number", "keyframed": False}]},
+                                 {"name": "Motion", "match_name": "AE.ADBE Motion", "properties": [
+                                     {"name": "Position", "value": [0.5, 0.5], "kind": "array", "keyframed": False}]},
+                                 {"name": "Lumetri Color", "match_name": "AE.ADBE Lumetri", "properties": []},
+                                 {"name": "ASC CDL", "match_name": "AE.ADBE ASC CDL", "properties": []},
+                                 procamp]},
+            (0, 1): {"node_id": "000f4250", "name": "second.mp4", "start_ticks": "1525620096000",
+                     "effects": [{"name": "ProcAmp", "match_name": "AE.ADBE ProcAmp", "properties": [
+                         {"name": "Brightness", "value": 5.0, "kind": "number", "keyframed": False}]}]},
+        }
+        lumetri = self.clips[(0, 0)]["effects"][2]["properties"]
+        for index in range(43):
+            lumetri.append({"name": " ", "value": 0.0, "kind": "number", "keyframed": False})
+        lumetri[4] = {"name": " ", "value": "", "kind": "string", "keyframed": False}
+        lumetri[6] = {"name": "Input LUT", "value": 0.0, "kind": "number", "keyframed": False}
+        lumetri[7] = {"name": "Input LUT", "value": 0.0, "kind": "number", "keyframed": False}
+        lumetri[13] = {"name": "White Balance", "value": [255, 192, 192, 192], "kind": "color", "keyframed": False}
+        lumetri[14] = {"name": "Temperature", "value": 10.0, "kind": "number", "keyframed": False}
+        lumetri[32] = {"name": " ", "value": "﻾", "kind": "string", "keyframed": False}
+        lumetri[34] = {"name": "Look", "value": 0.0, "kind": "number", "keyframed": False}
+        self.audio: dict[tuple[int, int], dict] = {}   # audio clips, found by node ID only (and refused)
+        self.readback: dict = {}            # value written -> value read back
+        self.failures: dict = {}            # value -> [times left, error text]
+        self.writes: list[tuple] = []
+        self.resolves = 0
+        self.moves: dict[int, Callable[[], None]] = {}
+
+    def fail(self, value, *, times: int, error: str = "Illegal Parameter type") -> None:
+        self.failures[value] = [times, error]
+
+    def replies(self) -> dict:
+        return {"recipe: effect_resolve": self.resolve, "recipe: effect_write": self.write}
+
+    def prop(self, track: int, clip: int, effect_index: int, index: int) -> dict:
+        return self.clips[(track, clip)]["effects"][effect_index]["properties"][index]
+
+    # ---------- the finders, with the texts of find.jsx ----------
+    def _expect(self, args: dict) -> None:
+        expect = args.get("expect") or {}
+        if expect.get("sequence_id") != self.sequence["id"]:
+            raise _Refused(f"no sequence has the ID {expect.get('sequence_id')}")
+        name = expect.get("sequence_name")
+        if name is not None and name != self.sequence["name"]:
+            raise _Refused(f"sequence {self.sequence['id']} is named {self.sequence['name']}, not {name}")
+
+    def _clip(self, target: dict) -> tuple[tuple[int, int], dict]:
+        if target.get("node_id") is not None:
+            for place, clip in sorted(self.clips.items()):
+                if clip["node_id"] == target["node_id"]:
+                    return place, clip
+            if any(clip["node_id"] == target["node_id"] for clip in self.audio.values()):
+                raise _Refused("this clip is on an audio track; effect set writes video clips only")
+            raise _Refused(f"no clip has the node ID {target['node_id']} in sequence {self.sequence['name']}")
+        track, number = target["track"], target["clip"]
+        if not any(place[0] == track for place in self.clips):
+            raise _Refused(f"the sequence has no video track {track}")
+        if (track, number) not in self.clips:
+            raise _Refused(f"video track {track} has no clip {number}")
+        return (track, number), self.clips[(track, number)]
+
+    @staticmethod
+    def _effect(clip: dict, name: str, effect_index) -> int:
+        found = [i for i, e in enumerate(clip["effects"]) if name in (e["name"], e["match_name"])]
+        if effect_index is not None:
+            if effect_index >= len(clip["effects"]):
+                raise _Refused(f"this clip has no effect at index {effect_index}")
+            if effect_index not in found:
+                raise _Refused(f"effect {effect_index} of this clip is {clip['effects'][effect_index]['name']}, not {name}")
+            return effect_index
+        if not found:
+            raise _Refused(f"no effect named {name} on this clip")
+        if len(found) > 1:
+            raise _Refused(f"ambiguous_effect: {len(found)} effects are named {name}; pass effect_index")
+        return found[0]
+
+    @staticmethod
+    def _property(effect: dict, index: int, name: str) -> dict:
+        props = effect["properties"]
+        if index >= len(props):
+            raise _Refused(f"{effect['name']} has no property {index}")
+        if props[index]["name"] != name:
+            raise _Refused(f"property {index} of {effect['name']} is named {props[index]['name']}, not {name}")
+        return props[index]
+
+    # ---------- the two scripts ----------
+    def resolve(self, script: str) -> object:
+        self.resolves += 1
+        if self.resolves in self.moves:
+            self.moves[self.resolves]()
+        args = script_args(script)
+        try:
+            self._expect(args)
+        except _Refused as exc:
+            return exc.error()
+        records = []
+        for number, entry in enumerate(args["entries"]):
+            try:
+                (track, clip_number), clip = self._clip(entry["target"])
+                effect_index = self._effect(clip, entry["effect"], entry.get("effect_index"))
+                effect = clip["effects"][effect_index]
+                prop = self._property(effect, entry["index"], entry["name"])
+            except _Refused as exc:
+                return exc.error(f"entry {number}: ")
+            records.append({"clip": {"node_id": clip["node_id"], "name": clip["name"], "track_type": "video", "track": track,
+                                     "clip": clip_number, "start_ticks": clip["start_ticks"]},
+                            "effect": {"effect_index": effect_index, "name": effect["name"],
+                                       "match_name": effect["match_name"]},
+                            "property": {"index": entry["index"], "name": prop["name"], "value": prop["value"],
+                                         "kind": prop["kind"], "keyframed": prop["keyframed"]}})
+        return {"sequence": dict(self.sequence), "entries": records}
+
+    def _set(self, node_id: str, effect_index: int, index: int, prop: dict, value) -> str | None:
+        """setValue(value, true): the error text when it throws, else None."""
+        self.writes.append((node_id, effect_index, index, value))
+        failing = self.failures.get(value)
+        if failing and failing[0] > 0:
+            failing[0] -= 1
+            return failing[1]
+        prop["value"] = self.readback.get(value, value)
+        return None
+
+    def write(self, script: str) -> object:
+        args = script_args(script)
+        try:
+            self._expect(args)
+            (track, clip_number), clip = self._clip(args["target"])
+            effect_index = self._effect(clip, args["effect"], args.get("effect_index"))
+            prop = self._property(clip["effects"][effect_index], args["index"], args["name"])
+            if clip["node_id"] != args["node_id"]:
+                raise _Refused("the clip at this place changed")
+            if effect_index != args["found_effect_index"]:
+                raise _Refused("the effect at this place changed")
+            if prop["keyframed"] is not False:
+                raise _Refused("property is keyframed")
+        except _Refused as exc:
+            return exc.error()
+        before, wanted = prop["value"], args["value"]
+        zero_first = False
+        number = isinstance(wanted, (int, float)) and not isinstance(wanted, bool)
+        if number and isinstance(before, (int, float)) and not isinstance(before, bool) and before > 0 and wanted < 0:
+            zero_first = True
+            error = self._set(clip["node_id"], effect_index, args["index"], prop, 0)
+            back = prop["value"]
+            if error is not None or abs(back) > args["tolerance"]:
+                return {"before": before, "zero_first": True, "value": back, "read_error": None,
+                        "set_error": f"zero step failed: {error if error is not None else f'read back {back}'}"}
+        error = self._set(clip["node_id"], effect_index, args["index"], prop, wanted)
+        return {"before": before, "zero_first": zero_first, "set_error": error, "value": prop["value"],
+                "read_error": None}
+
+
+class _Refused(Exception):
+    """A finder's refusal inside EffectModel."""
+
+    def error(self, prefix: str = "") -> Exception:
+        return Exception(f"Error: precondition: {prefix}{self}")

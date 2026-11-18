@@ -1,4 +1,5 @@
-"""The recipe commands of the `live` group: `live clip list`, `live effect get`, and the commands that later tasks add.
+"""The recipe commands of the `live` group: `live clip list`, `live effect get`, `live effect set`, and the commands
+that later tasks add.
 
 live_cli.py imports this module as its last line, so the `live` group exists when the commands attach.
 The logic of each command is in core/recipes; this file holds only the click side.
@@ -11,12 +12,16 @@ recipe inside `try`, turn a CliError into `_fail(ctx, err)`, and print with `_em
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import click
 
 from cli_anything.premiere.core.recipes import clips, effects
 from cli_anything.premiere.errors import CliError
-from cli_anything.premiere.live_cli import STOPPED_LOOK, _client, _warning_lines, live, live_options, stops_cleanly
-from cli_anything.premiere.premiere_cli import _emit, _fail, json_option
+from cli_anything.premiere.live_cli import (STOPPED_LOOK, STOPPED_RUN, _client, _warning_lines, live, live_options,
+                                            stops_cleanly)
+from cli_anything.premiere.premiere_cli import _emit, _fail, _json, json_option
 
 
 @live.group("clip")
@@ -102,7 +107,7 @@ HUMAN_STRING_LIMIT = 60       # a text longer than this is cut in the human outp
 
 @live.group("effect")
 def live_effect() -> None:
-    """Look at the effects of a clip in the running Premiere."""
+    """Look at the effects of a clip in the running Premiere, and write their values."""
 
 
 def _quoted(text: str) -> str:
@@ -218,3 +223,215 @@ def live_effect_get(ctx: click.Context, sequence_id: str | None, track: int | No
         _fail(ctx, err)
         return
     _emit(ctx, payload, _effect_text(payload))
+
+
+# ---------- live effect set ----------
+def _set_value_text(value: object) -> str:
+    """A value in a line of `live effect set`: numbers plain, texts quoted (cut at 60), true and false."""
+    if value is None:
+        return "(unreadable)"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return repr(round(value, 6))
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return _quoted(value if len(value) <= HUMAN_STRING_LIMIT else value[:HUMAN_STRING_LIMIT] + "...")
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _resolved_line(record: dict, requested: object) -> str:
+    """entry 0: V1[0] testclip.mp4 at 0.000 s, ProcAmp[4].Brightness[0] = 7.7 -> -2.6"""
+    clip, name = record["clip"], record.get("name")
+    shown = "?" if name is None else (_quoted(name) if name.strip() == "" else name)
+    effect = "?" if record.get("effect") is None else record["effect"]
+    return (f"entry {record['entry']}: V{clip['track'] + 1}[{clip['clip']}] "
+            f"{'?' if clip.get('name') is None else clip['name']} at {_seconds_text(clip.get('start_seconds'))} s, "
+            f"{effect}[{record['effect_index']}].{shown}[{record['index']}] = "
+            f"{_set_value_text(record.get('value_now'))} -> {_set_value_text(requested)}")
+
+
+def _result_line(result: dict) -> str:
+    """entry 0: stored -2.6 (2 attempts, zero first), or entry 1: NOT stored: ..., or the outcome unknown."""
+    head = f"entry {result['entry']}: "
+    if result["stored"] is None:
+        return f"{head}outcome unknown after {result['attempts']} finished attempts: {result['error']}"
+    if result["stored"]:
+        notes = [f"{result['attempts']} attempt" + ("" if result["attempts"] == 1 else "s")]
+        if result["zero_first"]:
+            notes.append("zero first")
+        return f"{head}stored {_set_value_text(result['value'])} ({', '.join(notes)})"
+    was = _set_value_text(result.get("before"))
+    if result["landed"] is not None:
+        return (f"{head}NOT stored: {_set_value_text(result['landed'])} landed, "
+                f"{_set_value_text(result['requested'])} did not (was {was})")
+    line = f"{head}NOT stored: wanted {_set_value_text(result['requested'])}."
+    if result.get("restored") is True:
+        return f"{line} The old value {was} was put back."
+    now = result.get("now")
+    holds = (f" The property now holds {_set_value_text(now)} (was {was})." if now is not None
+             else f" The property could not be read after the write (was {was}).")
+    error = result.get("error") or ""
+    if result.get("restored") is False:
+        return line + holds + " " + effects.PUT_BACK_FAILED + error.split(effects.PUT_BACK_FAILED, 1)[-1]
+    return f"{line} {error}.{holds}" if error else line + holds
+
+
+def _set_lines(payload: dict, requested: list) -> list[str]:
+    lines = [_resolved_line(record, requested[record["entry"]]) for record in payload.get("resolved") or []]
+    lines += [_result_line(result) for result in payload.get("results") or []]
+    return lines
+
+
+def _json_value(text: str, flag: str) -> object:
+    """--value and --expect-old: one JSON number, string or boolean."""
+    try:
+        value = json.loads(text, parse_constant=effects._no_constant)
+    except (ValueError, RecursionError) as exc:
+        raise CliError("bad_args", f"{flag} is not valid JSON: {exc}. Give a number such as -2.6, a text in double "
+                                   "quotes such as '\"/luts/a.cube/\"', or true or false. Nothing was sent.") from None
+    if value is None or isinstance(value, (list, dict)):
+        raise CliError("bad_args", f"{flag} must be a number, a text in double quotes, or true or false, not "
+                                   f"{text}. Nothing was sent.")
+    return value
+
+
+def _one_write_plan(options: dict) -> dict:
+    """The plan of one write, from the options of the command line."""
+    if options["sequence_id"] is None:
+        raise CliError("bad_args", "--sequence is missing. Give the sequence ID (see `live state`), or give a plan "
+                                   "with --from. Nothing was sent.")
+    if options["node_id"] is not None:
+        if options["track"] is not None or options["clip"] is not None:
+            raise CliError("bad_args", "--node-id cannot be used with --track or --clip. Nothing was sent.")
+        entry: dict = {"node_id": options["node_id"]}
+    elif options["track"] is None or options["clip"] is None:
+        raise CliError("bad_args", "Name the clip with --track and --clip together, or with --node-id. Nothing was sent.")
+    else:
+        entry = {"track": options["track"], "clip": options["clip"]}
+    for key, flag in (("effect", "--effect"), ("index", "--index"), ("name", "--name"), ("value", "--value")):
+        if options[key] is None:
+            raise CliError("bad_args", f"{flag} is missing. One write needs --sequence, the clip, --effect, --index, "
+                                       "--name and --value. Nothing was sent.")
+    entry.update(effect=options["effect"], index=options["index"], name=options["name"],
+                 value=_json_value(options["value"], "--value"))
+    if options["effect_index"] is not None:
+        entry["effect_index"] = options["effect_index"]
+    if options["expect_old"] is not None:
+        entry["expect_old"] = _json_value(options["expect_old"], "--expect-old")
+    plan = {"sequence_id": options["sequence_id"], "writes": [entry]}
+    if options["sequence_name"] is not None:
+        plan["sequence_name"] = options["sequence_name"]
+    return effects.check_plan(plan, code="bad_args")
+
+
+SINGLE_FLAGS = (("sequence_id", "--sequence"), ("sequence_name", "--sequence-name"), ("track", "--track"),
+                ("clip", "--clip"), ("node_id", "--node-id"), ("effect", "--effect"),
+                ("effect_index", "--effect-index"), ("index", "--index"), ("name", "--name"), ("value", "--value"),
+                ("expect_old", "--expect-old"))
+
+
+def _set_failure(ctx: click.Context, code: str, message: str, payload: dict, requested: list) -> None:
+    """Exit 1 with the failure and what ran so far, as `mcp batch` does."""
+    if _json(ctx):
+        click.echo(json.dumps({"ok": False, "error": message, "code": code, **payload}, indent=2, ensure_ascii=False))
+    else:
+        lines = _set_lines(payload, requested)
+        if lines:
+            click.echo("\n".join(lines))
+        click.echo(f"Error: {message}", err=True)
+        for line in _warning_lines(payload.get("warnings") or []):
+            click.echo(line, err=True)
+    ctx.exit(1)
+
+
+@live_effect.command("set")
+@click.option("--from", "plan_path", type=click.Path(path_type=Path), metavar="PLAN.json",
+              help="Write the entries of this plan file, in order. Not with the options of one write.")
+@click.option("--sequence", "sequence_id", metavar="ID", help="ID of the sequence (see `live state`).")
+@click.option("--sequence-name", "sequence_name", metavar="NAME",
+              help="The name the sequence must have. Nothing is written when it is named otherwise.")
+@click.option("--track", type=click.IntRange(min=0), metavar="N",
+              help="Video track of the clip, counted from 0 (V1 is track 0). Goes with --clip.")
+@click.option("--clip", type=click.IntRange(min=0), metavar="N",
+              help="Number of the clip on that track, counted from 0 (see `live clip list`). Goes with --track.")
+@click.option("--node-id", "node_id", metavar="ID", help="The clip by its node ID, instead of --track and --clip.")
+@click.option("--effect", metavar="NAME", help="Display name or match name of the effect.")
+@click.option("--effect-index", "effect_index", type=click.IntRange(min=0), metavar="N",
+              help="Index of the effect on the clip (see `live effect get`). Needed when two effects have the name.")
+@click.option("--index", type=click.IntRange(min=0), metavar="N", help="Index of the property in the effect.")
+@click.option("--name", metavar="NAME",
+              help="The exact name of the property at --index. Nothing is written when it is named otherwise.")
+@click.option("--value", metavar="JSON", help="The value as JSON: -2.6, a text in double quotes, true or false.")
+@click.option("--expect-old", "expect_old", metavar="JSON",
+              help="The value the property must hold now, as JSON. Nothing is written when it holds another one.")
+@click.option("--dry-run", "dry_run", is_flag=True, help="Find and check every target, and write nothing.")
+@click.option("--project", help="Path of the project that must be the active one.")
+@click.option("--any-project", is_flag=True, help="Allow a write to a project that is not a Claude working copy. Needs --project.")
+@live_options
+@json_option
+@click.pass_context
+@stops_cleanly(STOPPED_RUN)
+def live_effect_set(ctx: click.Context, plan_path: Path | None, dry_run: bool, project: str | None, any_project: bool,
+                    lease_wait: float, timeout: float, allow_untested: bool, **single: object) -> None:
+    """Write effect property values in the running Premiere. Each value is read back.
+
+    One write: --sequence, the clip (--track and --clip, or --node-id), --effect, --index, --name and --value.
+    Many writes: --from PLAN.json, a file such as {"sequence_id": "...", "writes": [{"track": 0, "clip": 0,
+    "effect": "ProcAmp", "index": 0, "name": "Brightness", "value": -2.6}]}. A write may add "node_id",
+    "effect_index" and "expect_old". Video tracks only.
+
+    stored: the value read back from Premiere equals the value written. It is not a render check.
+
+    Every target is found and checked before the first write. When one entry may not be written, nothing is
+    written. A property with keyframes is refused. A Gyroflow effect is refused, because Gyroflow ignores
+    scripted writes. Lumetri Color index 7, 32 and 34 are refused: 7 is the second Input LUT, and 32 and 34 are
+    Look slots that do not render a LUT. A property that holds an array (such as Position) or a colour is
+    refused, because only numbers, strings and booleans can be written. A property whose value cannot be read
+    is refused. A number that is not finite, or is 4294967296 or more in size, is refused.
+
+    A number counts as stored when the value read back is within 0.001 of the value wanted.
+
+    A plan stops at the first write that is not stored. The entries after it do not run.
+
+    A number below zero gets two tries. Then the near value is tried (-2.496 for -2.6). When it lands, the
+    output says so, and the entry is still not stored. When nothing landed and the property holds another value
+    than before, the old value is written back once, and the output says whether that worked. Use --dry-run to
+    see the targets first.
+    """
+    try:
+        given = [flag for key, flag in SINGLE_FLAGS if single[key] is not None]
+        if plan_path is not None:
+            if given:
+                raise CliError("bad_args", f"--from cannot be used with {', '.join(given)}: the plan file names the "
+                                           "sequence and every write. Nothing was sent.")
+            plan = effects.load_plan(plan_path)
+        elif not given:
+            raise CliError("bad_args", "Give a plan with --from PLAN.json, or one write with --sequence, the clip, "
+                                       "--effect, --index, --name and --value. Nothing was sent.")
+        else:
+            plan = _one_write_plan(single)
+        requested = [entry["value"] for entry in plan["writes"]]
+        client = _client(lease_wait)
+        payload = effects.set_effects(client, plan, dry_run=dry_run, project=project, any_project=any_project,
+                                      allow_untested=allow_untested, hard_limit_s=timeout)
+    except CliError as err:
+        carried = getattr(err, "payload", None)
+        if carried is None:
+            _fail(ctx, err)
+            return
+        _set_failure(ctx, err.code, err.message, carried, requested)
+        return
+    if payload.get("dry_run"):
+        lines = _set_lines(payload, requested) + ["Dry run: nothing was written."] + _warning_lines(payload["warnings"])
+        _emit(ctx, payload, "\n".join(lines))
+        return
+    if not payload["stored"]:
+        failed = next(r for r in payload["results"] if not r["stored"])
+        message = (f"The write of entry {failed['entry']} was not stored. The plan stops at the first write that is "
+                   f"not stored: {payload['ran']} of {payload['total']} entries ran.")
+        _set_failure(ctx, "not_stored", message, payload, requested)
+        return
+    lines = _set_lines(payload, requested) + [f"Stored: {payload['ran']} of {payload['total']} entries."]
+    _emit(ctx, payload, "\n".join(lines + _warning_lines(payload["warnings"])))
