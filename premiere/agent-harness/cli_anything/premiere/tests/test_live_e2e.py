@@ -26,21 +26,31 @@ sequence left and that its ProcAmp Brightness did not change. No test saves the 
 closes one. Because the fixture ends after the last test of the module, a failure of its end steps is
 reported as an error under the name of the last test of the file.
 
+The tests of `live frame export`, `live app` and `live lut set` also use the module fixture `app_state`
+(it depends on `work_copy`, so it ends first). It makes "Fixture seq" the active sequence when it starts (the
+state `work_copy` found), keeps that and the proxy display, and at the end of the module reads both again:
+what differs is put back with `live app proxies` / `live app activate`, and the fixture fails with a message
+that says which was left changed (it cannot say by which test).
+
 Tests run in file order. The write tests come after the read-only ones, `test_mcp_tool_negative_control`
 is the last of them (the tool may leave a recovery marker), and the last test checks the bridge folder
 after everything else has run, so it must stay last in the file.
 """
 from __future__ import annotations
 
+import atexit
 import contextlib
 import functools
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,6 +69,8 @@ if os.environ.get("PREMIERE_LIVE_E2E") != "1":
     pytest.skip(SKIP_REASON, allow_module_level=True)
 
 from cli_anything.premiere.core import bridge  # noqa: E402  (only needed once the switch is on)
+from cli_anything.premiere.core.recipes.lut import frame_pixels, mean_difference  # noqa: E402
+from cli_anything.premiere.errors import CliError  # noqa: E402
 
 TIMEOUTS: list[str] = []    # every command that ran out of time in this run (Premiere may be blocked by a dialog)
 
@@ -182,6 +194,14 @@ STATE0 = _gate()                        # `live state` as it was when the module
 BRIDGE_DIR = bridge.default_bridge_dir()
 
 
+def _cleanup_problem(action) -> str | None:
+    """Run a cleanup: None when all is well, else the text of what is still wrong (a raised failure too)."""
+    try:
+        return action()
+    except (Exception, pytest.fail.Exception) as exc:
+        return str(exc) or type(exc).__name__
+
+
 def _after(first: BaseException | None, action) -> None:
     """Run a cleanup (call it in a `finally`) and keep the FIRST failure.
 
@@ -190,10 +210,7 @@ def _after(first: BaseException | None, action) -> None:
     already carrying, or None. With a first failure, the cleanup problem is printed under it and the
     first failure goes on. Without one, the problem fails the test.
     """
-    try:
-        problem = action()
-    except (Exception, pytest.fail.Exception) as exc:
-        problem = str(exc) or type(exc).__name__
+    problem = _cleanup_problem(action)
     if problem:
         print(f"\nCLEANUP PROBLEM: {problem}")
         if first is None:
@@ -634,15 +651,24 @@ def work_copy():
     """
     start = _start_check()
     created: dict = {}
-    failure = None
+    setup_failed = None
     try:
         info = _make_copy(start, created)
-        yield info
     except BaseException as exc:
-        failure = exc
-        raise
+        # A failure of a test never enters this generator, so this is a failure of the SETUP. What it left in
+        # Premiere goes into the failure message itself (the printed line alone is easy to miss).
+        left = _cleanup_problem(lambda: _end_check(start, created))
+        if left:
+            print(f"\nCLEANUP PROBLEM: {left}")
+        if not left or not isinstance(exc, (Exception, pytest.fail.Exception)):
+            raise
+        setup_failed = f"The setup of the working copy failed: {str(exc) or type(exc).__name__}\n\n{left}"
+    if setup_failed:
+        pytest.fail(setup_failed, pytrace=False)       # outside the except block: no chained trace
+    try:
+        yield info
     finally:
-        _after(failure, lambda: _end_check(start, created))
+        _after(None, lambda: _end_check(start, created))
 
 
 # =====================================================================================================
@@ -884,6 +910,671 @@ def test_effect_get_and_readback_agree(work_copy):
           f"Contrast write read {contrast['value']}, effect get {got_contrast}")
     assert _near(tint["value"], got_tint) and _near(contrast["value"], got_contrast), (tint, contrast)
     assert _near(got_tint, 3.3) and _near(got_contrast, 97.5), (got_tint, got_contrast)
+
+
+# =====================================================================================================
+# Frame export, the app switches and lut set. They switch proxy display and the active sequence, so they
+# ask for `app_state`, which checks at the end of the module that Premiere is as it was found.
+# =====================================================================================================
+FRAME_TIMEOUT_S = 600               # one frame export or one `lut set --prove`: its worst case is two MCP server starts,
+                                    # up to 120 s a frame and several sessions, and a SIGTERM on a slow but healthy
+                                    # command would block every later send and put-back of the module
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+FRAME_SIZE = (1280, 720)            # the size of "Fixture seq"
+MIN_FRAME_BYTES = 10000            # a frame of the first clip (the colour test pattern is 100 kB and more)
+MIN_ANY_FRAME_BYTES = 1000         # any frame at all: a valid 1280x720 PNG of one colour is about 8 kB
+FIRST_CLIP_END_S = 6.006           # V1 clip 0 ends here; clip 1 (Mask, Color And Contrast, VR De-Noise) follows
+FIXTURES_LOCAL = Path(__file__).resolve().parent / "fixtures_local"
+# A 2-point LUT that halves every channel (red changes fastest). It has the layout of the known-good identity.cube
+# next to it (the same header lines in the same order, the same number format, one row per line), and only the
+# eight value rows differ: a LUT that Premiere cannot parse may open a modal dialog.
+HALVE_CUBE = ('TITLE "halve"\nLUT_3D_SIZE 2\n0 0 0\n0.5 0 0\n0 0.5 0\n0.5 0.5 0\n'
+              '0 0 0.5\n0.5 0 0.5\n0 0.5 0.5\n0.5 0.5 0.5\n')
+
+
+@functools.lru_cache(maxsize=1)
+def _proxy_script() -> Path:
+    """The read script for proxy display, in a folder of its own that goes away when the run ends."""
+    folder = Path(tempfile.mkdtemp(prefix="premiere-e2e-proxies-"))
+    atexit.register(shutil.rmtree, folder, ignore_errors=True)
+    script = folder / "read_proxies.jsx"
+    script.write_text("return __ok({proxies: app.getEnableProxies()});\n", encoding="utf-8")    # a body only, ES3
+    return script
+
+
+def _proxies_now() -> int:
+    """Proxy display as `app.getEnableProxies()` reads it: 1 on, 0 off (measures.md section 2)."""
+    run = run_cli("live", "run", str(_proxy_script()))
+    data = _ok(run)["data"]
+    value = data.get("proxies") if isinstance(data, dict) else None
+    assert _is_number(value) and value in (0, 1), f"app.getEnableProxies() gave {value!r}\n{run.describe()}"
+    return int(value)
+
+
+def _on_off(value: int) -> str:
+    return "on" if value == 1 else "off"
+
+
+def _app_now() -> tuple[int, str | None]:
+    """(proxy display, ID of the active sequence), read by two separate commands."""
+    return _proxies_now(), _active_id()
+
+
+def _proxies_back(value: int) -> str | None:
+    """Put proxy display back to `value` when it reads otherwise. None, or what is wrong."""
+    if _proxies_now() == value:
+        return None
+    data = _ok(run_cli("live", "app", "proxies", _on_off(value)))
+    now = _proxies_now()
+    if data["stored"] is not True or now != value:
+        return (f"proxy display was NOT put back {_on_off(value)}: it reads {now}. Run: "
+                f"cli-anything-premiere live app proxies {_on_off(value)}")
+    return None
+
+
+def _activate_back(seq_id: str, seq_name: str | None) -> str | None:
+    """Make a sequence the active one again when it is not. None, or what is wrong."""
+    if _active_id() == seq_id:
+        return None
+    args = ["live", "app", "activate", "--sequence", seq_id]
+    if seq_name:
+        args += ["--sequence-name", seq_name]
+    data = _ok(run_cli(*args))
+    now = _active_id()
+    if data["stored"] is not True or now != seq_id:
+        return (f"the sequence {seq_id} was NOT made active again: `live state` shows {now}. Run: "
+                f"cli-anything-premiere live app activate --sequence {seq_id}")
+    return None
+
+
+@contextlib.contextmanager
+def _step(problems: list[str], what: str):
+    """A step of an end check: what raises (a timeout of run_cli included) is kept as a problem, not thrown."""
+    try:
+        yield
+    except (Exception, pytest.fail.Exception) as exc:
+        problems.append(f"{what} failed: {str(exc)[-1500:]}")
+
+
+def _app_state_end(start: dict) -> str | None:
+    """The end of the module for `app_state`. None when proxy display and the active sequence are as they were at the
+    start, else what was found (what differed is put back first)."""
+    reason = _no_contact_reason()
+    if reason:
+        return (f"The app state was not checked at the end, because {reason}: nothing was sent to Premiere. At the "
+                f"start proxy display was {_on_off(start['proxies'])} and {start['active_name']!r} was active; a "
+                "test may have left them changed. Run: cli-anything-premiere recovery show")
+    problems: list[str] = []
+    with _step(problems, "Checking proxy display at the end"):
+        now = _proxies_now()
+        if now != start["proxies"]:
+            back = _proxies_back(start["proxies"])
+            problems.append(f"a test left proxy display changed; it was put back to {_on_off(start['proxies'])} "
+                            f"(it read {_on_off(now)} at the end)" if back is None else
+                            f"a test left proxy display {_on_off(now)} and it was {_on_off(start['proxies'])} at "
+                            f"the start; {back}")
+    with _step(problems, "Checking the active sequence at the end"):
+        now = _active_id()
+        if now != start["active"]:
+            back = _activate_back(start["active"], start["active_name"])
+            problems.append(f"a test left the active sequence changed; it was put back to {start['active_name']!r} "
+                            f"({start['active']}) (`live state` showed {now} at the end)" if back is None else
+                            f"a test left the active sequence at {now} and it was {start['active']} at the start; "
+                            f"{back}")
+    return "The end of app_state found a problem:\n" + "\n".join(problems) if problems else None
+
+
+@pytest.fixture(scope="module")
+def app_state(work_copy):
+    """Proxy display and the active sequence as the app tests found them: yields {"proxies", "active",
+    "active_name"}.
+
+    Start: reads proxy display (a `live run` read script) and the active sequence (`live state`). `duplicate_sequence`
+    left the COPY active, and `test_mcp_tool_negative_control` (after the app tests, so before this fixture ends)
+    leaves "Fixture seq" active, so the start state is made the one `work_copy` found: "Fixture seq" active (by the
+    server's set_active_sequence, which ran live before). A start with the copy active would read as a change at the
+    end of the module. Every export of a test then has to switch the active sequence, which is the real use.
+    End (always, before `work_copy` ends): see _app_state_end.
+    """
+    proxies = _proxies_now()
+    active = _active_id()
+    fixture_id = work_copy["fixture_id"]
+    if active != fixture_id:
+        problem = _fixture_active_again(work_copy)
+        if problem:
+            pytest.fail(f"app_state could not make {FIXTURE_SEQ!r} the active sequence: {problem}", pytrace=False)
+        print(f"app_state: the active sequence was {active}; {FIXTURE_SEQ!r} ({fixture_id}) is active now")
+    start = {"proxies": proxies, "active": fixture_id, "active_name": FIXTURE_SEQ}
+    print(f"app_state: proxy display is {_on_off(proxies)}, the active sequence is {FIXTURE_SEQ!r} ({fixture_id})")
+    try:
+        yield start
+    finally:
+        _after(None, lambda: _app_state_end(start))
+
+
+# ---------- helpers of these tests ----------
+def _alert(run: Run) -> None:
+    """Fails with the WHOLE output when a frame or LUT command left something switched (left_switched is not null,
+    also inside `export` of a lut failure) or a recovery is open (recovery_required, not_restored). Run.describe()
+    cuts the output, and the controller has to see what is still switched."""
+    data = run.data or {}
+    exported = data.get("export")
+    left = data.get("left_switched")
+    if left is None and isinstance(exported, dict):
+        left = exported.get("left_switched")
+    if left is not None or data.get("code") in ("recovery_required", "not_restored"):
+        pytest.fail("This command left Premiere switched, or a recovery is open. left_switched and warnings below say "
+                    "what is still switched and how to put it back; then run: cli-anything-premiere recovery show\n"
+                    f"command: {' '.join(run.argv)}\nexit status: {run.code}\nstdout: {run.stdout}\n"
+                    f"stderr: {run.stderr}", pytrace=False)
+
+
+def _switch_ok(run: Run) -> dict:
+    """The JSON of a frame or LUT command that must have succeeded (see _alert)."""
+    _alert(run)
+    return _ok(run)
+
+
+def _switch_failed(run: Run) -> dict:
+    """The JSON of a frame or LUT command that must have exited 1 (see _alert)."""
+    _alert(run)
+    return _failed(run)
+
+
+def _png_size(path: Path) -> tuple[int, int]:
+    """(width, height) of a PNG: bytes 16 to 24 of the file, after the signature and the IHDR header."""
+    with open(path, "rb") as handle:
+        head = handle.read(24)
+    assert head[:8] == PNG_SIGNATURE and head[12:16] == b"IHDR", f"{path} is not a PNG: {head!r}"
+    return struct.unpack(">II", head[16:24])
+
+
+def _export_args(seq_id: str, seq_name: str, out_dir: Path | str, *times: float, prefix: str | None = None,
+                 overwrite: bool = False, dry_run: bool = False) -> list[str]:
+    args = ["live", "frame", "export", "--sequence", seq_id, "--sequence-name", seq_name, "--out-dir", str(out_dir)]
+    for seconds in times:
+        args += ["--time", repr(float(seconds))]
+    if prefix is not None:
+        args += ["--prefix", prefix]
+    if overwrite:
+        args.append("--overwrite")
+    if dry_run:
+        args.append("--dry-run")
+    return args
+
+
+def _frame_file(folder: Path, prefix: str, seconds: float) -> Path:
+    """The file `live frame export` makes for a frame: PREFIX_00001000ms.png for 1 s."""
+    return folder / f"{prefix}_{round(seconds * 1000):08d}ms.png"
+
+
+def _export(seq_id: str, seq_name: str, folder: Path, *times: float, prefix: str = "frame", **options) -> dict:
+    """One `live frame export` that must succeed. Returns its JSON."""
+    return _switch_ok(run_cli(*_export_args(seq_id, seq_name, folder, *times, prefix=prefix, **options),
+                              timeout=FRAME_TIMEOUT_S))
+
+
+def _check_frames(data: dict, folder: Path, prefix: str, times: tuple[float, ...], *, only: bool = True) -> list[Path]:
+    """The frames of an export: the times and paths in the payload, each file with the bytes the payload says and a
+    PNG of 1280x720, and a size floor that depends on the time. A frame inside the first clip (before 6.006 s) holds
+    the colour test pattern and must be above 10000 bytes. A frame inside the second clip (6.006 s to the end) renders
+    almost fully black on 27.0.0 (measured: 7951 and 7952 bytes at 7.9 s and 7.0 s), and a black PNG of this size is
+    about 8 kB, so it only has to be above 1000 bytes. With `only`, the folder holds these files and no other."""
+    frames = data["frames"]
+    assert data["exported"] == len(times) == data["total"] == len(frames), data
+    assert [f["time_seconds"] for f in frames] == list(times), frames
+    paths = []
+    for entry, seconds in zip(frames, times):
+        path = _frame_file(folder, prefix, seconds)
+        assert entry["path"] == str(path), (entry, str(path))
+        assert path.is_file(), f"there is no file at {path}"
+        size = path.stat().st_size
+        floor = MIN_FRAME_BYTES if seconds < FIRST_CLIP_END_S else MIN_ANY_FRAME_BYTES
+        assert size > floor, (f"{path} has {size} bytes, not more than {floor} (the floor for a frame at "
+                              f"{seconds:g} s, which is {'inside' if seconds < FIRST_CLIP_END_S else 'after'} the first clip)")
+        assert entry["bytes"] == size, (entry, size)
+        assert _png_size(path) == FRAME_SIZE, f"{path} is a PNG of {_png_size(path)}, not {FRAME_SIZE}"
+        paths.append(path)
+    if only:
+        held = sorted(os.listdir(folder))
+        assert held == sorted(p.name for p in paths), f"{folder} holds {held}"
+    return paths
+
+
+def _need_ffmpeg(what: str) -> None:
+    if shutil.which("ffmpeg") is None:
+        pytest.skip(f"ffmpeg is not on PATH: {what}")
+
+
+def _difference(a: Path, b: Path) -> float:
+    """The mean absolute difference of two frames (frame_pixels: over black, 960x540 rgb24; 0 to 255)."""
+    try:
+        return mean_difference(frame_pixels(a), frame_pixels(b))
+    except CliError as exc:
+        pytest.fail(f"The pictures {a} and {b} could not be compared: {exc.code}: {exc.message}", pytrace=False)
+
+
+def _halve_cube() -> Path:
+    """tests/fixtures_local/halve.cube (local, not in git): written when it is missing, and rewritten when it holds
+    anything but HALVE_CUBE (a file of an earlier attempt)."""
+    path = FIXTURES_LOCAL / "halve.cube"
+    wanted = HALVE_CUBE.encode("ascii")
+    if not path.is_file() or path.read_bytes() != wanted:
+        FIXTURES_LOCAL.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(wanted)
+        print(f"halve.cube: written to {path}")
+    return path
+
+
+def _lut_args(copy: dict, lut_file: Path | str, *, clip: int = 0, prove: bool = False, time_s: float | None = None,
+              out_dir: Path | str | None = None, dry_run: bool = False) -> list[str]:
+    """`live lut set` on V1 clip `clip` of the copy; no --effect-index (clip 0 holds one Lumetri Color)."""
+    args = ["live", "lut", "set", "--sequence", copy["id"], "--sequence-name", copy["name"], "--track", "0",
+            "--clip", str(clip), "--lut", str(lut_file)]
+    if prove:
+        args += ["--prove", "--time", repr(float(time_s)), "--out-dir", str(out_dir)]
+    if dry_run:
+        args.append("--dry-run")
+    return args
+
+
+def _lut_slots(seq_id: str) -> tuple[object, object]:
+    """(index 4, index 6) of the Lumetri Color on V1 clip 0 as `live effect get` reads them: the LUT path with a
+    trailing "/" (a string), and the Input LUT menu (a number)."""
+    props = _props(_effect_get(seq_id, LUMETRI), LUMETRI)
+    assert props[4]["kind"] == "string" and props[6]["name"] == "Input LUT" and props[6]["kind"] == "number", \
+        (props[4], props[6])
+    return props[4]["value"], props[6]["value"]
+
+
+def _same_app(before: tuple[int, str | None], what: str) -> None:
+    """Proxy display and the active sequence read as they did before the command."""
+    after = _app_now()
+    assert after == before, (f"{what} changed Premiere: (proxy display, active sequence) was {before} and is "
+                             f"{after}")
+
+
+# ---------- live frame export and live app ----------
+def test_frame_export_dry_run_makes_no_folder(work_copy, app_state, tmp_path):
+    """live frame export --dry-run. Output keys: dry_run, sequence {id, name}, planned[] {time_seconds, path}, total,
+    out_dir {path, exists}, proxies {before, switch}, active_sequence {before, switch}, warnings. No frames,
+    exported or left_switched."""
+    copy_id = work_copy["id"]
+    folder = tmp_path / "frames not made"
+    before = _app_now()
+    data = _switch_ok(run_cli(*_export_args(copy_id, COPY_NAME, folder, 1.0, dry_run=True)))
+    print(f"frame export dry run: proxies {data['proxies']}, active_sequence {data['active_sequence']}, "
+          f"out_dir {data['out_dir']}")
+    assert data["dry_run"] is True and data["sequence"] == {"id": copy_id, "name": COPY_NAME}, data
+    assert not {"frames", "exported", "left_switched"} & set(data), data
+    assert data["planned"] == [{"time_seconds": 1.0, "path": str(_frame_file(folder, "frame", 1.0))}], data["planned"]
+    assert data["total"] == 1, data
+    assert data["out_dir"] == {"path": str(folder), "exists": False}, data["out_dir"]
+    assert not os.path.lexists(folder), f"a dry run made the folder {folder}"
+    assert data["proxies"] == {"before": before[0] == 1, "switch": before[0] == 1}, (data["proxies"], before)
+    assert data["active_sequence"] == {"before": before[1], "switch": before[1] != copy_id}, (data["active_sequence"], before)
+    _same_app(before, "a dry run")
+    assert not _marker_open()
+
+
+def test_frame_export_three_times(work_copy, app_state, tmp_path):
+    """live frame export --time 1.0 --time 3.0 --time 7.0. Output keys: sequence, frames[] {time_seconds, path,
+    bytes}, exported, total, proxies {before, during, after} (booleans), active_sequence {before, after} (IDs),
+    left_switched, changed_by_others, stored, rendered, warnings."""
+    copy_id = work_copy["id"]
+    folder = tmp_path / "frames"
+    times = (1.0, 3.0, 7.0)
+    before = _app_now()
+    started = time.monotonic()
+    run = run_cli(*_export_args(copy_id, COPY_NAME, folder, *times), timeout=FRAME_TIMEOUT_S)
+    seconds = time.monotonic() - started
+    data = _switch_ok(run)
+    print(f"frame export: {len(times)} frames in {seconds:.1f} s; proxies {data['proxies']}, "
+          f"active_sequence {data['active_sequence']}, warnings {data['warnings']}")
+    assert data["sequence"] == {"id": copy_id, "name": COPY_NAME}, data["sequence"]
+    assert data["stored"] is None and data["rendered"] is None, data
+    assert data["left_switched"] is None, data
+    assert data["changed_by_others"] == {"proxies": False, "active_sequence": False}, data
+    paths = _check_frames(data, folder, "frame", times)
+    print(f"frame export: sizes {[p.stat().st_size for p in paths]} bytes, each {_png_size(paths[0])}")
+    assert data["proxies"]["before"] is (before[0] == 1), (data["proxies"], before)
+    assert data["proxies"]["during"] is False, data["proxies"]         # proxy display was off for the export
+    assert data["proxies"]["after"] is data["proxies"]["before"], data["proxies"]
+    print(f"frame export: proxy display at the start: {_on_off(before[0])}")
+    if before[0] == 1:
+        assert data["proxies"] == {"before": True, "during": False, "after": True}, \
+            f"proxy display was on at the start: it must be off during the export and on again after: {data['proxies']}"
+    else:
+        print("frame export: proxy display was off at the start, so the proxy switch was NOT exercised by this test")
+    assert data["active_sequence"] == {"before": before[1], "after": before[1]}, (data["active_sequence"], before)
+    assert before[1] != copy_id                                     # so this run switched the active sequence and back
+    _same_app(before, "the export")                                 # separate reads: `live state` and the proxy script
+    assert not _marker_open()
+
+
+def test_frame_export_follows_the_target_sequence(work_copy, app_state, tmp_path):
+    """A frame is of the NAMED sequence, not of the active one. The copy gets ProcAmp Brightness -60, "Fixture seq"
+    is made active (live app activate), then time 1.0 is exported from the copy and from "Fixture seq": the pictures
+    differ (mean difference above 5), and "Fixture seq" is still the active sequence after both."""
+    copy_id, fixture_id = work_copy["id"], work_copy["fixture_id"]
+    folder = tmp_path / "frames"
+    old = _value(copy_id, PROCAMP, 0, "Brightness")
+    before = _app_now()
+    failure = None
+    try:
+        _write_ok(work_copy, PROCAMP, 0, "Brightness", -60)
+        made = _ok(run_cli("live", "app", "activate", "--sequence", fixture_id, "--sequence-name", FIXTURE_SEQ))
+        assert made["stored"] is True and made["active_sequence"]["after"]["id"] == fixture_id, made
+        assert _active_id() == fixture_id, "`live state` does not show the fixture sequence as the active one"
+        from_copy = _export(copy_id, COPY_NAME, folder, 1.0, prefix="from_copy")
+        from_fixture = _export(fixture_id, FIXTURE_SEQ, folder, 1.0, prefix="from_fixture")
+        print(f"follows the target: copy export {from_copy['active_sequence']}, fixture export "
+              f"{from_fixture['active_sequence']}")
+        assert from_copy["sequence"] == {"id": copy_id, "name": COPY_NAME}, from_copy["sequence"]
+        assert from_fixture["sequence"] == {"id": fixture_id, "name": FIXTURE_SEQ}, from_fixture["sequence"]
+        assert from_copy["active_sequence"] == {"before": fixture_id, "after": fixture_id}, from_copy["active_sequence"]
+        assert from_fixture["active_sequence"] == {"before": fixture_id, "after": fixture_id}, \
+            from_fixture["active_sequence"]
+        [copy_frame] = _check_frames(from_copy, folder, "from_copy", (1.0,), only=False)
+        [fixture_frame] = _check_frames(from_fixture, folder, "from_fixture", (1.0,), only=False)
+        assert _active_id() == fixture_id, "`live state`: the fixture sequence is not the active one after the exports"
+        _same_app(before, "the two exports")
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        def restore() -> str | None:
+            _write_ok(work_copy, PROCAMP, 0, "Brightness", old)
+            now = _value(copy_id, PROCAMP, 0, "Brightness")
+            return None if _near(now, old) else f"The ProcAmp Brightness of the copy is {now}, and it was {old} before the test."
+        _after(failure, restore)
+    _need_ffmpeg("the two pictures cannot be compared")
+    difference = _difference(copy_frame, fixture_frame)
+    print(f"follows the target: mean difference between the copy (Brightness -60) and Fixture seq at 1.0 s: {difference:.2f}")
+    assert difference > 5, (f"the frame of the copy and the frame of {FIXTURE_SEQ!r} differ by only {difference:.2f}: "
+                            f"the export may have taken the wrong sequence ({copy_frame}, {fixture_frame})")
+
+
+def test_frame_export_refuses_an_existing_file_and_overwrites(work_copy, app_state, tmp_path):
+    """The second run of the same command: exit 1, code output_exists (no payload: ok, error, code), nothing
+    switched, the file as it was. With --overwrite: exit 0 and the file is a new one (inode or time changed)."""
+    copy_id = work_copy["id"]
+    folder = tmp_path / "frames"
+    first = _export(copy_id, COPY_NAME, folder, 1.0, prefix="again")
+    [path] = _check_frames(first, folder, "again", (1.0,))
+    old = os.stat(path)
+    before = _app_now()
+    refused = _switch_failed(run_cli(*_export_args(copy_id, COPY_NAME, folder, 1.0, prefix="again"),
+                                     timeout=FRAME_TIMEOUT_S))
+    print(f"existing file: error {refused['error']!r}")
+    assert refused["code"] == "output_exists" and "exists already" in refused["error"], refused
+    _same_app(before, "a refused export")
+    kept = os.stat(path)
+    assert (kept.st_ino, kept.st_mtime_ns, kept.st_size) == (old.st_ino, old.st_mtime_ns, old.st_size), \
+        "the refused export changed the file"
+    assert not _marker_open()
+    again = _export(copy_id, COPY_NAME, folder, 1.0, prefix="again", overwrite=True)
+    _check_frames(again, folder, "again", (1.0,))
+    new = os.stat(path)
+    print(f"existing file: inode {old.st_ino} -> {new.st_ino}, mtime_ns {old.st_mtime_ns} -> {new.st_mtime_ns}")
+    assert (new.st_ino, new.st_mtime_ns) != (old.st_ino, old.st_mtime_ns), "--overwrite did not replace the file"
+    _same_app(before, "the export with --overwrite")
+
+
+def test_frame_export_name_with_space_quote_and_umlaut_under_tmp(work_copy, app_state):
+    """A folder with a space and an umlaut under the real /tmp (a link to /private/tmp on macOS) and a prefix with
+    quotes and an umlaut: the file is at the path asked for, and the payload says so."""
+    copy_id = work_copy["id"]
+    top = Path(f"/tmp/premiere-cli-e2e-{os.getpid()}")
+    folder = top / "frames ü"
+    prefix = 'a "b" ü'
+    requested = _frame_file(folder, prefix, 1.0)
+    before = _app_now()
+    try:
+        data = _export(copy_id, COPY_NAME, folder, 1.0, prefix=prefix)
+        print(f"odd name: requested {ascii(str(requested))}, payload {ascii(data['frames'][0]['path'])}, "
+              f"folder holds {ascii(os.listdir(folder))}")
+        assert data["exported"] == 1 and data["frames"][0]["path"] == str(requested), (data["frames"], str(requested))
+        assert os.path.isfile(requested), f"there is no file at {ascii(str(requested))}"
+        assert os.path.getsize(requested) > MIN_FRAME_BYTES, os.path.getsize(requested)
+        assert len(os.listdir(folder)) == 1, os.listdir(folder)
+        _same_app(before, "the export")
+    finally:
+        shutil.rmtree(top, ignore_errors=True)
+
+
+def test_frame_export_time_at_the_end_is_refused(work_copy, app_state, tmp_path):
+    """The sequence ends at 8.008 s: that time is refused (code bad_time, with the payload of a failed export:
+    exported 0, nothing switched), and 7.9 exports."""
+    copy_id = work_copy["id"]
+    folder = tmp_path / "frames"
+    before = _app_now()
+    refused = _switch_failed(run_cli(*_export_args(copy_id, COPY_NAME, folder, 8.008), timeout=FRAME_TIMEOUT_S))
+    print(f"time at the end: error {refused['error']!r}")
+    assert refused["code"] == "bad_time" and "Nothing was switched" in refused["error"], refused
+    assert refused["exported"] == 0 and refused["frames"] == [] and refused["left_switched"] is None, refused
+    assert refused["proxies"]["after"] is refused["proxies"]["before"], refused["proxies"]
+    assert refused["proxies"]["during"] is refused["proxies"]["before"], refused["proxies"]
+    assert refused["active_sequence"]["after"] == refused["active_sequence"]["before"] == before[1], \
+        refused["active_sequence"]
+    _same_app(before, "the refused export")
+    assert not os.path.isdir(folder) or os.listdir(folder) == [], f"the refused export made files: {os.listdir(folder)}"
+    assert not _marker_open()
+    done = _export(copy_id, COPY_NAME, folder, 7.9)
+    _check_frames(done, folder, "frame", (7.9,))
+    _same_app(before, "the export of 7.9")
+
+
+def test_app_proxies_off_and_on(work_copy, app_state):
+    """live app proxies off|on. Output keys: proxies {before, after} (booleans), stored, rendered, warnings. The
+    proxy script (app.getEnableProxies) reads 1 on and 0 off."""
+    start = _proxies_now()
+    flipped, original = ("off", "on") if start == 1 else ("on", "off")
+    failure = None
+    try:
+        data = _ok(run_cli("live", "app", "proxies", flipped))
+        print(f"proxies {flipped}: {data['proxies']}, warnings {data['warnings']}")
+        assert data["stored"] is True and data["rendered"] is None, data
+        assert data["proxies"] == {"before": start == 1, "after": flipped == "on"}, data["proxies"]
+        assert _proxies_now() == (1 if flipped == "on" else 0)
+        back = _ok(run_cli("live", "app", "proxies", original))
+        print(f"proxies {original}: {back['proxies']}")
+        assert back["stored"] is True and back["rendered"] is None, back
+        assert back["proxies"] == {"before": flipped == "on", "after": start == 1}, back["proxies"]
+        assert _proxies_now() == start
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        _after(failure, lambda: _proxies_back(start))
+
+
+def test_app_activate(work_copy, app_state):
+    """live app activate --sequence ID --sequence-name NAME. Output keys: sequence {id, name}, active_sequence
+    {before, after} (each {id, name}), stored, rendered, warnings. `live state` must agree."""
+    copy_id, fixture_id = work_copy["id"], work_copy["fixture_id"]
+    start = _active_id()
+    failure = None
+    try:
+        data = _ok(run_cli("live", "app", "activate", "--sequence", copy_id, "--sequence-name", COPY_NAME))
+        print(f"activate: copy -> {data['active_sequence']}")
+        assert data["stored"] is True and data["rendered"] is None, data
+        assert data["sequence"] == {"id": copy_id, "name": COPY_NAME}, data["sequence"]
+        assert (data["active_sequence"]["before"] or {}).get("id") == start, (data["active_sequence"], start)
+        assert data["active_sequence"]["after"] == {"id": copy_id, "name": COPY_NAME}, data["active_sequence"]
+        assert _active_id() == copy_id, "`live state` does not show the copy as the active sequence"
+        data = _ok(run_cli("live", "app", "activate", "--sequence", fixture_id, "--sequence-name", FIXTURE_SEQ))
+        print(f"activate: fixture -> {data['active_sequence']}")
+        assert data["stored"] is True and data["rendered"] is None, data
+        assert data["sequence"] == {"id": fixture_id, "name": FIXTURE_SEQ}, data["sequence"]
+        assert (data["active_sequence"]["before"] or {}).get("id") == copy_id, data["active_sequence"]
+        assert data["active_sequence"]["after"] == {"id": fixture_id, "name": FIXTURE_SEQ}, data["active_sequence"]
+        assert _active_id() == fixture_id, "`live state` does not show the fixture sequence as the active one"
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        _after(failure, lambda: _activate_back(app_state["active"], app_state["active_name"]))
+
+
+# ---------- live lut set ----------
+def test_baseline_two_exports_of_one_frame_are_equal(work_copy, app_state, tmp_path):
+    """The noise floor of `lut set --prove`: two exports of time 2.0, in two commands, give the same picture (mean
+    difference below 0.5)."""
+    copy_id = work_copy["id"]
+    folder = tmp_path / "frames"
+    before = _app_now()
+    first = _export(copy_id, COPY_NAME, folder, 2.0, prefix="base_a")
+    second = _export(copy_id, COPY_NAME, folder, 2.0, prefix="base_b")
+    [path_a] = _check_frames(first, folder, "base_a", (2.0,), only=False)
+    [path_b] = _check_frames(second, folder, "base_b", (2.0,), only=False)
+    _same_app(before, "the two exports")
+    _need_ffmpeg("the two frames cannot be compared")
+    difference = _difference(path_a, path_b)
+    print(f"baseline: mean difference of two exports of one frame (2.0 s): {difference:.4f}")
+    assert difference < 0.5, f"two exports of one frame differ by {difference:.4f}: --prove has no noise floor"
+
+
+def test_lut_set_dry_run_changes_nothing(work_copy, app_state):
+    """live lut set --dry-run. Output keys: dry_run, sequence, clip, lut, effect_index, path_before, path_after (the
+    text that would be written), menu_value (index 6 now), stored None, rendered None, frames [], replaces []."""
+    copy_id = work_copy["id"]
+    halve = _halve_cube()
+    before = _snapshot(copy_id, LUMETRI)
+    slot4, slot6 = before[LUMETRI][4]["value"], before[LUMETRI][6]["value"]
+    data = _switch_ok(run_cli(*_lut_args(work_copy, halve, dry_run=True)))
+    print(f"lut dry run: effect_index {data['effect_index']}, path_before {data['path_before']!r}, "
+          f"path_after {data['path_after']!r}, menu_value {data['menu_value']!r}")
+    assert data["dry_run"] is True and data["stored"] is None and data["rendered"] is None, data
+    assert data["sequence"] == {"id": copy_id, "name": COPY_NAME}, data["sequence"]
+    assert (data["clip"]["track"], data["clip"]["clip"]) == (0, 0), data["clip"]
+    assert data["lut"] == str(halve) and data["path_after"] == str(halve) + "/", data
+    assert data["frames"] == [] and data["left_switched"] is None, data
+    assert data["menu_value"] == slot6, (data["menu_value"], slot6)
+    assert data["path_before"] == (slot4 if isinstance(slot4, str) and slot4.lower().endswith(".cube/") else None), \
+        (data["path_before"], slot4)
+    assert _snapshot(copy_id, LUMETRI) == before, "a dry run changed a Lumetri Color value"
+    assert _lut_slots(copy_id) == (slot4, slot6)
+    assert not _marker_open()
+
+
+def test_lut_set_same_identity_gives_no_verdict(work_copy, app_state, tmp_path):
+    """Runs BEFORE any other LUT write: the clip holds identity.cube already, so writing identity.cube again must not
+    change the picture (difference below 1.0) and the verdict is null (rendered None) with a warning that a LUT was
+    in the slot. Output keys: stored, rendered, difference, path_before, path_after, menu_value, frames[] (paths),
+    warnings."""
+    _need_ffmpeg("lut set --prove needs it")
+    identity = FIXTURES_LOCAL / "identity.cube"
+    assert identity.is_file(), f"{identity} is missing: it is the LUT the fixture holds"
+    folder = tmp_path / "frames"
+    before = _app_now()
+    started = time.monotonic()
+    run = run_cli(*_lut_args(work_copy, identity, prove=True, time_s=2.0, out_dir=folder), timeout=FRAME_TIMEOUT_S)
+    seconds = time.monotonic() - started
+    data = _switch_ok(run)
+    print(f"identity again: {seconds:.1f} s; path_before {data['path_before']!r}, menu_value {data['menu_value']!r}, "
+          f"difference {data['difference']!r}, rendered {data['rendered']!r}")
+    print(f"identity again: warnings {data['warnings']}")
+    assert data["stored"] is True, data
+    assert data["rendered"] is None, data
+    assert data["difference"] is not None and data["difference"] < 1.0, data["difference"]
+    assert any("A LUT was already in the slot" in w for w in data["warnings"]), data["warnings"]
+    assert data["path_before"] is not None and data["path_after"] == str(identity.resolve()) + "/", data
+    assert data["left_switched"] is None, data
+    names = sorted(os.path.basename(p) for p in data["frames"])
+    assert names == ["lut_after_00002000ms.png", "lut_before_00002000ms.png"], data["frames"]
+    assert all(os.path.isfile(p) for p in data["frames"]), data["frames"]
+    _same_app(before, "lut set --prove")
+
+
+def test_lut_set_with_prove_changes_the_picture(work_copy, app_state, tmp_path):
+    """halve.cube with --prove at 2.0 s: stored true, rendered true, difference above 10, index 4 reads the path plus
+    "/". Then a plain `live frame export` of 2.0 s must equal the frame taken after the write (difference below
+    0.5: the LUT was fully loaded when that frame was taken)."""
+    _need_ffmpeg("lut set --prove needs it")
+    copy_id = work_copy["id"]
+    halve = _halve_cube()
+    folder = tmp_path / "frames"
+    before = _app_now()
+    started = time.monotonic()
+    run = run_cli(*_lut_args(work_copy, halve, prove=True, time_s=2.0, out_dir=folder), timeout=FRAME_TIMEOUT_S)
+    seconds = time.monotonic() - started
+    data = _switch_ok(run)
+    slot4, slot6 = _lut_slots(copy_id)
+    print(f"halve with --prove: {seconds:.1f} s; stored {data['stored']!r}, rendered {data['rendered']!r}, "
+          f"difference {data['difference']!r}, menu_value {data['menu_value']!r}, index 6 reads {slot6!r}")
+    print(f"halve with --prove: warnings {data['warnings']}")
+    assert data["stored"] is True and data["rendered"] is True, data
+    assert data["difference"] is not None and data["difference"] > 10, data["difference"]
+    assert data["lut"] == str(halve) and data["path_after"] == str(halve) + "/", data
+    assert slot4 == str(halve) + "/", f"index 4 reads {slot4!r}, not {str(halve) + '/'!r}"
+    assert data["left_switched"] is None, data
+    before_frame, after_frame = (folder / "lut_before_00002000ms.png", folder / "lut_after_00002000ms.png")
+    assert sorted(data["frames"]) == sorted([str(before_frame), str(after_frame)]), data["frames"]
+    for path in (before_frame, after_frame):
+        assert path.is_file() and path.stat().st_size > MIN_FRAME_BYTES, f"{path} is missing or small"
+    _same_app(before, "lut set --prove")
+    again = _export(copy_id, COPY_NAME, folder, 2.0, prefix="lut_again")
+    [again_frame] = _check_frames(again, folder, "lut_again", (2.0,), only=False)
+    difference = _difference(after_frame, again_frame)
+    print(f"halve with --prove: mean difference of the frame taken after the write and a later export: {difference:.4f}")
+    assert difference < 0.5, (f"the frame taken right after the write differs by {difference:.4f} from a later export "
+                              "of the same time: the LUT was not fully loaded when frame B was taken")
+    _same_app(before, "the later export")
+
+
+def test_lut_set_time_at_the_clip_end_is_refused(work_copy, app_state, tmp_path):
+    """--prove --time 6.006 is the end of V1 clip 0, which is not inside it: code bad_time, nothing written (index 4
+    and 6 as before), no frame, no folder made by lut set."""
+    _need_ffmpeg("lut set --prove needs it")
+    copy_id = work_copy["id"]
+    halve = _halve_cube()
+    folder = tmp_path / "frames"
+    slots = _lut_slots(copy_id)
+    before = _app_now()
+    data = _switch_failed(run_cli(*_lut_args(work_copy, halve, prove=True, time_s=6.006, out_dir=folder),
+                                  timeout=FRAME_TIMEOUT_S))
+    print(f"lut time at the clip end: error {data['error']!r}")
+    assert data["code"] == "bad_time", data
+    assert data["stored"] is False and data["rendered"] is None and data["path_after"] is None, data
+    assert data["frames"] == [] and data["difference"] is None and data["left_switched"] is None, data
+    assert _lut_slots(copy_id) == slots, "a refused lut set changed index 4 or 6"
+    assert not os.path.isdir(folder) or os.listdir(folder) == [], f"a refused lut set made files: {os.listdir(folder)}"
+    _same_app(before, "a refused lut set")
+    assert not _marker_open()
+
+
+def test_lut_set_non_ascii_path(work_copy, app_state, tmp_path):
+    """A LUT file named with an a-umlaut and a u-umlaut: stored true, and index 4 reads back the path plus "/" exactly.
+    A different Unicode form from Premiere would fail here with both strings: that is a finding."""
+    copy_id = work_copy["id"]
+    lut_file = tmp_path / "lüt ä.cube"
+    shutil.copyfile(_halve_cube(), lut_file)
+    expected = str(lut_file.resolve()) + "/"
+    run = run_cli(*_lut_args(work_copy, lut_file))
+    data = run.data or {}
+    slot4, slot6 = _lut_slots(copy_id)
+    print(f"non-ASCII LUT path: stored {data.get('stored')!r}, menu_value {data.get('menu_value')!r}, "
+          f"index 4 reads back {ascii(slot4)}")
+    shown = (f"sent {ascii(expected)}, index 4 reads {ascii(slot4)}; "
+             f"NFC equal {unicodedata.normalize('NFC', str(slot4)) == expected}")
+    assert run.code == 0 and data.get("ok") is True and data.get("stored") is True, f"{shown}\n{run.describe()}"
+    assert data["path_after"] == expected and data["lut"] == expected[:-1], f"{shown}\n{data}"
+    assert slot4 == expected, shown
+    assert not _marker_open()
+
+
+def test_lut_set_refuses_a_clip_without_lumetri(work_copy, app_state):
+    """V1 clip 1 has no Lumetri Color: exit 1, code precondition, nothing written, no recovery marker."""
+    copy_id = work_copy["id"]
+    halve = _halve_cube()
+    slots = _lut_slots(copy_id)
+    data = _switch_failed(run_cli(*_lut_args(work_copy, halve, clip=1)))
+    print(f"lut on a clip without Lumetri: error {data['error']!r}")
+    assert data["code"] == "precondition" and "Lumetri" in data["error"], data
+    assert data["stored"] is False and data["path_after"] is None and data["frames"] == [], data
+    assert not _marker_open(), "a refusal left a recovery marker"
+    assert _lut_slots(copy_id) == slots, "a refused lut set changed index 4 or 6 of clip 0"
 
 
 CONTROL_WRITES = (

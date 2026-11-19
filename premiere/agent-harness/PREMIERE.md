@@ -143,3 +143,35 @@ Not shown by this run:
 - The name of a transition in `live clip list --detail` (the fixture has no transition).
 - A failed negative write on the real app, so the near-value step and the put-back have run only in unit tests.
 - A plan long enough to pass the 15 s lease limit (the breath between writes has run only in unit tests).
+
+### Round 2, 2026-11-18: frame export, the app switches, lut set
+
+Same setup as round 1. Command: `PREMIERE_LIVE_E2E=1 python -m pytest cli_anything/premiere/tests/test_live_e2e.py -q -s`. Result: 39 passed in 117 s (the 24 tests of round 1 and 15 new ones). No recovery marker. At the end proxy display was on as before, the fixture sequence was active and unchanged, and the project was closed without saving.
+
+A first run of this round had 2 failures. Both came from a wrong number in the tests (a size floor of 10 kB per frame). The second clip of the fixture renders black, and a black frame of 1280x720 is about 8 kB. The export was right. The tests now use the floor only for the first clip.
+
+What the run showed:
+
+| Check | Result |
+|---|---|
+| `live frame export`, three times in one call | 3 PNG files of 1280x720 in about 3 s. Proxy display was on, went off for the export, and was on again after it. The active sequence was the same before and after. |
+| The frame is of the named sequence | With the fixture sequence active, an export of the copy (ProcAmp Brightness -60) and an export of the fixture sequence at the same time differ by a mean of 80.8 of 255 per channel. |
+| File names | An output folder under `/tmp` and a name with a space, a quote and a non-ASCII letter work. The path in the tool's reply is the requested path. |
+| An existing file | Refused before anything is sent. With `--overwrite` the file is replaced (new inode and time stamp). |
+| A time at the end of the sequence | 8.008 s is refused before any switch. 7.9 s exports. |
+| `live app proxies off`, `on` and `live app activate` | Each stored, and a separate read agreed. |
+| Noise floor of the picture check | Two exports of the same frame are identical: mean difference 0.0000. |
+| `live lut set --prove`, the same LUT again | The slot already held `identity.cube`. `stored` true, `rendered` null with the reason, exit status 0. |
+| `live lut set --prove`, a LUT that halves every channel | `stored` true, `rendered` true, mean difference 57.0. Index 6 read 1 after the write. A frame exported later equals the frame taken right after the write (0.0000), so the LUT was loaded when the write returned. |
+| A LUT path with non-ASCII letters | Index 4 read back the identical text. |
+| Refusals of `lut set` | A time at the clip end (6.006 s) and a clip without Lumetri Color were refused before any write. No recovery marker. |
+| Writes to a sequence that is not active | `live effect set` and `live lut set` wrote to the copy while the fixture sequence was active. Targets are found by sequence ID. |
+| Control through the MCP tool | ProcAmp Brightness -2.6 and Lumetri Temperature -40 verified again. |
+
+Not shown by this run:
+
+- A failed export on the real app: the path that leaves proxy display or the active sequence switched and prints the two commands that put them back has run only in unit tests.
+- A stop by Ctrl-C on the real app during an export or a put-back. Every stop point has a unit test with the real bridge code and a fake panel.
+- A change by another person during a `--prove` check.
+- A LUT in a converted project (where index 6 can read 0 while the LUT renders).
+- A clip with two Lumetri Color effects.
