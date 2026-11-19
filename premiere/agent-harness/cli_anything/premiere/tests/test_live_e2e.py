@@ -33,7 +33,8 @@ what differs is put back with `live app proxies` / `live app activate`, and the 
 that says which was left changed (it cannot say by which test).
 
 Tests run in file order. The write tests come after the read-only ones, `test_mcp_tool_negative_control`
-is the last of them (the tool may leave a recovery marker), and the last test checks the bridge folder
+is the last of them (the tool may leave a recovery marker), the Plan 3 tests (keys, place, effect apply and
+three measures) come just before it, and the last test checks the bridge folder
 after everything else has run, so it must stay last in the file.
 """
 from __future__ import annotations
@@ -916,9 +917,11 @@ def test_effect_get_and_readback_agree(work_copy):
 # Frame export, the app switches and lut set. They switch proxy display and the active sequence, so they
 # ask for `app_state`, which checks at the end of the module that Premiere is as it was found.
 # =====================================================================================================
-FRAME_TIMEOUT_S = 600               # one frame export or one `lut set --prove`: its worst case is two MCP server starts,
-                                    # up to 120 s a frame and several sessions, and a SIGTERM on a slow but healthy
-                                    # command would block every later send and put-back of the module
+FRAME_TIMEOUT_S = 2400              # one frame export or one `lut set --prove`. Each frame may wait up to 600 s
+                                    # (frames.EXPORT_TIMEOUT_S), the largest command here exports 3 frames
+                                    # (test_frame_export_three_times; --prove exports 2), so 3 x 600 = 1800 s, plus two
+                                    # MCP server starts (up to 180 s each) and the sessions around them. A SIGTERM on a
+                                    # slow but healthy command would block every later send and put-back of the module
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 FRAME_SIZE = (1280, 720)            # the size of "Fixture seq"
 MIN_FRAME_BYTES = 10000            # a frame of the first clip (the colour test pattern is 100 kB and more)
@@ -1575,6 +1578,578 @@ def test_lut_set_refuses_a_clip_without_lumetri(work_copy, app_state):
     assert data["stored"] is False and data["path_after"] is None and data["frames"] == [], data
     assert not _marker_open(), "a refusal left a recovery marker"
     assert _lut_slots(copy_id) == slots, "a refused lut set changed index 4 or 6 of clip 0"
+
+
+# =====================================================================================================
+# Plan 3: live keys get / set, live place, live effect apply, and three measures for the film session.
+# All on "E2E copy". Each test cleans up the clips it placed (a tool that acts on the active sequence is sent
+# only while the copy is active, then "Fixture seq" is made active again). What stays on the copy until
+# work_copy deletes it: the keys and Scale of V1 clip 0, the effects applied to V1 clip 1, an audio track that
+# test_place_sound_only may add. What stays in the unsaved project: the item marks of testclip.mp4 and the PNG
+# item of the still test (_end_check compares neither; the controller closes the project without saving).
+# =====================================================================================================
+PLAN_CMD_TIMEOUT_S = 900    # keys set, place, effect apply: session A, one or two MCP sessions (each may start the
+                            # server, up to 180 s, and each call has the command's own 120 s limit), read passes and
+                            # session B. A SIGTERM on a slow but healthy run would block every later send
+TICKS_PER_SECOND = 254016000000
+FRAME_TICKS = 10594584000   # one frame of "Fixture seq" (23.976 fps): seq.timebase
+PLAN_FPS = "24000/1001"
+KEY_TOLERANCE = 0.0001      # key values are stored as float32 (measures.md, M4)
+GYROFLOW = "Gyroflow"
+PROJECT_PATH = STATE0["projects"][0].get("path") or None
+
+
+def _project_guard() -> dict:
+    """expected_project_path for a direct MCP write, when `live state` gave the path."""
+    return {"expected_project_path": PROJECT_PATH} if PROJECT_PATH else {}
+
+
+def _copy_guard(copy: dict) -> dict:
+    """The guard args of a direct MCP write to the copy (as active.py sends them)."""
+    return {**_project_guard(), "expected_cep_target": {"backend": "cep", "sequence_id": copy["id"]}}
+
+
+def _on_copy(copy: dict, action):
+    """Run action() while the copy is the active sequence (confirmed by `live state`), then make "Fixture seq"
+    active again, also after a failure. For the tools that act on the active sequence only (add_track,
+    remove_from_timeline): sent while the fixture is active, they would change the fixture."""
+    failure = None
+    try:
+        reply = _tool("set_active_sequence", {"sequence_id": copy["id"]})
+        assert isinstance(reply, dict) and reply.get("active") is True and str(reply.get("id")) == copy["id"], reply
+        active = _active_id()
+        assert active == copy["id"], f"`live state` shows the active sequence {active}, not the copy {copy['id']}"
+        return action()
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        _after(failure, lambda: _fixture_active_again(copy))
+
+
+def _clips(seq_id: str, track_type: str = "both", track: int | None = None) -> list[dict]:
+    args = ["live", "clip", "list", "--sequence", seq_id, "--track-type", track_type]
+    if track is not None:
+        args += ["--track", str(track)]
+    data = _ok(run_cli(*args))
+    assert data["truncated"] is False, data
+    return data["clips"]
+
+
+def _node_ids(seq_id: str) -> set[str]:
+    return {c["node_id"] for c in _clips(seq_id)}
+
+
+def _clip_on(seq_id: str, track: int, clip: int) -> dict:
+    """The `live clip list` record of video track `track`, clip `clip`."""
+    found = [c for c in _clips(seq_id, "video", track) if c["clip"] == clip]
+    assert len(found) == 1, f"V{track + 1} of {seq_id} has no clip {clip}: {[c['clip'] for c in _clips(seq_id, 'video', track)]}"
+    return found[0]
+
+
+def _remove_new(copy: dict, before: set[str]) -> str | None:
+    """Remove from the copy every clip that is not in `before` (with its linked partner), then check that none is
+    left. None, or what is still wrong."""
+    reason = _no_contact_reason()
+    if reason:
+        return f"The clips this test placed on {COPY_NAME!r} were NOT removed, because {reason}."
+    now = _clips(copy["id"])
+    new = [c["node_id"] for c in sorted(now, key=lambda c: c["track_type"] != "video") if c["node_id"] not in before]
+    if not new:
+        return None
+
+    def remove() -> None:
+        for node in new:
+            if node not in _node_ids(copy["id"]):
+                continue                                    # it went with its linked partner
+            reply = _tool("remove_from_timeline", {"node_id": node, "include_linked": True, "ripple": False,
+                                                   **_copy_guard(copy)})
+            assert isinstance(reply, dict) and reply.get("removed") is True and reply.get("verified") is True, \
+                f"remove_from_timeline {node} gave an unexpected reply: {reply!r}"
+
+    _on_copy(copy, remove)
+    left = sorted(_node_ids(copy["id"]) - before)
+    print(f"cleanup: removed {new} from {COPY_NAME!r}")
+    return None if not left else f"These clips are still on {COPY_NAME!r}: {left}. Remove them by hand."
+
+
+def _write_json(tmp_path: Path, name: str, value: object) -> Path:
+    path = tmp_path / name
+    path.write_text(json.dumps(value), encoding="utf-8")
+    return path
+
+
+def _plan_failed(run: Run, code: str) -> dict:
+    """A plan command (keys set, place, effect apply) that failed: exit 1, ok false, this code, the payload with
+    results and counts, and no recovery marker."""
+    data = _failed(run)
+    assert data["code"] == code and isinstance(data.get("results"), list) and isinstance(data.get("counts"), dict), \
+        run.describe()
+    assert not _marker_open(), f"a recovery marker is open after a refused plan command.\n{run.describe()}"
+    return data
+
+
+def _counts(done: int = 0, skipped: int = 0, refused: int = 0, failed: int = 0, not_run: int = 0) -> dict:
+    return {"done": done, "skipped": skipped, "refused": refused, "failed": failed, "not_run": not_run}
+
+
+# ---------- live keys ----------
+def _keys_get(seq_id: str, *, track: int = 0, clip: int = 0) -> dict:
+    return _ok(run_cli("live", "keys", "get", "--sequence", seq_id, "--track", str(track), "--clip", str(clip)))
+
+
+def _keys_now(seq_id: str) -> dict:
+    """What V1 clip 0's Rotation holds, to compare before and after a command that must change nothing."""
+    got = _keys_get(seq_id)
+    return {"is_time_varying": got["is_time_varying"], "value": got["value"],
+            "keys": [(k["media_ticks"], k["value"]) for k in got["keys"]]}
+
+
+def _level_entry(clip: dict, **fields) -> dict:
+    """A level plan entry for a clip of `live clip list`: node, src_in and src_out from its in and out ticks."""
+    entry = {"node": clip["node_id"], "name": "e2e", "src_in": int(clip["in_ticks"]) / TICKS_PER_SECOND,
+             "src_out": int(clip["out_ticks"]) / TICKS_PER_SECOND, "scale": None, "keys": []}
+    entry.update(fields)
+    return entry
+
+
+def _keys_set_args(copy: dict, plan: Path, *extra: str) -> list[str]:
+    return ["live", "keys", "set", "--sequence", copy["id"], "--sequence-name", copy["name"], "--from", str(plan),
+            *extra]
+
+
+def test_keys_get_of_the_fixture(work_copy):
+    """live keys get on V1 clip 0 of "Fixture seq" (a read): Motion Rotation has keys, each with media_ticks (digits)
+    and seconds = (media_ticks - in) / 254016000000. Output keys: sequence, clip, effect, property, is_time_varying,
+    value, keys[] {seconds, media_ticks, value}, warnings. The copy is read too and printed (the duplicate should
+    hold the same keys)."""
+    fixture_id = work_copy["fixture_id"]
+    data = _keys_get(fixture_id)
+    print(f"keys get (fixture): clip {data['clip']}, keys {data['keys']}, warnings {data['warnings']}")
+    assert data["sequence"]["id"] == fixture_id, data["sequence"]
+    clip = data["clip"]
+    assert clip["track_type"] == "video" and (clip["track"], clip["clip"]) == (0, 0) and clip["node_id"], clip
+    assert data["effect"]["name"] == "Motion" and data["property"] == {"name": "Rotation", "index": 4}, data
+    assert data["is_time_varying"] is True and data["value"] is None, data
+    assert data["keys"], "V1 clip 0 of the fixture should hold Rotation keys"
+    in_ticks = clip["in_ticks"]
+    assert isinstance(in_ticks, str) and in_ticks.isdigit(), clip
+    for key in data["keys"]:
+        media = key["media_ticks"]
+        assert isinstance(media, str) and media.isdigit(), key
+        assert _is_number(key["value"]), key
+        assert _near(key["seconds"], (int(media) - int(in_ticks)) / TICKS_PER_SECOND, 1e-6), (key, in_ticks)
+    copy = _keys_get(work_copy["id"])
+    same = [(k["media_ticks"], k["value"]) for k in copy["keys"]] == [(k["media_ticks"], k["value"]) for k in data["keys"]]
+    print(f"keys get (copy): node {copy['clip']['node_id']}, keys {copy['keys']}; same keys as the fixture: {same}")
+
+
+def test_keys_set_replaces_keys(work_copy, tmp_path):
+    """A level plan for V1 clip 0 of the copy (src_in and src_out from `live clip list`): 3 keys, the last one at the
+    clip end (it moves to one frame before the end), and Scale 1.5 above what it is. Done; `live keys get` shows
+    exactly those 3 keys (media ticks exact, values within 0.0001); Scale reads the new value."""
+    copy_id = work_copy["id"]
+    clip = _clip_on(copy_id, 0, 0)
+    in_ticks, length = int(clip["in_ticks"]), int(clip["end_ticks"]) - int(clip["start_ticks"])
+    assert length % FRAME_TICKS == 0, f"V1 clip 0 is {length} ticks long, not whole frames of {FRAME_TICKS}"
+    scale = _props(_effect_get(copy_id, "Motion"), "Motion")[1]
+    assert scale["name"] in ("Scale", "Scale Height") and scale["kind"] == "number" and scale["keyframed"] is False, scale
+    new_scale = round(scale["value"] + 1.5, 3)
+    end_s = length / TICKS_PER_SECOND
+    keys = [{"time_seconds": 0.0, "value": 1.26}, {"time_seconds": 1.247, "value": -0.07},
+            {"time_seconds": end_s, "value": 0.33}]
+    plan = _write_json(tmp_path, "level.json", [_level_entry(clip, scale=new_scale, keys=keys, static=False)])
+    data = _ok(run_cli(*_keys_set_args(work_copy, plan), timeout=PLAN_CMD_TIMEOUT_S))
+    [record] = data["results"]
+    print(f"keys set: record {record}")
+    assert data["counts"] == _counts(done=1) and data["stored"] is True, data
+    assert data["sequence"] == {"id": copy_id, "name": COPY_NAME}, data["sequence"]
+    assert record["status"] == "done" and record["mode"] == "keys", record
+    [moved] = record["moved"]
+    assert _near(moved["from_seconds"], end_s, 1e-6), moved
+    assert _near(moved["to_seconds"], round((length - FRAME_TICKS) / TICKS_PER_SECOND, 6), 1e-6), moved
+    want = [str(in_ticks + round(0.0 * TICKS_PER_SECOND)), str(in_ticks + round(1.247 * TICKS_PER_SECOND)),
+            str(in_ticks + length - FRAME_TICKS)]
+    got = _keys_get(copy_id)
+    print(f"keys set: keys get after {got['keys']}")
+    assert got["is_time_varying"] is True, got
+    assert [k["media_ticks"] for k in got["keys"]] == want, (got["keys"], want)
+    for key, planned in zip(got["keys"], keys):
+        assert _near(key["value"], planned["value"], KEY_TOLERANCE), (key, planned)
+    assert _near(_value(copy_id, "Motion", 1, scale["name"]), new_scale), f"Scale is not {new_scale}"
+
+
+def test_keys_set_static_and_rerun(work_copy, tmp_path):
+    """"static": true with static_value -1.49 and --no-scale: done, Rotation has no keys and reads -1.49. The same
+    plan again: done again, exit 0 (a static write has no "already done")."""
+    copy_id = work_copy["id"]
+    clip = _clip_on(copy_id, 0, 0)
+    plan = _write_json(tmp_path, "level_static.json", [_level_entry(clip, static=True, static_value=-1.49)])
+    for attempt in ("first", "again"):
+        data = _ok(run_cli(*_keys_set_args(work_copy, plan, "--no-scale"), timeout=PLAN_CMD_TIMEOUT_S))
+        [record] = data["results"]
+        print(f"keys set static ({attempt}): record {record}")
+        assert data["counts"] == _counts(done=1) and data["stored"] is True, data
+        assert record["status"] == "done" and record["mode"] == "static", record
+        got = _keys_get(copy_id)
+        print(f"keys set static ({attempt}): is_time_varying {got['is_time_varying']}, value {got['value']}")
+        assert got["is_time_varying"] is False and got["keys"] == [], got
+        assert _near(got["value"], -1.49, KEY_TOLERANCE), got
+
+
+def test_keys_set_clip_changed(work_copy, tmp_path):
+    """A plan whose src_in is 0.5 s off the clip: refused before any write (exit 1, code refused, the record skipped
+    as refused with reason_code clip_changed), no recovery marker, and Rotation as before."""
+    copy_id = work_copy["id"]
+    clip = _clip_on(copy_id, 0, 0)
+    entry = _level_entry(clip, keys=[{"time_seconds": 0.5, "value": 2.0}], static=False)
+    entry["src_in"] += 0.5
+    plan = _write_json(tmp_path, "level_changed.json", [entry])
+    before = _keys_now(copy_id)
+    data = _plan_failed(run_cli(*_keys_set_args(work_copy, plan, "--no-scale"), timeout=PLAN_CMD_TIMEOUT_S), "refused")
+    [record] = data["results"]
+    print(f"clip changed: error {data['error']!r}; record reason {record['reason']!r}")
+    assert record["status"] == "skipped" and record["skip"] == "refused" and record["reason_code"] == "clip_changed", record
+    assert data["counts"] == _counts(skipped=1, refused=1), data["counts"]
+    assert _keys_now(copy_id) == before, "a refused keys set changed Rotation"
+
+
+# ---------- live place ----------
+def _testclip_item(seq_id: str) -> str:
+    """The node ID of the project item testclip.mp4, from V1 clip 0 of the sequence."""
+    source = _clip_on(seq_id, 0, 0)["source"]
+    assert isinstance(source, dict) and source.get("name") == "testclip.mp4" and source.get("node_id"), source
+    return source["node_id"]
+
+
+def _shot(name: str, item: str, src_in: float, start_f: int, *, frames: int | None = 48, track: int = 1,
+          audio_track: int = 0, **extra) -> dict:
+    shot = {"name": name, "item": item, "src_in": src_in, "start_f": start_f, "track": track,
+            "audio_track": audio_track}
+    if frames is not None:
+        shot["frames"] = frames
+    shot.update(extra)
+    return shot
+
+
+def _place_args(copy: dict, plan: Path, *extra: str) -> list[str]:
+    return ["live", "place", "--sequence", copy["id"], "--sequence-name", copy["name"], "--plan", str(plan), *extra]
+
+
+def _place_plan(tmp_path: Path, name: str, *shots: dict) -> Path:
+    return _write_json(tmp_path, name, {"fps": PLAN_FPS, "shots": list(shots)})
+
+
+def _starts_at(clip: dict, start_f: int) -> bool:
+    return 2 * abs(int(clip["start_ticks"]) - start_f * FRAME_TICKS) <= FRAME_TICKS
+
+
+def test_place_on_a_spare_track(work_copy, app_state, tmp_path):
+    """Two shots of testclip.mp4 onto V2 (sound on A1) after the end of the sequence (frames 240 and 300, 48 frames
+    each): both done, each with set_item_in_out and overwrite_clip, new node IDs for picture and sound, and the
+    active sequence put back. `live clip list` shows the clips at their starts. The clips are removed at the end.
+    Output keys: results[] (calls, marks, now {video, audio}), counts, marks, left_switched, stopped, sequence."""
+    copy_id = work_copy["id"]
+    item = _testclip_item(copy_id)
+    before = _node_ids(copy_id)
+    active = _active_id()
+    starts = (240, 300)
+    plan = _place_plan(tmp_path, "shots.json", _shot("e2e A", item, 1.0, starts[0]), _shot("e2e B", item, 3.0, starts[1]))
+    failure = None
+    try:
+        started = time.monotonic()
+        data = _ok(run_cli(*_place_args(work_copy, plan), timeout=PLAN_CMD_TIMEOUT_S))
+        print(f"place: {time.monotonic() - started:.1f} s; marks {data['marks']}; warnings {data['warnings']}")
+        assert data["counts"] == _counts(done=2) and data["stored"] is True, data
+        assert data["left_switched"] is None and data["stopped"] is False, data
+        nodes = []
+        for record in data["results"]:
+            print(f"place: {record['name']}: now {record['now']}, calls {record['calls']}, marks {record['marks']}")
+            assert record["status"] == "done" and record["target"]["node_id"] == item, record
+            assert record["calls"] == [{"tool": "set_item_in_out", "ok": True}, {"tool": "overwrite_clip", "ok": True}], record
+            video, audio = record["now"]["video"], record["now"]["audio"]
+            assert video and audio and video["node_id"] and audio["node_id"], record["now"]
+            nodes += [video["node_id"], audio["node_id"]]
+        assert len(set(nodes)) == 4 and not set(nodes) & before, (nodes, before)
+        assert _active_id() == active, "the active sequence was not put back"
+        on_v2 = {c["node_id"]: c for c in _clips(copy_id, "video", 1)}
+        for record, start_f in zip(data["results"], starts):
+            clip = on_v2.get(record["now"]["video"]["node_id"])
+            assert clip is not None and _starts_at(clip, start_f), (clip, start_f)
+            assert clip["source"]["node_id"] == item, clip["source"]
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        _after(failure, lambda: _remove_new(work_copy, before))
+
+
+def test_place_rerun_is_already_placed(work_copy, app_state, tmp_path):
+    """One shot onto V2 at frame 400; the same command again: exit 0, the shot skipped as nothing to do
+    (reason_code already_placed), no MCP call (calls is []), the clips on the copy unchanged. The active sequence
+    is still switched and put back on the re-run (parked P-T6-1), so that is not asserted."""
+    copy_id = work_copy["id"]
+    item = _testclip_item(copy_id)
+    before = _node_ids(copy_id)
+    plan = _place_plan(tmp_path, "shots_rerun.json", _shot("e2e rerun", item, 2.0, 400))
+    failure = None
+    try:
+        first = _ok(run_cli(*_place_args(work_copy, plan), timeout=PLAN_CMD_TIMEOUT_S))
+        assert first["counts"] == _counts(done=1), first
+        placed = _node_ids(copy_id)
+        again = _ok(run_cli(*_place_args(work_copy, plan), timeout=PLAN_CMD_TIMEOUT_S))
+        [record] = again["results"]
+        print(f"place re-run: record {record}")
+        assert again["counts"] == _counts(skipped=1) and again["stored"] is True, again
+        assert record["status"] == "skipped" and record["skip"] == "nothing_to_do", record
+        assert record["reason_code"] == "already_placed" and record["calls"] == [], record
+        assert again["left_switched"] is None, again
+        assert _node_ids(copy_id) == placed, "the re-run changed the clips of the copy"
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        _after(failure, lambda: _remove_new(work_copy, before))
+
+
+def test_place_sound_only(work_copy, app_state, tmp_path):
+    """A shot with "audio_only": true, picture track V3, sound track A2, at frame 520: done with set_item_in_out,
+    overwrite_clip and remove_from_timeline; the sound is on A2 at the start, no clip of it is left on V3. A dry run
+    first: when it refuses with no_track (the copy has one audio track), one audio track is added to the copy (it is
+    left there; the copy is deleted at the end)."""
+    copy_id = work_copy["id"]
+    item = _testclip_item(copy_id)
+    before = _node_ids(copy_id)
+    plan = _place_plan(tmp_path, "shots_sound.json",
+                       _shot("e2e sound", item, 1.0, 520, track=2, audio_track=1, audio_only=True))
+    dry = run_cli(*_place_args(work_copy, plan, "--dry-run"), timeout=PLAN_CMD_TIMEOUT_S)
+    if dry.code != 0:
+        refused = _plan_failed(dry, "refused")
+        [record] = refused["results"]
+        assert record["reason_code"] == "no_track", dry.describe()
+        print(f"sound only: dry run refused ({record['reason']}); adding one audio track to the copy")
+        added = _on_copy(work_copy, lambda: _tool("add_track", {"track_type": "audio", "count": 1,
+                                                                **_copy_guard(work_copy)}))
+        print(f"sound only: add_track replied {added!r}")
+        dry = run_cli(*_place_args(work_copy, plan, "--dry-run"), timeout=PLAN_CMD_TIMEOUT_S)
+    planned = _ok(dry)["planned"]
+    print(f"sound only: dry run {planned}")
+    assert planned[0]["steps"] == ["place", "remove_picture"], planned
+    failure = None
+    try:
+        data = _ok(run_cli(*_place_args(work_copy, plan), timeout=PLAN_CMD_TIMEOUT_S))
+        [record] = data["results"]
+        print(f"sound only: record {record}")
+        assert data["counts"] == _counts(done=1) and data["left_switched"] is None, data
+        assert [c["tool"] for c in record["calls"]] == ["set_item_in_out", "overwrite_clip", "remove_from_timeline"], record
+        assert all(c["ok"] for c in record["calls"]), record
+        assert record["now"]["video"] is None and record["now"]["audio"]["node_id"], record["now"]
+        sound = record["now"]["audio"]["node_id"]
+        on_a2 = [c for c in _clips(copy_id, "audio", 1) if c["node_id"] == sound]
+        assert len(on_a2) == 1 and _starts_at(on_a2[0], 520), on_a2
+        left_on_v3 = [c for c in _clips(copy_id, "video", 2) if c["node_id"] not in before]
+        assert left_on_v3 == [], f"a picture clip is left on V3: {left_on_v3}"
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        _after(failure, lambda: _remove_new(work_copy, before))
+
+
+# ---------- live effect apply ----------
+def _apply_args(copy: dict, track: int, clips: str, *effects: str, allow_second: bool = False,
+                any_order: bool = False) -> list[str]:
+    args = ["live", "effect", "apply", "--sequence", copy["id"], "--sequence-name", copy["name"], "--track", str(track),
+            "--clips", clips]
+    for name in effects:
+        args += ["--effect", name]
+    if allow_second:
+        args.append("--allow-second")
+    if any_order:
+        args.append("--any-order")
+    return args
+
+
+def _added(before: list[str], after: list[str]) -> list[str]:
+    """The component names that `after` holds more often than `before`."""
+    extra = []
+    for name in dict.fromkeys(after):
+        extra += [name] * max(0, after.count(name) - before.count(name))
+    return extra
+
+
+def _landing(before: list[str], after: list[str]) -> tuple[int, str] | None:
+    """(index, name) of the one component that `after` has more than `before`, or None."""
+    if len(after) != len(before) + 1:
+        return None
+    for index in range(len(after)):
+        if after[:index] + after[index + 1:] == before:
+            return index, after[index]
+    return None
+
+
+def test_effect_apply_procamp_then_lumetri(work_copy, app_state):
+    """V1 clip 1 (Mask, Color And Contrast, VR De-Noise; no ProcAmp, no Lumetri Color): --effect ProcAmp --effect
+    "Lumetri Color" are both done, render_order ends "ProcAmp > Lumetri Color", each record's effect_index names its
+    effect, the active sequence is put back. Re-run: exit 0, both skipped (has_effect) with the same effect_index.
+    Runs before the two measure tests below, which add more effects to this clip."""
+    copy_id = work_copy["id"]
+    first = _clip_on(copy_id, 0, 1)
+    assert PROCAMP not in first["effects"] and LUMETRI not in first["effects"], \
+        f"V1 clip 1 of the copy holds {first['effects']} already: this test needs it without ProcAmp and Lumetri Color"
+    active = _active_id()
+    args = _apply_args(work_copy, 0, "1", PROCAMP, LUMETRI)
+    started = time.monotonic()
+    data = _ok(run_cli(*args, timeout=PLAN_CMD_TIMEOUT_S))
+    print(f"effect apply: {time.monotonic() - started:.1f} s; results "
+          f"{[(r['effect'], r['status'], r['effect_index']) for r in data['results']]}; warnings {data['warnings']}")
+    assert data["counts"] == _counts(done=2) and data["stored"] is True, data
+    assert data["left_switched"] is None and data["stopped"] is False, data
+    assert [r["effect"] for r in data["results"]] == [PROCAMP, LUMETRI], data["results"]
+    after = _clip_on(copy_id, 0, 1)
+    print(f"effect apply: components {after['effects']}, render_order {after['render_order']}")
+    for record in data["results"]:
+        assert record["status"] == "done" and isinstance(record["effect_index"], int), record
+        assert after["effects"][record["effect_index"]] == record["effect"], (record, after["effects"])
+    assert after["render_order"][-2:] == [PROCAMP, LUMETRI], after["render_order"]
+    assert after["procamp_before_lumetri"] is True, after
+    assert _active_id() == active, "the active sequence was not put back"
+    again = _ok(run_cli(*args, timeout=PLAN_CMD_TIMEOUT_S))
+    print(f"effect apply re-run: {[(r['effect'], r['status'], r['reason_code'], r['effect_index']) for r in again['results']]}")
+    assert again["counts"] == _counts(skipped=2) and again["stored"] is True, again
+    for record, done in zip(again["results"], data["results"]):
+        assert record["status"] == "skipped" and record["skip"] == "nothing_to_do", record
+        assert record["reason_code"] == "has_effect" and record["effect_index"] == done["effect_index"], (record, done)
+    assert _clip_on(copy_id, 0, 1)["effects"] == after["effects"], "the re-run changed the clip"
+
+
+def test_effect_names_qe_vs_display(work_copy, app_state):
+    """MEASURE: the name apply_effect takes (QE) against the display name the clip then shows. ProcAmp and Lumetri
+    Color on V1 clip 1 (--allow-second, so it does not matter what the clip holds already): the new components must
+    carry exactly the requested names, or `effect apply` cannot count them as done. The match names are printed.
+    Gyroflow is not in the fixture: test_new_procamp_index_with_three_components records it, or skips naming it."""
+    copy_id = work_copy["id"]
+    before = _clip_on(copy_id, 0, 1)["effects"]
+    run = run_cli(*_apply_args(work_copy, 0, "1", PROCAMP, LUMETRI, allow_second=True), timeout=PLAN_CMD_TIMEOUT_S)
+    after = _clip_on(copy_id, 0, 1)["effects"]
+    added = _added(before, after)
+    facts = f"requested {[PROCAMP, LUMETRI]}; the clip got the components {added} (before {before}, after {after})"
+    print(f"effect names: {facts}; exit {run.code}, code {(run.data or {}).get('code')}")
+    assert not _marker_open(), f"a recovery marker is open after effect apply.\n{run.describe()}"
+    for name in (PROCAMP, LUMETRI):
+        shown = _effect_get(copy_id, name, clip=1)["effects"]
+        print(f"effect names: {name!r} -> {[(e['effect_index'], e['name'], e['match_name']) for e in shown]}")
+    assert sorted(added) == sorted([PROCAMP, LUMETRI]), f"the display names differ from the requested names: {facts}"
+    data = _ok(run)
+    assert data["counts"] == _counts(done=2), data
+
+
+def test_new_procamp_index_with_three_components(work_copy, app_state):
+    """MEASURE, in the film's order: Gyroflow, then ProcAmp, then Lumetri Color, one `effect apply` each
+    (--allow-second) on V1 clip 1, which holds the fixture's own effects (3 or more components). For each step it
+    prints where the new component lands (its index in the component list, found by comparing the list before and
+    after), the record's effect_index (the first component of that name) and the render_order.
+
+    Gyroflow is applied only when list_available_effects names it. When it is not listed, or apply_effect does not
+    add it, ProcAmp and Lumetri Color are still recorded, then the test SKIPS with a reason that names Gyroflow and
+    holds what was recorded. A recovery marker after any step fails the test."""
+    copy_id = work_copy["id"]
+    listed = _tool("list_available_effects")
+    entries = listed if isinstance(listed, list) else (listed or {}).get("effects") if isinstance(listed, dict) else None
+    names = [e.get("name") for e in entries or [] if isinstance(e, dict) and isinstance(e.get("name"), str)]
+    partial = any("partial" in str(e.get("source", "")) for e in entries or [] if isinstance(e, dict))
+    gyro = [n for n in names if "gyroflow" in n.lower()]
+    print(f"effect list: {len(names)} effects (partial list: {partial}); Gyroflow names: {gyro}")
+    skip_reason = None
+    steps = [PROCAMP, LUMETRI]
+    if gyro:
+        steps.insert(0, GYROFLOW if GYROFLOW in gyro else gyro[0])
+    else:
+        skip_reason = (f"Gyroflow is not in list_available_effects ({len(names)} effects listed, partial list: "
+                       f"{partial}), so it was not applied")
+    lines = []
+    for name in steps:
+        before = _clip_on(copy_id, 0, 1)["effects"]
+        run = run_cli(*_apply_args(work_copy, 0, "1", name, allow_second=True), timeout=PLAN_CMD_TIMEOUT_S)
+        clip = _clip_on(copy_id, 0, 1)
+        landed = _landing(before, clip["effects"])
+        record = ((run.data or {}).get("results") or [{}])[0]
+        line = (f"{name}: {len(before)} components before; lands at component index "
+                f"{None if landed is None else landed[0]} as {None if landed is None else landed[1]!r}; record "
+                f"effect_index {record.get('effect_index')}, status {record.get('status')}; render_order "
+                f"{clip['render_order']}; exit {run.code}")
+        lines.append(line)
+        print(f"three components: {line}")
+        if _marker_open():
+            pytest.fail(f"A recovery marker is open after `effect apply --effect {name}`. Run: cli-anything-premiere "
+                        f"recovery show\n{line}\n{run.describe()}", pytrace=False)
+        if name in gyro and landed is None:
+            skip_reason = (f"Gyroflow ({name!r}) is listed, but apply_effect did not add it: "
+                           f"{(run.data or {}).get('error')}")
+            continue
+        if name == PROCAMP:
+            assert len(before) >= 3, f"the clip has only {len(before)} components before ProcAmp: {before}"
+        assert landed is not None and landed[1] == name, f"no new component named {name!r}: {line}"
+        assert run.code == 0 and run.data is not None and run.data.get("ok") is True, f"{line}\n{run.describe()}"
+    if skip_reason:
+        pytest.skip(f"{skip_reason}. Recorded anyway: " + " | ".join(lines))
+
+
+# ---------- a still with an out mark past its import length ----------
+def test_still_out_mark_past_import_length(work_copy, app_state, tmp_path):
+    """MEASURE. A PNG frame of the copy (live frame export) is imported (import_media, suppress_ui), then
+    set_item_in_out sends in 0 and out 6.0 s, past the 4.96 s a still gets at import: the reply (applied out,
+    verified) is printed, and only an answer is asserted. Then `live place` places the still for 6.0 s (144 frames
+    on V3 at frame 700; its own set_item_in_out sends out 6.007 s): it must be done, and V3 shows it 144 frames
+    long. The placed clip is removed at the end; the PNG item stays in the unsaved project."""
+    copy_id = work_copy["id"]
+    folder = tmp_path / "still"
+    prefix = f"e2e_still_{os.getpid()}_{int(time.time())}"
+    exported = _export(copy_id, COPY_NAME, folder, 1.0, prefix=prefix)
+    [png] = _check_frames(exported, folder, prefix, (1.0,))
+    imported = _tool("import_media", {"file_paths": [str(png)], "suppress_ui": True, **_project_guard()})
+    items = imported.get("items") if isinstance(imported, dict) else None
+    assert isinstance(imported, dict) and imported.get("verified") is True and isinstance(items, list) \
+        and len(items) == 1 \
+        and items[0].get("nodeId"), f"import_media gave an unexpected reply: {imported!r}"
+    item = str(items[0]["nodeId"])
+    print(f"still: imported {png.name} as item {item}")
+    marks_run = _tool_run("set_item_in_out", {"item_id": item, "in_seconds": 0.0, "out_seconds": 6.0,
+                                              **_project_guard()})
+    reply = (marks_run.data or {}).get("result")
+    data = reply.get("data") if isinstance(reply, dict) else None
+    marks = {"exit": marks_run.code, "code": (marks_run.data or {}).get("code"),
+             "error": (marks_run.data or {}).get("error"),
+             "applied_out": data.get("appliedOutSeconds") if isinstance(data, dict) else None,
+             "verified": data.get("verified") if isinstance(data, dict) else None}
+    print(f"still: set_item_in_out out 6.0 s -> {marks}")
+    assert marks_run.data is not None, f"set_item_in_out gave no JSON answer.\n{marks_run.describe()}"
+    before = _node_ids(copy_id)
+    plan = _place_plan(tmp_path, "shots_still.json",
+                       _shot("e2e still", item, 0.0, 700, frames=None, track=2, src_out=6.0))
+    failure = None
+    try:
+        run = run_cli(*_place_args(work_copy, plan), timeout=PLAN_CMD_TIMEOUT_S)
+        result = run.data or {}
+        record = (result.get("results") or [{}])[0]
+        print(f"still: place exit {run.code}, record {record}")
+        if not (run.code == 0 and result.get("ok") is True and record.get("status") == "done"):
+            pytest.fail("`live place` did NOT place the still for 6.0 s. Its out mark (6.007 s) is past the 4.96 s "
+                        "the still got at import: the mark may have been refused. "
+                        f"Direct set_item_in_out out 6.0 s: {marks}. Place record: status {record.get('status')}, "
+                        f"error {record.get('error')!r}, calls {record.get('calls')}, marks {record.get('marks')}."
+                        f"\n{run.describe()}", pytrace=False)
+        node = record["now"]["video"]["node_id"]
+        [clip] = [c for c in _clips(copy_id, "video", 2) if c["node_id"] == node]
+        length = int(clip["end_ticks"]) - int(clip["start_ticks"])
+        print(f"still: placed {node}, {length / TICKS_PER_SECOND:.6f} s long ({length / FRAME_TICKS:.3f} frames), "
+              f"calls {record['calls']}, marks {record['marks']}")
+        assert _starts_at(clip, 700) and 2 * abs(length - 144 * FRAME_TICKS) <= FRAME_TICKS, clip
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        _after(failure, lambda: _remove_new(work_copy, before))
 
 
 CONTROL_WRITES = (
