@@ -1,5 +1,5 @@
-"""The recipe commands of the `live` group: `live clip list`, `live effect get`, `live effect set`, and the commands
-that later tasks add.
+"""The recipe commands of the `live` group: `live clip list`, `live effect get`, `live effect set`, `live frame
+export`, `live app`, `live lut set`, and the commands that later tasks add.
 
 live_cli.py imports this module as its last line, so the `live` group exists when the commands attach.
 The logic of each command is in core/recipes; this file holds only the click side.
@@ -18,7 +18,7 @@ from pathlib import Path
 import click
 
 from cli_anything.premiere import live_cli
-from cli_anything.premiere.core.recipes import clips, effects, frames
+from cli_anything.premiere.core.recipes import clips, effects, frames, lut
 from cli_anything.premiere.errors import CliError
 from cli_anything.premiere.live_cli import (DEFAULT_LEASE_WAIT_S, STOPPED_LOOK, STOPPED_RUN, _client, _warning_lines,
                                             live, live_options, stops_cleanly)
@@ -653,3 +653,131 @@ def live_app_activate(ctx: click.Context, sequence_id: str, sequence_name: str |
         lines = [f"Active sequence: {_sequence_text(payload['active_sequence']['after'])} "
                  f"(was {_sequence_text(before)}). Stored: yes"]
     _emit(ctx, payload, "\n".join(lines + _warning_lines(payload["warnings"])))
+
+
+# ---------- live lut set ----------
+@live.group("lut")
+def live_lut() -> None:
+    """Write a LUT file into a Lumetri Color effect of the running Premiere."""
+
+
+def _lut_lines(payload: dict) -> list[str]:
+    """V1[0] testclip.mp4, Lumetri Color[2]: index 4 "\ufefe" -> "/luts/look.cube/", then stored and rendered."""
+    lines = []
+    clip = payload.get("clip")
+    if clip:
+        name = "?" if clip.get("name") is None else clip["name"]
+        before, after = payload.get("path_before"), payload.get("path_after")
+        line = (f"V{clip['track'] + 1}[{clip['clip']}] {name}, Lumetri Color[{payload.get('effect_index')}]: "
+                f"index 4 {_set_value_text(before) if before is not None else '(no LUT)'}")
+        lines.append(line + (f" -> {_set_value_text(after)}" if after is not None else ""))   # nothing written: no arrow
+    if payload.get("dry_run"):
+        lines += [f"Would export: {path}" for path in payload.get("frames") or []]
+        lines += [f"Would replace: {path}" for path in payload.get("replaces") or []]
+        lines.append("Dry run: nothing was written.")
+        return lines
+    stored = payload.get("stored")
+    lines.append("Stored: " + {True: "yes", False: "no", None: "unknown"}[stored]
+                 + ("" if payload.get("menu_value") is None
+                    else f". Index 6 (Input LUT) reads {_set_value_text(payload['menu_value'])}."))
+    lines += [f"Frame: {path}" for path in payload.get("frames") or []]
+    if payload.get("difference") is not None:
+        rendered = {True: "yes", False: "no", None: "cannot tell"}[payload.get("rendered")]
+        lines.append(f"Rendered: {rendered} (difference {payload['difference']}, threshold {lut.PROVE_THRESHOLD}).")
+    return lines
+
+
+def _lut_failure(ctx: click.Context, err: CliError, payload: dict) -> None:
+    """Exit 1 with the failure and what was written, as `mcp batch` does."""
+    if _json(ctx):
+        click.echo(json.dumps({"ok": False, "error": err.message, "code": err.code, **payload}, indent=2,
+                              ensure_ascii=False))
+    else:
+        lines = _lut_lines(payload)
+        if lines:
+            click.echo("\n".join(lines))
+        click.echo(f"Error: {err.message}", err=True)
+        for line in _warning_lines(payload.get("warnings") or []):
+            click.echo(line, err=True)
+    ctx.exit(1)
+
+
+@live_lut.command("set")
+@click.option("--sequence", "sequence_id", required=True, metavar="ID", help="ID of the sequence (see `live state`).")
+@click.option("--sequence-name", "sequence_name", metavar="NAME",
+              help="The name the sequence must have. Nothing is written when it is named otherwise.")
+@click.option("--track", type=click.IntRange(min=0), metavar="N",
+              help="Video track of the clip, counted from 0 (V1 is track 0). Goes with --clip.")
+@click.option("--clip", type=click.IntRange(min=0), metavar="N",
+              help="Number of the clip on that track, counted from 0 (see `live clip list`). Goes with --track.")
+@click.option("--node-id", "node_id", metavar="ID", help="The clip by its node ID, instead of --track and --clip.")
+@click.option("--lut", "lut_path", required=True, type=click.Path(path_type=Path), metavar="FILE.cube",
+              help="The LUT file, as an absolute path to a .cube file.")
+@click.option("--effect-index", "effect_index", type=click.IntRange(min=0), metavar="N",
+              help="Index of the Lumetri Color on the clip (see `live effect get`). Needed when the clip has two.")
+@click.option("--prove", is_flag=True,
+              help="Export the frame at --time before and after the write, into --out-dir, and compare them. "
+                   "Shows that the LUT changed the picture. It does not show that it is the right LUT. "
+                   "For a film, compare with an ffmpeg lut3d render of the source.")
+@click.option("--time", "time", type=float, metavar="SECONDS",
+              help="Sequence time of the frame for --prove, in seconds. It must lie inside the clip.")
+@click.option("--out-dir", "out_dir", type=click.Path(path_type=Path), metavar="DIR",
+              help="Folder for the two frames of --prove. It is made when it does not exist.")
+@click.option("--dry-run", "dry_run", is_flag=True,
+              help="Find and check the clip and the Lumetri Color, and write nothing. No frame is exported.")
+@click.option("--project", help="Path of the project that must be the active one.")
+@click.option("--any-project", is_flag=True, help="Allow a write to a project that is not a Claude working copy. Needs --project.")
+@live_options
+@json_option
+@click.pass_context
+@stops_cleanly(STOPPED_RUN)
+def live_lut_set(ctx: click.Context, sequence_id: str, sequence_name: str | None, track: int | None, clip: int | None,
+                 node_id: str | None, lut_path: Path, effect_index: int | None, prove: bool, time: float | None,
+                 out_dir: Path | None, dry_run: bool, project: str | None, any_project: bool, lease_wait: float,
+                 timeout: float, allow_untested: bool) -> None:
+    """Write a LUT file into the Input LUT slot of a Lumetri Color effect, and read it back.
+
+    The clip must already hold a Lumetri Color effect. The command writes the full path of the .cube file plus a
+    trailing / into index 4, then 1 into index 6. Index 7 is never written. Before any write it checks the layout:
+    index 2 is Basic Correction, index 4 holds a string, and index 6 is Input LUT. Any other layout is refused, and
+    nothing is written.
+
+    stored: index 4 reads back the path that was written. That is not proof for a LUT: a path in the slot does not
+    show that the LUT renders. Index 6 is shown, but it does not count: in some projects it reads 0 while the LUT
+    renders. Index 6 = 0 does not remove a LUT.
+
+    --prove exports the frame at --time before the write and after it, and compares the two. The clip must be
+    visible at --time, and the picture must not be black or one flat color. rendered is true when the exported
+    frame changed. It is false when the slot was empty before and the exported frame did not change: then check
+    that the clip is visible at that time and that the LUT is not an identity LUT. It is null when the exported
+    frame did not change and a LUT was already in the slot or the frame before is one flat color; and when the two
+    frames were not taken under the same conditions (someone changed proxy display or the active sequence during
+    the check, or that could not be read). The warnings say which. --prove replaces its own two files
+    (lut_before_... and lut_after_...) from an earlier run at the same time: it removes them before the first
+    export. It needs ffmpeg on PATH. Each export switches proxy display off and makes the sequence active, then
+    puts both back, as `live frame export` does.
+    """
+    try:
+        if node_id is not None:
+            if track is not None or clip is not None:
+                raise CliError("bad_args", "--node-id cannot be used with --track or --clip. Nothing was sent.")
+            target: dict = {"sequence_id": sequence_id, "node_id": node_id}
+        elif track is None or clip is None:
+            raise CliError("bad_args", "Name the clip with --track and --clip together, or with --node-id. "
+                                       "Nothing was sent.")
+        else:
+            target = {"sequence_id": sequence_id, "track": track, "clip": clip}
+        if sequence_name is not None:
+            target["sequence_name"] = sequence_name
+        client = _client(lease_wait)
+        payload = lut.set_lut(client, live_cli.make_session, target, lut_path, effect_index=effect_index, prove=prove,
+                              time=time, out_dir=out_dir, dry_run=dry_run, project=project, any_project=any_project,
+                              allow_untested=allow_untested, hard_limit_s=timeout, pixels=lut.frame_pixels)
+    except CliError as err:
+        carried = getattr(err, "payload", None)
+        if carried is None:
+            _fail(ctx, err)
+            return
+        _lut_failure(ctx, err, carried)
+        return
+    _emit(ctx, payload, "\n".join(_lut_lines(payload) + _warning_lines(payload["warnings"])))

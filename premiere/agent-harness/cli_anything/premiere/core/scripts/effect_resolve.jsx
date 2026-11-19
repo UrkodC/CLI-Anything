@@ -5,20 +5,22 @@
 //                   effect_index: whole number or null, index: whole number, name: string}],
 //        expect: {project_path, sequence_id, sequence_name} (added by the write session)}
 // Reply: {sequence: {id, name},
-//         entries: [{clip: {node_id, name, track_type, track, clip, start_ticks},
+//         entries: [{clip: {node_id, name, track_type, track, clip, start_ticks, end_ticks (only when readable)},
 //                    effect: {effect_index, name, match_name},
 //                    property: {index, name, value, kind, keyframed}}]}, one record per entry, in order.
 // The first entry that cannot be found makes the whole script fail, so nothing is half resolved: a finder's
 // refusal comes back as "precondition: entry <n>: <the finder's text>" (n counts from 0); a host call that
 // throws comes back as "entry <n>: <the error>". A clip found on an audio track (a node ID can name one) is
 // refused: effect set writes video clips only. value and kind come from __readValue of values.jsx, as in
-// effect_get.jsx. keyframed is prop.isTimeVarying() in its own try, null when it throws.
+// effect_get.jsx. keyframed is prop.isTimeVarying() in its own try, null when it throws. end_ticks (the end of the
+// clip in the sequence, for live lut set --prove) is read as clip_list.jsx reads it; the key is left out when the
+// end cannot be read, so a reader takes a missing key as unreadable.
 //
 // Host calls follow the premiere-pro-mcp server (dist/), through find.jsx and values.jsx:
 // - the project and the sequence: __expect of find.jsx (app.project.path: bridge/script-builder.js, line 3322;
 //   the sequence by ID: lines 554-564);
 // - the clip: __clip of find.jsx (bridge/script-builder.js, lines 1070-1098); clip.nodeId, clip.name and
-//   clip.start.ticks (tools/inspection.js, lines 339-354, the ticks as a string through __ticks);
+//   clip.start.ticks and clip.end.ticks (tools/inspection.js, lines 339-354, the ticks as a string through __ticks);
 // - the effect: __effect of find.jsx (tools/keyframes.js, lines 182-186), component.displayName, .matchName;
 // - the property: __property of find.jsx (bridge/script-builder.js, lines 724-733);
 // - prop.isTimeVarying(): tools/keyframes.js, line 98 (read) and lines 215-218 (the write refusal);
@@ -71,6 +73,8 @@ for (var n = 0; n < ARGS.entries.length; n++) {
       property: {index: entry.index, name: textOf(prop, "displayName"), value: read.value, kind: read.kind,
                  keyframed: keyframed}
     };
+    var endTicks = ticksOf(found.clip, "end");
+    if (endTicks !== null) record.clip.end_ticks = endTicks;
   } catch (e) {
     throw entryError(n, e);
   }

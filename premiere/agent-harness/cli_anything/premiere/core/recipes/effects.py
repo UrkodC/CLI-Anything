@@ -378,7 +378,8 @@ def resolve_entries(session: WriteSession, entries: list[dict]) -> list[dict]:
     """Find the target of every entry in one read (effect_resolve.jsx). session.target() must have been called.
 
     entries are checked plan entries (check_plan). Returns one record per entry, in order:
-    {"entry", "clip": {"node_id", "name", "track_type", "track", "clip", "start_ticks", "start_seconds"}, "effect",
+    {"entry", "clip": {"node_id", "name", "track_type", "track", "clip", "start_ticks", "start_seconds", "end_ticks",
+    "end_seconds"}, "effect",
     "effect_index", "match_name", "index", "name", "value_now", "kind", "keyframed"}, plus the key "sequence"
     ({"id", "name"}) on every record. The first entry that cannot be found raises CliError("precondition",
     "entry <n>: ..."); a reply of the wrong shape raises CliError("bad_reply"). Changes nothing."""
@@ -397,11 +398,12 @@ def resolve_entries(session: WriteSession, entries: list[dict]) -> list[dict]:
     resolved = []
     for number, record in enumerate(found):
         clip, effect, prop = record["clip"], record["effect"], _property(record["property"])
-        start = _tick(clip.get("start_ticks"))
+        start, end = _tick(clip.get("start_ticks")), _tick(clip.get("end_ticks"))   # end: None when not read
         resolved.append({"entry": number,
                          "clip": {"node_id": clip["node_id"], "name": _name(clip.get("name")),
                                   "track_type": clip["track_type"], "track": clip["track"],
-                                  "clip": clip["clip"], "start_ticks": start, "start_seconds": _seconds(start)},
+                                  "clip": clip["clip"], "start_ticks": start, "start_seconds": _seconds(start),
+                                  "end_ticks": end, "end_seconds": _seconds(end)},
                          "effect": _name(effect.get("name")), "effect_index": effect["effect_index"],
                          "match_name": _name(effect.get("match_name")), "index": prop["index"], "name": prop["name"],
                          "value_now": prop["value"], "kind": prop["kind"], "keyframed": prop["keyframed"],

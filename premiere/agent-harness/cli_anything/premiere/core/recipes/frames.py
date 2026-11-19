@@ -12,6 +12,26 @@ the exports through one MCP session, then takes the lease again and puts both ba
 The work runs in two write sessions. Session A: target, read, checks, switches, the confirming state read.
 Then no lease: one MCP session for all frames; its outcome is kept in variables. Session B (always when
 something was switched and not yet put back): the put-back.
+
+A stop by the user (stops.is_stop: Ctrl-C, SIGTERM, SIGHUP, in any shape) ends the run with the code interrupted
+(an error that came first keeps its code) and "stopped": true in the payload. The rules for writes:
+
+- A stop that arrives during a write (a switch write of session A, a put-back write) ends every write of the run:
+  nothing further is written, and left_switched says what is, or may be, still switched. The same holds for a
+  stop at session B's entry or read, and between two put-back writes.
+- A stop anywhere else after a switch (session A between the switches, at its confirming read or as it gives the
+  lease back; the exports; between the sessions): one put-back of what was switched is still tried (leaving proxy
+  display off without a word is worse).
+- A write that ends as unknown_outcome (also one that a stop caused: only its message tells the two apart, and a
+  message is not parsed) keeps its code and "stopped": false, and nothing further is written either.
+- A switch write of session A that was refused before it was sent (effects.NOTHING_SENT_CODES, and interrupted,
+  which the bridge raises for a write only before Premiere picked it up) did not switch anything: it is not put
+  back and not in left_switched.
+
+These rules hold for one stop, wherever it arrives. A second stop that arrives while the first one is being
+handled is caught wherever a write could follow (_put_back, _restore, _export_all). Outside those it can leave
+export_frames as it came: the caller then reports interrupted without a payload. No write follows it and the
+lease is not held.
 """
 from __future__ import annotations
 
@@ -22,8 +42,10 @@ import stat
 import unicodedata
 from pathlib import Path
 
-from cli_anything.premiere.core import bridge, guard, jsx
+from cli_anything.premiere.core import guard, jsx
 from cli_anything.premiere.core.bridge import BridgeClient
+from cli_anything.premiere.core.recipes import effects
+from cli_anything.premiere.core.recipes.stops import STOPPED, as_error, ends_writes, is_stop
 from cli_anything.premiere.core.session import DEFAULT_HARD_LIMIT_S, WriteSession, guarded_state
 from cli_anything.premiere.errors import CliError
 
@@ -34,7 +56,9 @@ TICKS_PER_SECOND = 254016000000
 PROGRAM = "cli-anything-premiere"
 PNG_ALPHA = "A PNG still can carry alpha. Composite it over black before you measure it."
 GUARD_REFUSED = "guard refused"
-STOPPED = "Stopped by Ctrl-C or a stop signal."
+# A write refused with one of these codes was not sent. "interrupted": BridgeClient.send raises it for a write
+# only when Premiere had not picked the command up (after the pickup a stop gives unknown_outcome).
+NOT_SENT_CODES = (*effects.NOTHING_SENT_CODES, "interrupted")
 
 
 def frame_name(prefix: str, seconds: float, fmt: str) -> str:
@@ -200,11 +224,15 @@ def _confirm_active(client: BridgeClient, guards: dict, project_path: str, seque
 def _new_switches() -> dict:
     """What the command switched. *_before: as read at the start. *_now: the last value known (None: unknown).
     *_sent: a switch write was sent. *_reason: why the put-back failed, for the warning line. *_foreign: someone
-    else changed it during the export (session B's read), so it is left as it is."""
+    else changed it during the export (session B's read), so it is left as it is. stopped: a stop by the user
+    was seen. halt: set when no further write may be sent in this run (a stop during a write or in the put-back,
+    or a write whose outcome is unknown); it is the error whose reason goes to each item that is not put back."""
     return {"proxies_before": None, "proxies_now": None, "proxies_during": None, "proxies_sent": False,
             "proxies_reason": None,
             "active_before": None, "active_now": None, "active_during": None, "active_sent": False,
-            "active_reason": None, "target": None, "tried": False, "proxies_foreign": False, "active_foreign": False}
+            "active_reason": None, "target": None, "tried": False, "proxies_foreign": False, "active_foreign": False,
+            "changed_proxies": False, "changed_active": False, "stopped": False, "after_noted": False,
+            "active_unknown": False, "halt": None}
 
 
 def _proxies_left(sw: dict) -> bool:
@@ -225,79 +253,198 @@ def _reason(err: CliError) -> str:
     return f"putting it back failed ({err.code}: {err.message}). When that is fixed"
 
 
+def _halt(session: WriteSession, exc: BaseException) -> CliError:
+    """sw["halt"] after a write that ended every write of the run (stops.ends_writes): the error whose reason
+    goes to each item that is not put back.
+
+    - A stop: interrupted.
+    - An unknown outcome: the bridge wrote a recovery marker with that error, so the reason is the open recovery.
+      When the marker could not be written, the bridge kept the lock instead and the error says so: then the
+      error itself is the reason."""
+    if is_stop(exc):
+        return CliError("interrupted", STOPPED)
+    if session.client.lease().retained:
+        return exc
+    return CliError("recovery_required", "A recovery is open. Run: cli-anything-premiere recovery show")
+
+
+def _switch(session: WriteSession, sw: dict, item: str, send) -> dict:
+    """One switch write of session A: send() is _set_proxies or _activate. The item is marked as sent, with its
+    value unknown, before the send. A failure goes on to the caller, after this note of what it means:
+
+    - a CliError with a code of NOT_SENT_CODES: the write was not sent, so the item was not switched. It is not
+      put back and not in left_switched;
+    - a stop in any shape, or unknown_outcome (stops.ends_writes): no further write is sent in this run
+      (sw["halt"]). A stop as KeyboardInterrupt or bridge.Interrupted does not say whether the write was sent:
+      the item stays marked as sent with its value unknown, so left_switched names it."""
+    sw[f"{item}_sent"], sw[f"{item}_now"] = True, None
+    if item == "active":
+        sw["active_unknown"] = True
+    try:
+        return send()
+    except BaseException as exc:
+        if isinstance(exc, CliError) and exc.code in NOT_SENT_CODES:
+            sw[f"{item}_sent"], sw[f"{item}_now"] = False, sw[f"{item}_before"]
+            if item == "active":
+                sw["active_unknown"] = False
+        if ends_writes(exc):
+            sw["halt"] = _halt(session, exc)
+        raise
+
+
 def _put_back(session: WriteSession, sw: dict) -> None:
     """Put back, in reverse order, each switch that was sent and does not show its old state. Each failure is kept
-    in sw[*_reason]; a failure of one does not stop the other (a recovery marker stops every write by itself,
-    since session.write checks it before each send). An interrupt stops the put-back."""
+    in sw[*_reason]. A failure of one does not stop the other, with two exceptions that end every write:
+
+    - a stop by the user (any shape, during a write or between two writes): sw["stopped"] is set;
+    - a write that ends as unknown_outcome: sw["stopped"] stays as it is.
+
+    Both set sw["halt"]. With sw["halt"] set (also before the call) nothing is written, and every item that is
+    still switched gets the halt's reason. A stop does not leave this function."""
     sw["tried"] = True
-    items = []
-    if _active_left(sw):
-        items.append("active")
-    if _proxies_left(sw):
-        items.append("proxies")
-    stop: CliError | None = None
-    for item in items:
-        if stop is not None:
-            sw[f"{item}_reason"] = _reason(stop)
-            continue
-        try:
-            if item == "active":
-                reply = _activate(session, sw["active_before"]["id"])
-                sw["active_now"] = reply["after"]
-                if _active_left(sw):
-                    sw["active_reason"] = (f"putting it back did not take (Premiere shows {_shown(reply['after'])}"
-                                           + (f": {reply['set_error']}" if reply["set_error"] else "") + ")")
-            else:
-                reply = _set_proxies(session, sw["proxies_before"] == 1)
-                sw["proxies_now"] = reply["after"]
-                if _proxies_left(sw):
-                    sw["proxies_reason"] = (f"putting it back did not take (it reads {reply['after']}"
-                                            + (f": {reply['set_error']}" if reply["set_error"] else "") + ")")
-        except CliError as err:
-            sw[f"{item}_reason"] = _reason(err)
-        except RuntimeError as err:            # the write session closed (a retained lock, a failed guard)
-            sw[f"{item}_reason"] = _reason(CliError("session_closed", str(err)))
-        except (KeyboardInterrupt, bridge.Interrupted):
-            stop = CliError("interrupted", STOPPED)
-            sw[f"{item}_reason"] = _reason(stop)
-
-
-def _restore(client: BridgeClient, guards: dict, project_path: str, sw: dict, warnings: list) -> None:
-    """Session B: a new write session for the put-back. When it cannot start (a recovery marker, the lease,
-    another project), nothing is written and the reason goes to every switch that is left."""
-    if sw["tried"] or not (_active_left(sw) or _proxies_left(sw)):
-        return
     try:
+        items = []
+        if _active_left(sw):
+            items.append("active")
+        if _proxies_left(sw):
+            items.append("proxies")
+        for item in items:
+            if sw["halt"] is not None:
+                break
+            try:
+                if item == "active":
+                    reply = _activate(session, sw["active_before"]["id"])
+                    sw["active_now"] = reply["after"]
+                    if _active_left(sw):
+                        sw["active_reason"] = (f"putting it back did not take (Premiere shows "
+                                               f"{_shown(reply['after'])}"
+                                               + (f": {reply['set_error']}" if reply["set_error"] else "") + ")")
+                else:
+                    reply = _set_proxies(session, sw["proxies_before"] == 1)
+                    sw["proxies_now"] = reply["after"]
+                    if _proxies_left(sw):
+                        sw["proxies_reason"] = (f"putting it back did not take (it reads {reply['after']}"
+                                                + (f": {reply['set_error']}" if reply["set_error"] else "") + ")")
+            except RuntimeError as err:        # the write session closed (a retained lock, a failed guard)
+                sw[f"{item}_reason"] = _reason(CliError("session_closed", str(err)))
+            except BaseException as exc:
+                if not (isinstance(exc, CliError) or is_stop(exc)):
+                    raise
+                sw[f"{item}_reason"] = _reason(as_error(exc))
+                if is_stop(exc):
+                    sw["stopped"] = True
+                if ends_writes(exc):
+                    sw["halt"] = _halt(session, exc)
+        if sw["halt"] is not None:
+            _fail_all(sw, sw["halt"])
+    except BaseException as exc:               # a stop between two writes
+        if not is_stop(exc):
+            raise
+        sw["stopped"] = True
+        sw["halt"] = CliError("interrupted", STOPPED)
+        _fail_all(sw, sw["halt"])
+
+
+def _restore(client: BridgeClient, guards: dict, project_path: str, sw: dict, warnings: list, *,
+             read_after: bool = False) -> None:
+    """Session B: a new write session for the put-back. When it cannot start (a recovery marker, the lease,
+    another project), nothing is written and the reason goes to every switch that is left.
+
+    read_after (every export ran without an error): session B always opens, also when nothing is left to put back,
+    and reads the app once (_check_after). When the read cannot be done, a warning says why (_note_unread).
+
+    With sw["halt"] set, no session opens: nothing may be written any more.
+
+    A stop anywhere in here (the lease wait, the guard, the read, the put-back, giving the lease back) sets
+    sw["stopped"] and ends the put-back: nothing further is written. A stop does not leave this function."""
+    opened = False
+    try:
+        if sw["halt"] is not None:
+            _fail_all(sw, sw["halt"])
+            return
+        if not read_after and (sw["tried"] or not (_active_left(sw) or _proxies_left(sw))):
+            return
+        opened = True
         with WriteSession(client, **guards) as session:
             warnings += [w for w in session.warnings if w not in warnings]
             if session.expect["project_path"] != project_path:
                 raise CliError("project_mismatch", f"the active project changed from {project_path} to "
                                                    f"{session.expect['project_path']} during the export")
-            _check_owner(session, sw, warnings)
-            _put_back(session, sw)
-    except CliError as err:
+            _check_after(session, sw, warnings)
+            if not sw["tried"] and (_active_left(sw) or _proxies_left(sw)):
+                _put_back(session, sw)
+    except BaseException as exc:
+        if is_stop(exc):
+            sw["stopped"] = True
+        elif not isinstance(exc, CliError):
+            raise
+        err = as_error(exc)
+        if opened or read_after:
+            _note_unread(sw, err, warnings)
         _fail_all(sw, err)
-    except (KeyboardInterrupt, bridge.Interrupted):
-        _fail_all(sw, CliError("interrupted", STOPPED))
 
 
-def _check_owner(session: WriteSession, sw: dict, warnings: list) -> None:
-    """Session B reads the app once before it writes. An item is put back only when it still holds the value this
-    command set (proxies off, the target active). An item someone else changed is left as it is, with a warning;
-    it is not in left_switched. When the read fails, both items count as still ours."""
+def _note_unread(sw: dict, err: CliError, warnings: list) -> None:
+    """One warning line when the read after the exports could not be done (once per run)."""
+    if sw["after_noted"]:
+        return
+    sw["after_noted"] = True
+    if err.code == "recovery_required":
+        warnings.append("A recovery is open, so the state after the export was not read. Run: "
+                        "cli-anything-premiere recovery show")
+    else:
+        warnings.append(f"The state after the export could not be read ({err.code}: {err.message}).")
+
+
+STILL_VALID = "The server checked the sequence for each frame, so the frames stay valid."
+
+
+def _proxy_text(value) -> str:
+    return {1: "on", 0: "off"}.get(value, str(value))
+
+
+def _check_after(session: WriteSession, sw: dict, warnings: list) -> None:
+    """Session B reads the app once, before any write, and compares both items with what they were at the end of
+    session A (what the exports ran under). A difference sets changed_proxies / changed_active, whoever switched the
+    item at the start; an unreadable value leaves it None (unknown).
+
+    An item this command switched is put back only when it still holds the value this command set; one someone else
+    changed is left as it is, with a warning, and is not in left_switched. An item this command did not switch and
+    someone else changed gets a warning and is not touched. When the read fails, both items count as still ours (the
+    put-back runs as before) and both changes stay unknown. A stop during the read is raised (in any shape: the
+    other two are not a CliError and pass by themselves): the put-back stops, and left_switched records what is
+    still switched."""
     try:
         info = _read_app(session, None)
-    except CliError:
+    except CliError as err:
+        if is_stop(err):
+            raise
+        _note_unread(sw, err, warnings)
         return
-    target = sw["target"]
-    if _proxies_left(sw) and info["proxies"] is not None and info["proxies"] != 0:
-        sw["proxies_foreign"], sw["proxies_now"] = True, info["proxies"]
-        warnings.append(f"Proxy display reads {'on' if info['proxies'] == 1 else info['proxies']} now: it was "
-                        "changed during the export by someone else, so this command did not put it back.")
-    if _active_left(sw) and _id(info["active_sequence"]) != _id(target):
-        sw["active_foreign"], sw["active_now"] = True, info["active_sequence"]
-        warnings.append(f"The active sequence is {_shown(info['active_sequence'])} now: it was changed during the "
-                        "export by someone else, so this command did not put it back.")
+    sw["after_noted"] = True
+    proxies, active = info["proxies"], info["active_sequence"]
+    if proxies is None or sw["proxies_during"] is None:
+        sw["changed_proxies"] = None
+    else:
+        sw["changed_proxies"] = proxies != sw["proxies_during"]
+    sw["changed_active"] = _id(active) != _id(sw["active_during"])
+    if sw["changed_proxies"]:
+        if _proxies_left(sw):
+            sw["proxies_foreign"] = True
+            warnings.append(f"Proxy display reads {_proxy_text(proxies)} now: it was changed during the export by "
+                            "someone else, so this command did not put it back.")
+        else:
+            warnings.append(f"Someone changed proxy display during the export. It now holds {_proxy_text(proxies)}.")
+        sw["proxies_now"] = proxies
+    if sw["changed_active"]:
+        if _active_left(sw):
+            sw["active_foreign"] = True
+            warnings.append(f"The active sequence is {_shown(active)} now: it was changed during the export by "
+                            f"someone else, so this command did not put it back. {STILL_VALID}")
+        else:
+            warnings.append(f"Someone changed the active sequence during the export. It now holds {_shown(active)}. "
+                            f"{STILL_VALID}")
+        sw["active_now"] = active
 
 
 def _fail_all(sw: dict, err: CliError) -> None:
@@ -392,11 +539,15 @@ def _frame_fault(reply: dict, path: Path, before) -> tuple[str | None, int]:
 
 
 def _export_all(client: BridgeClient, make_session, times: list[float], paths: list[Path], sequence_id: str,
-                project_path: str, timeout_s: float, frames: list) -> CliError | None:
-    """One MCP session, one export_frame call per time. Called without the lease. Never raises: the first
-    failure is returned (export_failed, or the session's own code: mcp_missing, mcp_timeout, mcp_died,
-    mcp_error, lease_busy, interrupted)."""
+                project_path: str, timeout_s: float, frames: list) -> tuple[CliError | None, bool]:
+    """One MCP session, one export_frame call per time. Called without the lease. Returns (the first failure or
+    None, stopped). The failure is export_failed, or the session's own code: mcp_missing, mcp_timeout, mcp_died,
+    mcp_error, lease_busy, interrupted. stopped: a stop by the user was seen, in any shape and at any place (the
+    start of the session, a call, between two calls, the close of the session). The failure is then interrupted,
+    unless an export had failed before the stop: that failure keeps its place. A stop does not leave this
+    function."""
     total = len(times)
+    error: CliError | None = None
     try:
         with make_session(client) as mcp:
             for number, (seconds, path) in enumerate(zip(times, paths), 1):
@@ -408,19 +559,25 @@ def _export_all(client: BridgeClient, make_session, times: list[float], paths: l
                 try:
                     reply = mcp.call("export_frame", arguments, timeout_s=timeout_s)
                 except CliError as err:
-                    return CliError(err.code, f"{where}: {err.message}")
+                    error = CliError(err.code, f"{where}: {err.message}")
+                    break
                 fault, size = _frame_fault(reply, path, before)
                 if fault is not None:
-                    return CliError("export_failed", f"{where}: {fault}")
+                    error = CliError("export_failed", f"{where}: {fault}")
+                    break
                 frames.append({"time_seconds": seconds, "path": str(path), "bytes": size})
-    except CliError as err:                     # the session did not start, or did not close
-        return err
-    except (KeyboardInterrupt, bridge.Interrupted):
-        return CliError("interrupted", f"{STOPPED} The export that was running may have finished: check Premiere "
-                                       "before another edit.")
-    except Exception as exc:                    # a fault of this program: still put back what was switched
-        return CliError("export_failed", f"Unexpected error during the export: {exc!r}")
-    return None
+    except BaseException as exc:
+        if is_stop(exc):
+            stop = as_error(exc, f"{STOPPED} The export that was running may have finished: check Premiere before "
+                                 "another edit.")
+            return error or stop, True
+        if isinstance(exc, CliError):           # the session did not start, or did not close
+            return exc, False
+        if not isinstance(exc, Exception):
+            raise
+        # A fault of this program: still put back what was switched.
+        return CliError("export_failed", f"Unexpected error during the export: {exc!r}"), False
+    return error, is_stop(error)
 
 
 # ---------- the whole command ----------
@@ -433,12 +590,19 @@ def export_frames(client: BridgeClient, make_session, *, sequence_id, sequence_n
     the scripts of the write sessions wait at most DEFAULT_HARD_LIMIT_S (or hard_limit_s when that is lower).
 
     Returns {"sequence", "frames", "exported", "total", "proxies": {"before", "during", "after"},
-    "active_sequence": {"before", "after"}, "left_switched", "stored": None, "rendered": None, "warnings"}; with
+    "active_sequence": {"before", "after"}, "left_switched", "changed_by_others": {"proxies", "active_sequence"}
+    (session B's read after the exports differs from the state the exports ran under: True or False; None when that
+    read did not happen or the value was unreadable; False when no export ran), "stopped" (a stop by the user was
+    seen: such a run always raises, with the code interrupted unless another error came first), "stored": None,
+    "rendered": None, "warnings"}; with
     dry_run {"dry_run": True, "sequence", "planned", "total", "out_dir": {"path", "exists"},
     "proxies": {"before", "switch"},
     "active_sequence": {"before", "switch"}, "warnings"}. A CliError raised after the checks of the arguments
     carries `payload` (the same keys as the return). When every frame was written but a switch could not be put
     back, the error is not_restored.
+
+    A stop by the user never leaves this function in another shape than CliError("interrupted") with the payload
+    (the module docstring has the rules for the writes after a stop).
     """
     _check_options(sequence_id, prefix, fmt, proxies)
     times = _check_times(times)
@@ -453,115 +617,160 @@ def export_frames(client: BridgeClient, make_session, *, sequence_id, sequence_n
     sw = _new_switches()
     frames: list[dict] = []
     warnings: list[str] = []
-    sequence = {"id": sequence_id, "name": sequence_name}
-    project_path = None
-    error: CliError | None = None
+    # What the three steps leave for the end: the sequence as read, the project of session A, the first error,
+    # and whether every export ran without one.
+    run = {"sequence": {"id": sequence_id, "name": sequence_name}, "project_path": None, "error": None,
+           "exported": False}
 
-    def payload() -> dict:
+    def finish() -> tuple[dict, CliError | None]:
+        """(the payload, the error or None) from what is known now. It changes nothing, so it can run again
+        after a stop."""
+        sequence = run["sequence"]
         left, lines = _left_switched(sw, guards)
-        return {"sequence": sequence, "frames": frames, "exported": len(frames), "total": len(times),
-                "proxies": {"before": _flag(sw["proxies_before"]), "during": _flag(sw["proxies_during"]),
-                            "after": _flag(sw["proxies_now"])},
-                "active_sequence": {"before": _id(sw["active_before"]), "after": _id(sw["active_now"])},
-                "left_switched": left, "stored": None, "rendered": None, "warnings": warnings + lines}
+        notes = warnings + ([PNG_ALPHA] if fmt == "png" and frames else []) + lines
+        if sw["active_sent"] and sw["active_before"] is None:
+            if _id(sw["active_now"]) == sequence["id"]:
+                notes.append(f"No sequence was active before the export, so {_shown(sequence)} stays active.")
+            elif sw["active_unknown"]:
+                notes.append(f"The active sequence may have been switched to {_shown(sequence)}: the outcome of "
+                             "that write is unknown. No sequence was active before, so there is nothing to put "
+                             "back.")
+        result = {"sequence": sequence, "frames": frames, "exported": len(frames), "total": len(times),
+                  "proxies": {"before": _flag(sw["proxies_before"]), "during": _flag(sw["proxies_during"]),
+                              "after": _flag(sw["proxies_now"])},
+                  "active_sequence": {"before": _id(sw["active_before"]), "after": _id(sw["active_now"])},
+                  "left_switched": left,
+                  "changed_by_others": {"proxies": sw["changed_proxies"], "active_sequence": sw["changed_active"]},
+                  "stopped": sw["stopped"], "stored": None, "rendered": None, "warnings": notes}
+        error = run["error"]
+        if error is None and sw["stopped"]:
+            if run["exported"]:
+                error = CliError("interrupted", f"{STOPPED} Every frame was exported ({len(frames)} of "
+                                                f"{len(times)}), but the run was stopped after the export. Check "
+                                                "Premiere before another edit.")
+            else:
+                error = CliError("interrupted", f"{STOPPED} Check Premiere before another edit.")
+        if error is None and left is not None:
+            error = CliError("not_restored", f"Every frame was exported ({len(frames)} of {len(times)}), but not "
+                                             "everything that was switched could be put back. The warnings say how to "
+                                             "do it.")
+        return result, error
 
-    # Session A: read, check, switch, confirm.
+    def sessions() -> dict | None:
+        """Session A, the exports, session B. Returns the dry-run payload, or None: the outcome is then in sw,
+        frames, warnings and run. A stop inside a step is handled there. A stop between two steps leaves this
+        function as it came; the caller handles it."""
+        # Session A: read, check, switch, confirm.
+        try:
+            with WriteSession(client, **guards) as session:
+                warnings.extend(session.warnings)
+                session.target(sequence_id, sequence_name)
+                info = _read_app(session, sequence_id)
+                sequence = run["sequence"] = {"id": info["sequence"]["id"], "name": info["sequence"]["name"]}
+                sw["target"] = dict(sequence)
+                sw["proxies_before"] = sw["proxies_now"] = sw["proxies_during"] = info["proxies"]
+                sw["active_before"] = sw["active_now"] = sw["active_during"] = info["active_sequence"]
+                end = info["sequence"]["end_ticks"]
+                if end is None:
+                    raise CliError("bad_state", f"The end of sequence {_shown(sequence)} cannot be read, so the "
+                                                "times cannot be checked. Nothing was switched.")
+                for seconds in times:
+                    if round(seconds * TICKS_PER_SECOND) >= int(end):
+                        raise CliError("bad_time", f"The time {seconds:g} s is at or after the end of sequence "
+                                                   f"{_shown(sequence)}, which ends at "
+                                                   f"{int(end) / TICKS_PER_SECOND:g} s. Nothing was switched.")
+                switch_proxies = proxies == "off" and info["proxies"] == 1
+                switch_active = _id(info["active_sequence"]) != sequence_id
+                if proxies == "off" and info["proxies"] is None:
+                    raise CliError("not_switched", "The proxy display cannot be read, so it cannot be switched off "
+                                                   "and put back. Use --proxies keep to export with the display as "
+                                                   "it is. Nothing was switched.")
+                if dry_run:
+                    planned = [{"time_seconds": s, "path": str(p)} for s, p in zip(times, paths)]
+                    return {"dry_run": True, "sequence": sequence, "planned": planned, "total": len(times),
+                            "out_dir": {"path": str(folder), "exists": folder_existed},
+                            "proxies": {"before": _flag(info["proxies"]), "switch": switch_proxies},
+                            "active_sequence": {"before": _id(info["active_sequence"]), "switch": switch_active},
+                            "warnings": warnings + ([PNG_ALPHA] if fmt == "png" else [])}
+                try:
+                    if switch_proxies:
+                        reply = _switch(session, sw, "proxies", lambda: _set_proxies(session, False))
+                        sw["proxies_now"] = reply["after"]
+                        if reply["after"] != 0:
+                            raise CliError("not_switched", f"The proxy display did not switch off: it reads "
+                                                           f"{reply['after']} after the write"
+                                           + (f" ({reply['set_error']})" if reply["set_error"] else "")
+                                           + ". Nothing was exported.")
+                    if switch_active:
+                        reply = _switch(session, sw, "active", lambda: _activate(session, sequence_id))
+                        sw["active_unknown"] = False
+                        sw["active_now"] = reply["after"]
+                        if _id(reply["after"]) != sequence_id:
+                            raise CliError("not_switched", f"Sequence {_shown(sequence)} did not become active: "
+                                                           f"Premiere shows {_shown(reply['after'])} after the write"
+                                           + (f" ({reply['set_error']})" if reply["set_error"] else "")
+                                           + ". Nothing was exported.")
+                    # The last state read before the export: nothing comes between it and the MCP session except
+                    # giving the lease back.
+                    run["project_path"] = session.expect["project_path"]
+                    state, more = _confirm_active(client, guards, run["project_path"], sequence_id)
+                    warnings.extend(w for w in more if w not in warnings)
+                    shown = state.get("active_sequence")
+                    if switch_active:
+                        sw["active_now"] = shown if isinstance(shown, dict) else None
+                    if _id(shown) != sequence_id:
+                        raise CliError("not_switched", f"Premiere's state shows {_shown(shown)} as the active "
+                                                       f"sequence, not {_shown(sequence)}. Nothing was exported.")
+                    sw["proxies_during"], sw["active_during"] = sw["proxies_now"], sw["active_now"]
+                except BaseException as exc:
+                    # Any failure after the first switch, a stop too: one put-back in this session. It writes
+                    # nothing when a write ended every write of the run (sw["halt"]: a stop during a switch
+                    # write, or an unknown outcome).
+                    _put_back(session, sw)
+                    if isinstance(exc, CliError) or is_stop(exc) or not isinstance(exc, Exception):
+                        raise
+                    # A fault of this program: reported with the payload. (SIGTERM and SIGHUP arrive as
+                    # bridge.Interrupted, which is an Exception: is_stop keeps them out of here.)
+                    raise CliError("recipe_error", f"{type(exc).__name__}: {exc}") from exc
+        except BaseException as exc:
+            if isinstance(exc, CliError):
+                run["error"] = exc
+            elif is_stop(exc):
+                run["error"] = CliError("interrupted", f"{STOPPED} Check Premiere before another edit.")
+            else:
+                raise
+        if is_stop(run["error"]):
+            sw["stopped"] = True
+
+        # No lease: the exports.
+        if run["error"] is None:
+            sw["changed_proxies"] = sw["changed_active"] = None          # unknown until the read after
+            run["error"], stopped = _export_all(client, make_session, times, paths, run["sequence"]["id"],
+                                                run["project_path"], hard_limit_s, frames)
+            run["exported"] = run["error"] is None
+            if stopped:
+                sw["stopped"] = True
+
+        # Session B: the read after, when every export ran without an error, then the put-back of what is still
+        # switched. After a stop or a failed export, session B runs only when something is left to put back.
+        _restore(client, guards, run["project_path"], sw, warnings, read_after=run["exported"])
+        return None
+
+    outcome = None
     try:
-        with WriteSession(client, **guards) as session:
-            warnings += session.warnings
-            session.target(sequence_id, sequence_name)
-            info = _read_app(session, sequence_id)
-            sequence = {"id": info["sequence"]["id"], "name": info["sequence"]["name"]}
-            sw["target"] = dict(sequence)
-            sw["proxies_before"] = sw["proxies_now"] = sw["proxies_during"] = info["proxies"]
-            sw["active_before"] = sw["active_now"] = sw["active_during"] = info["active_sequence"]
-            end = info["sequence"]["end_ticks"]
-            if end is None:
-                raise CliError("bad_state", f"The end of sequence {_shown(sequence)} cannot be read, so the times "
-                                            "cannot be checked. Nothing was switched.")
-            for seconds in times:
-                if round(seconds * TICKS_PER_SECOND) >= int(end):
-                    raise CliError("bad_time", f"The time {seconds:g} s is at or after the end of sequence "
-                                               f"{_shown(sequence)}, which ends at {int(end) / TICKS_PER_SECOND:g} s. "
-                                               "Nothing was switched.")
-            switch_proxies = proxies == "off" and info["proxies"] == 1
-            switch_active = _id(info["active_sequence"]) != sequence_id
-            if proxies == "off" and info["proxies"] is None:
-                raise CliError("not_switched", "The proxy display cannot be read, so it cannot be switched off and "
-                                               "put back. Use --proxies keep to export with the display as it is. "
-                                               "Nothing was switched.")
-            if dry_run:
-                planned = [{"time_seconds": s, "path": str(p)} for s, p in zip(times, paths)]
-                return {"dry_run": True, "sequence": sequence, "planned": planned, "total": len(times),
-                        "out_dir": {"path": str(folder), "exists": folder_existed},
-                        "proxies": {"before": _flag(info["proxies"]), "switch": switch_proxies},
-                        "active_sequence": {"before": _id(info["active_sequence"]), "switch": switch_active},
-                        "warnings": warnings + ([PNG_ALPHA] if fmt == "png" else [])}
-            try:
-                if switch_proxies:
-                    sw["proxies_sent"], sw["proxies_now"] = True, None
-                    reply = _set_proxies(session, False)
-                    sw["proxies_now"] = reply["after"]
-                    if reply["after"] != 0:
-                        raise CliError("not_switched", f"The proxy display did not switch off: it reads "
-                                                       f"{reply['after']} after the write"
-                                       + (f" ({reply['set_error']})" if reply["set_error"] else "")
-                                       + ". Nothing was exported.")
-                if switch_active:
-                    sw["active_sent"], sw["active_now"] = True, None
-                    reply = _activate(session, sequence_id)
-                    sw["active_now"] = reply["after"]
-                    if _id(reply["after"]) != sequence_id:
-                        raise CliError("not_switched", f"Sequence {_shown(sequence)} did not become active: Premiere "
-                                                       f"shows {_shown(reply['after'])} after the write"
-                                       + (f" ({reply['set_error']})" if reply["set_error"] else "")
-                                       + ". Nothing was exported.")
-                # The last state read before the export: nothing comes between it and the MCP session except
-                # giving the lease back.
-                project_path = session.expect["project_path"]
-                state, more = _confirm_active(client, guards, project_path, sequence_id)
-                warnings += [w for w in more if w not in warnings]
-                shown = state.get("active_sequence")
-                if switch_active:
-                    sw["active_now"] = shown if isinstance(shown, dict) else None
-                if _id(shown) != sequence_id:
-                    raise CliError("not_switched", f"Premiere's state shows {_shown(shown)} as the active sequence, "
-                                                   f"not {_shown(sequence)}. Nothing was exported.")
-                sw["proxies_during"], sw["active_during"] = sw["proxies_now"], sw["active_now"]
-            except CliError:
-                _put_back(session, sw)
-                raise
-            except Exception as exc:            # a fault of this program: put back, then report it with the payload
-                _put_back(session, sw)
-                raise CliError("recipe_error", f"{type(exc).__name__}: {exc}") from exc
-            except BaseException:               # interrupts keep their own path
-                _put_back(session, sw)
-                raise
-    except CliError as err:
-        error = err
-    except (KeyboardInterrupt, bridge.Interrupted):
-        error = CliError("interrupted", f"{STOPPED} Check Premiere before another edit.")
-
-    # No lease: the exports.
-    if error is None:
-        error = _export_all(client, make_session, times, paths, sequence["id"], project_path, hard_limit_s, frames)
-
-    # Session B: the put-back (when something is still switched and the put-back was not tried in session A).
-    _restore(client, guards, project_path, sw, warnings)
-    if fmt == "png" and frames:
-        warnings.append(PNG_ALPHA)
-    result = payload()
-    if sw["active_sent"] and sw["active_before"] is None:
-        if _id(sw["active_now"]) == sequence["id"]:
-            result["warnings"].append(f"No sequence was active before the export, so {_shown(sequence)} stays active.")
-        elif sw["active_now"] is None:
-            result["warnings"].append(f"The active sequence may have been switched to {_shown(sequence)}: the outcome "
-                                      "of that write is unknown. No sequence was active before, so there is nothing "
-                                      "to put back.")
-    if error is None and result["left_switched"] is not None:
-        error = CliError("not_restored", f"Every frame was exported ({len(frames)} of {len(times)}), but not "
-                                         "everything that was switched could be put back. The warnings say how to "
-                                         "do it.")
+        dry = sessions()
+        outcome = (dry, None) if dry is not None else finish()
+    except BaseException as exc:
+        if not is_stop(exc):
+            raise
+    if outcome is None:
+        # A stop that no step handled: it came between two steps, or after the last one. It takes the path of a
+        # stop during the exports: one put-back when something is still switched and none was tried (_restore
+        # does nothing otherwise, and handles a further stop itself), then the same end.
+        sw["stopped"] = True
+        _restore(client, guards, run["project_path"], sw, warnings)
+        outcome = finish()
+    result, error = outcome
     if error is not None:
         error.payload = result
         raise error

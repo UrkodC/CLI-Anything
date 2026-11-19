@@ -204,7 +204,9 @@ def test_frames_are_exported_and_checked(live, bridge_dir, capsys, tmp_path):  #
     assert code == 0, out
     assert out.pop("ok") is True
     assert list(out) == ["sequence", "frames", "exported", "total", "proxies", "active_sequence", "left_switched",
-                         "stored", "rendered", "warnings"]
+                         "changed_by_others", "stopped", "stored", "rendered", "warnings"]
+    assert out["stopped"] is False
+    assert out["changed_by_others"] == {"proxies": False, "active_sequence": False}
     names = ["frame_00001000ms.png", "frame_00002500ms.png", "frame_00004000ms.png"]
     assert [Path(f["path"]).name for f in out["frames"]] == names
     for frame, seconds in zip(out["frames"], (1.0, 2.5, 4.0)):
@@ -1253,3 +1255,857 @@ def test_recipe_program_fault_in_session_a_puts_back_and_carries_the_payload(rec
     assert model.writes == [("proxies", 0), ("activate", "s1"), ("activate", "o1"), ("proxies", 1)]
     assert err.payload["left_switched"] is None and err.payload["frames"] == [] and sessions == []
     assert lease_free(recipe)
+
+
+# ---------- fixes taken with Task 8 ----------
+def test_recipe_sigterm_in_session_a_after_the_switches_takes_the_interrupt_path(recipe, tmp_path, monkeypatch):
+    """A SIGTERM or SIGHUP arrives as bridge.Interrupted, which is an Exception: it must not be reported as a
+    program fault. Session A puts both switches back and the code is interrupted."""
+    model = AppModel(proxies=1, active="o1")
+
+    def stop(*args, **kwargs):
+        raise bridge.Interrupted()
+    monkeypatch.setattr(frames, "guarded_state", stop)      # only the confirming read uses this name
+    err, sessions = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == "interrupted"
+    assert model.writes == [("proxies", 0), ("activate", "s1"), ("activate", "o1"), ("proxies", 1)]
+    assert err.payload["left_switched"] is None and err.payload["frames"] == []
+    assert sessions == [] and lease_free(recipe)
+
+
+def test_recipe_interrupt_during_the_read_of_session_b_stops_the_put_back(recipe, tmp_path, monkeypatch):
+    """Ctrl-C while session B reads the app arrives as CliError("interrupted"). It must not count as an
+    unreadable state: nothing more is written, and left_switched says what is still switched."""
+    model = AppModel(proxies=1, active="o1")
+    original = frames._read_app
+
+    def read(session, sequence_id):
+        if sequence_id is None:                 # session B's read
+            raise CliError("interrupted", "Stopped while Premiere ran a read-only script.")
+        return original(session, sequence_id)
+    monkeypatch.setattr(frames, "_read_app", read)
+    result, _ = run_recipe(recipe, model, tmp_path)
+    assert isinstance(result, CliError) and result.code == "interrupted"      # round 3: an interrupt in B wins
+    assert result.payload["stopped"] is True
+    assert model.writes == [("proxies", 0), ("activate", "s1")]
+    assert result.payload["left_switched"] == {"proxies": False, "active_sequence": {"id": "s1", "name": "Main"}}
+    lines = [w for w in result.payload["warnings"] if "cli-anything-premiere live app" in w]
+    assert len(lines) == 2 and all("interrupted" in line for line in lines)
+    assert lease_free(recipe)
+
+
+def test_recipe_changes_by_others_are_a_field_of_the_payload(recipe, tmp_path):
+    """Q18: a change by someone else during the export is a field, not only a warning text."""
+    model = AppModel(proxies=1, active="o1")
+    model.sequences["t3"] = {"name": "Third", "end_ticks": str(60 * TPS)}
+
+    def someone_else():
+        model.active, model.proxies = "t3", 1
+    result, _ = run_recipe(recipe, model, tmp_path, on_exit=someone_else)
+    assert isinstance(result, dict), result
+    assert result["changed_by_others"] == {"proxies": True, "active_sequence": True}
+
+    def only_proxies():
+        model.proxies = 1
+    model2 = AppModel(proxies=1, active="o1")
+    model = model2
+    result, _ = run_recipe(recipe, model2, tmp_path / "second", on_exit=only_proxies)
+    assert result["changed_by_others"] == {"proxies": True, "active_sequence": False}
+
+
+# ---------- fix round 2 (Q21): the read after the exports, also when nothing was switched ----------
+STILL_VALID = "The server checked the sequence for each frame, so the frames stay valid."
+
+
+def _third(model):
+    model.sequences["t3"] = {"name": "Third", "end_ticks": str(60 * TPS)}
+
+
+def test_recipe_nothing_switched_and_someone_turns_proxies_on(recipe, tmp_path):
+    model = AppModel(proxies=0, active="s1")
+
+    def someone_else():
+        model.proxies = 1
+    result, _ = run_recipe(recipe, model, tmp_path, on_exit=someone_else)
+    assert isinstance(result, dict), result
+    assert result["changed_by_others"] == {"proxies": True, "active_sequence": False}
+    assert "Someone changed proxy display during the export. It now holds on." in result["warnings"]
+    assert model.writes == [] and model.reads == 2 and result["left_switched"] is None
+    assert result["proxies"] == {"before": False, "during": False, "after": True}
+
+
+def test_recipe_nothing_switched_and_someone_activates_another_sequence(recipe, tmp_path):
+    model = AppModel(proxies=0, active="s1")
+    _third(model)
+
+    def someone_else():
+        model.active = "t3"
+    result, _ = run_recipe(recipe, model, tmp_path, on_exit=someone_else)
+    assert isinstance(result, dict), result
+    assert result["changed_by_others"] == {"proxies": False, "active_sequence": True}
+    assert (f"Someone changed the active sequence during the export. It now holds Third (t3). {STILL_VALID}"
+            in result["warnings"])
+    assert model.writes == [] and result["active_sequence"] == {"before": "s1", "after": "t3"}
+
+
+def test_recipe_only_proxies_switched_and_someone_activates_another_sequence(recipe, tmp_path):
+    model = AppModel(proxies=1, active="s1")
+    _third(model)
+
+    def someone_else():
+        model.active = "t3"
+    result, _ = run_recipe(recipe, model, tmp_path, on_exit=someone_else)
+    assert isinstance(result, dict), result
+    assert result["changed_by_others"] == {"proxies": False, "active_sequence": True}
+    assert model.writes == [("proxies", 0), ("proxies", 1)]          # the put-back rules are unchanged
+    assert any(w.startswith("Someone changed the active sequence") for w in result["warnings"])
+    assert result["left_switched"] is None
+
+
+def test_recipe_nothing_switched_and_nothing_changed(recipe, tmp_path):
+    model = AppModel(proxies=0, active="s1")
+    result, _ = run_recipe(recipe, model, tmp_path)
+    assert isinstance(result, dict), result
+    assert result["changed_by_others"] == {"proxies": False, "active_sequence": False}
+    assert not any("Someone changed" in w or "someone else" in w for w in result["warnings"])
+    assert model.reads == 2 and model.writes == []                 # one read in session A, one in session B
+
+
+def test_recipe_switched_item_changed_by_others_warns_that_frames_stay_valid(recipe, tmp_path):
+    model = AppModel(proxies=1, active="o1")
+    _third(model)
+
+    def someone_else():
+        model.active = "t3"
+    result, _ = run_recipe(recipe, model, tmp_path, on_exit=someone_else)
+    assert any("The active sequence is Third (t3) now" in w and STILL_VALID in w for w in result["warnings"])
+
+
+@pytest.mark.parametrize("proxies, active", [(1, "o1"), (0, "s1")])
+def test_recipe_session_b_blocked_by_a_marker_leaves_changes_unknown(recipe, tmp_path, proxies, active):
+    model = AppModel(proxies=proxies, active=active)
+
+    def marker():
+        (recipe / MARKER_FILE).write_text('{"version":1,"reason":"unknown_command_outcome","nonce":"x"}')
+    result, _ = run_recipe(recipe, model, tmp_path, on_exit=marker)
+    payload = result.payload if isinstance(result, CliError) else result
+    assert payload["changed_by_others"] == {"proxies": None, "active_sequence": None}
+    if proxies == 1:                                              # switched: the put-back rules as before
+        assert isinstance(result, CliError) and result.code == "not_restored"
+        assert payload["left_switched"] == {"proxies": False, "active_sequence": {"id": "s1", "name": "Main"}}
+        assert model.writes == [("proxies", 0), ("activate", "s1")]
+    else:                                                          # nothing switched: the export still succeeds
+        assert isinstance(result, dict) and model.writes == [] and payload["left_switched"] is None
+    assert lease_free(recipe)
+
+
+def test_recipe_dry_run_and_refusals_do_not_read_after(recipe, tmp_path):
+    model = AppModel(proxies=0, active="s1")
+    result, _ = run_recipe(recipe, model, tmp_path, dry_run=True)
+    assert result["dry_run"] is True and model.reads == 1
+    model = AppModel(proxies=0, active="s1")
+    err, _ = run_recipe(recipe, model, tmp_path, times=(9.0,))     # after the end of s1 (8.008 s)
+    assert err.code == "bad_time" and model.reads == 1
+
+
+# ---------- fix round 3: an interrupt in session B, and the read after ----------
+def _stop_session_b(monkeypatch, at: int = 2):
+    """Ctrl-C at the entry of the at-th WriteSession of export_frames (1 is session A, 2 session B)."""
+    from cli_anything.premiere.core.session import WriteSession
+    seen = []
+
+    class Stopping(WriteSession):
+        def __enter__(self):
+            seen.append(1)
+            if len(seen) == at:
+                raise KeyboardInterrupt
+            return super().__enter__()
+    monkeypatch.setattr(frames, "WriteSession", Stopping)
+
+
+def _stop_read_after(monkeypatch):
+    original = frames._read_app
+
+    def read(session, sequence_id):
+        if sequence_id is None:
+            raise CliError("interrupted", "Stopped while Premiere ran a read-only script.")
+        return original(session, sequence_id)
+    monkeypatch.setattr(frames, "_read_app", read)
+
+
+@pytest.mark.parametrize("where", ["entry", "read"])
+def test_recipe_blind_start_interrupt_in_session_b_is_not_swallowed(recipe, tmp_path, monkeypatch, where):
+    model = AppModel(proxies=0, active="s1")
+    (_stop_session_b if where == "entry" else _stop_read_after)(monkeypatch)
+    err, _ = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == "interrupted", err
+    assert err.payload["stopped"] is True and err.payload["exported"] == 2 and len(err.payload["frames"]) == 2
+    assert err.payload["left_switched"] is None and err.payload["changed_by_others"] == {
+        "proxies": None, "active_sequence": None}
+    assert model.writes == [] and lease_free(recipe)
+
+
+@pytest.mark.parametrize("where", ["entry", "read"])
+def test_recipe_switched_start_interrupt_in_session_b(recipe, tmp_path, monkeypatch, where):
+    model = AppModel(proxies=1, active="o1")
+    (_stop_session_b if where == "entry" else _stop_read_after)(monkeypatch)
+    err, _ = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == "interrupted"
+    assert err.payload["stopped"] is True and len(err.payload["frames"]) == 2
+    assert err.payload["left_switched"] == {"proxies": False, "active_sequence": {"id": "s1", "name": "Main"}}
+    assert model.writes == [("proxies", 0), ("activate", "s1")] and lease_free(recipe)
+
+
+def test_recipe_marker_blocks_the_read_after_and_says_so(recipe, tmp_path):
+    model = AppModel(proxies=0, active="s1")
+
+    def marker():
+        (recipe / MARKER_FILE).write_text('{"version":1,"reason":"unknown_command_outcome","nonce":"x"}')
+    result, _ = run_recipe(recipe, model, tmp_path, on_exit=marker)
+    assert isinstance(result, dict)
+    assert ("A recovery is open, so the state after the export was not read. Run: cli-anything-premiere recovery show"
+            in result["warnings"])
+    assert result["stopped"] is False
+
+
+def test_recipe_failed_read_after_says_why(recipe, tmp_path):
+    model = AppModel(proxies=0, active="s1")
+    original = model.app_switch
+    reads = []
+
+    def failing_second_read(script):
+        if script_args(script)["action"] == "read":
+            reads.append(1)
+            if len(reads) == 2:
+                return Exception("Error: host busy")
+        return original(script)
+    model.app_switch = failing_second_read
+    result, _ = run_recipe(recipe, model, tmp_path)
+    assert isinstance(result, dict)
+    assert [w for w in result["warnings"] if w.startswith("The state after the export could not be read (")]
+    assert result["changed_by_others"] == {"proxies": None, "active_sequence": None}
+
+
+def test_recipe_confirmed_activation_is_not_called_unknown(recipe, tmp_path):
+    """No sequence active before; the activation was confirmed in session A; someone clears the active sequence
+    during the export. No line may say the outcome of the activation is unknown."""
+    model = AppModel(proxies=0, active=None)
+
+    def someone_else():
+        model.active = None
+    result, _ = run_recipe(recipe, model, tmp_path, on_exit=someone_else)
+    assert isinstance(result, dict), result
+    assert not any("the outcome of that write is unknown" in w for w in result["warnings"])
+    assert result["changed_by_others"]["active_sequence"] is True
+
+
+@pytest.mark.parametrize("stop", ["fail", "interrupt"])
+def test_recipe_no_read_after_a_failed_or_stopped_export_when_nothing_is_left(recipe, tmp_path, stop):
+    model = AppModel(proxies=0, active="s1")
+
+    def on_call(number, arguments):
+        if stop == "interrupt":
+            raise KeyboardInterrupt
+        return {"is_error": True, "text": "fake export failure", "structured": None}
+    err, _ = run_recipe(recipe, model, tmp_path, on_call=on_call)
+    assert err.code == ("export_failed" if stop == "fail" else "interrupted")
+    assert model.reads == 1                                     # session A only
+    assert err.payload["changed_by_others"] == {"proxies": None, "active_sequence": None}
+    assert err.payload["stopped"] is (stop == "interrupt")
+
+
+# ---------- fix round 4: one rule for every stop ----------
+# The table below is the proof: one case per place where a stop can arrive, per start state, per shape of the
+# stop. Each case names the exact writes the model must have received, so "no write after the stop" is checked.
+import signal  # noqa: E402
+import time  # noqa: E402
+
+from cli_anything.premiere.core import session as session_module  # noqa: E402
+from cli_anything.premiere.core.recipes import stops  # noqa: E402
+from cli_anything.premiere.core.session import WriteSession  # noqa: E402
+from cli_anything.premiere.tests.fakes import signal_when  # noqa: E402
+
+MAIN = {"id": "s1", "name": "Main"}
+STARTS = {"none": (0, "s1"), "proxies": (1, "s1"), "active": (0, "o1"), "both": (1, "o1")}
+SWITCHES = {"none": [], "proxies": [("proxies", 0)], "active": [("activate", "s1")],
+            "both": [("proxies", 0), ("activate", "s1")]}
+PUT_BACK = {"none": [], "proxies": [("proxies", 1)], "active": [("activate", "o1")],
+            "both": [("activate", "o1"), ("proxies", 1)]}
+LEFT = {"none": None, "proxies": {"proxies": False, "active_sequence": None},
+        "active": {"proxies": None, "active_sequence": MAIN}, "both": {"proxies": False, "active_sequence": MAIN}}
+ONLY_PROXIES_LEFT = {"proxies": False, "active_sequence": None}
+ALL_STARTS = ("none", "proxies", "active", "both")
+RAW = ("KI", "INT")                      # KeyboardInterrupt, bridge.Interrupted
+THREE = ("KI", "INT", "CLI")             # and CliError("interrupted")
+NOT_PICKED_UP = "Stopped before Premiere picked up the command. Nothing was changed."
+READ_STOPPED = "Stopped while Premiere ran a read-only script."
+UNKNOWN_TEXT = "Stopped while Premiere ran the edit; its result is unknown. Check Premiere before another edit."
+
+
+def stop_of(shape: str, text: str = READ_STOPPED) -> BaseException:
+    """One stop in the shape named: KI, INT, CLI, or UNKNOWN (a write whose outcome is unknown: not a stop for
+    the payload, but no write may follow it)."""
+    if shape == "KI":
+        return KeyboardInterrupt()
+    if shape == "INT":
+        return bridge.Interrupted()
+    if shape == "CLI":
+        return CliError("interrupted", text)
+    assert shape == "UNKNOWN", shape
+    return CliError("unknown_outcome", UNKNOWN_TEXT)
+
+
+def hook_sessions(monkeypatch, module, event: str, number: int, when: str, exc: BaseException, after_hit=None):
+    """Replace module.WriteSession by one that raises `exc` at the number-th `event` of the run (enter, exit,
+    read or write, counted over all sessions that module opens). when "before": instead of the call, so the model
+    never sees it. when "after": the call runs first (a write lands, a lease is given back), then the stop is
+    raised, as bridge._Section does when a signal waited for the end of a send. after_hit() runs after a hit
+    with when "armed": nothing is raised here, the caller's hook raises later. Returns the counters."""
+    count = {"enter": 0, "exit": 0, "read": 0, "write": 0, "hits": 0}
+
+    def hit(name: str, phase: str) -> bool:
+        if name == event and count[name] == number and when == phase:
+            count["hits"] += 1
+            return True
+        return False
+
+    class Hooked(WriteSession):
+        def __enter__(self):
+            count["enter"] += 1
+            if hit("enter", "before"):
+                raise exc
+            return super().__enter__()
+
+        def __exit__(self, *info):
+            count["exit"] += 1
+            super().__exit__(*info)
+            if info[0] is None and hit("exit", "after"):
+                raise exc
+
+        def _call(self, name: str, send):
+            count[name] += 1
+            if hit(name, "before"):
+                raise exc
+            reply = send()
+            if hit(name, "after"):
+                raise exc
+            if hit(name, "armed"):
+                after_hit()
+            return reply
+
+        def read(self, body, args=None, **kw):
+            return self._call("read", lambda: WriteSession.read(self, body, args, **kw))
+
+        def write(self, body, args=None, **kw):
+            return self._call("write", lambda: WriteSession.write(self, body, args, **kw))
+    monkeypatch.setattr(module, "WriteSession", Hooked)
+    return count
+
+
+def raise_at_call(monkeypatch, module, name: str, number: int, exc: BaseException) -> dict:
+    """module.name raises `exc` at its number-th call (instead of running) and runs as before at every other."""
+    original = getattr(module, name)
+    count = {"calls": 0, "hits": 0}
+
+    def wrapper(*args, **kwargs):
+        count["calls"] += 1
+        if count["calls"] == number:
+            count["hits"] += 1
+            raise exc
+        return original(*args, **kwargs)
+    monkeypatch.setattr(module, name, wrapper)
+    return count
+
+
+class StopCase:
+    """One row of the stop table of export_frames. at: the writes the model has when the stop arrives (a write
+    during which it arrives counts when it landed). after: the writes sent after the stop."""
+
+    def __init__(self, point, where, start, shape, when, how, *, frames, at, after, left, code="interrupted",
+                 stopped=True) -> None:
+        self.point, self.where, self.start, self.shape, self.when, self.how = point, where, start, shape, when, how
+        self.frames, self.at, self.after, self.left, self.code, self.stopped = frames, at, after, left, code, stopped
+
+    @property
+    def id(self) -> str:
+        return f"{self.point}-{self.start}-{self.shape}" + (f"-{self.when}" if self.when else "")
+
+
+def _write_shapes():
+    """(shape, when) for a write: the bridge's error before the pickup, the two raw shapes before the send and
+    as the write returns (it landed, its reply is lost), and an unknown outcome (it may have landed)."""
+    return [("CLI", "before"), ("KI", "before"), ("INT", "before"), ("KI", "after"), ("INT", "after"),
+            ("UNKNOWN", "after")]
+
+
+def stop_cases() -> list[StopCase]:
+    cases: list[StopCase] = []
+
+    def add(point, where, start, shape, when, how, **expected):
+        cases.append(StopCase(point, where, start, shape, when, how, **expected))
+
+    for start in ALL_STARTS:
+        sw, back, left = SWITCHES[start], PUT_BACK[start], LEFT[start]
+        # ----- session A, before a switch -----
+        for shape in RAW:
+            add("A1", "session A: the lease wait at entry", start, shape, "", ("session", "enter", 1, "before"),
+                frames=0, at=[], after=[], left=None)
+        for shape in THREE:
+            add("A2", "session A: the guard at entry (state read)", start, shape, "", ("guard", 1),
+                frames=0, at=[], after=[], left=None)
+            add("A3", "session A: the read, before a switch", start, shape, "",
+                ("session", "read", 1, "before" if shape == "CLI" else "after"), frames=0, at=[], after=[], left=None)
+        # ----- session A, the switch writes: a stop during a write ends every write, in every shape -----
+        if start in ("proxies", "both"):
+            for shape, when in _write_shapes():
+                how = ("session", "write", 1, when)
+                where = "session A: during the proxy switch write"
+                if shape == "CLI":                       # not picked up: nothing was switched, nothing is left
+                    add("A4", where, start, shape, when, how, frames=0, at=[], after=[], left=None)
+                elif shape == "UNKNOWN":                 # may have landed: the code stays, "stopped" stays false
+                    add("A4", where, start, shape, when, how, frames=0, at=[("proxies", 0)], after=[],
+                        left=ONLY_PROXIES_LEFT, code="unknown_outcome", stopped=False)
+                else:                                    # the recipe cannot know whether it was sent: may be off
+                    add("A4", where, start, shape, when, how, frames=0,
+                        at=[("proxies", 0)] if when == "after" else [], after=[], left=ONLY_PROXIES_LEFT)
+        if start == "both":                              # not during a write: the one put-back is still tried
+            for shape in RAW:
+                add("A5", "session A: between the switches", start, shape, "", ("between_switches",),
+                    frames=0, at=[("proxies", 0)], after=[("proxies", 1)], left=None)
+        if start in ("active", "both"):
+            for shape, when in _write_shapes():
+                how = ("session", "write", len(sw), when)
+                where = "session A: during the activation write"
+                if shape == "CLI":                       # not picked up: the sequence was not switched
+                    add("A6", where, start, shape, when, how, frames=0, at=sw[:-1], after=[],
+                        left=ONLY_PROXIES_LEFT if start == "both" else None)
+                elif shape == "UNKNOWN":
+                    add("A6", where, start, shape, when, how, frames=0, at=sw, after=[], left=left,
+                        code="unknown_outcome", stopped=False)
+                else:
+                    add("A6", where, start, shape, when, how, frames=0, at=sw if when == "after" else sw[:-1],
+                        after=[], left=left)
+        # ----- session A, after the switches -----
+        for shape in THREE:
+            add("A7", "session A: the confirming state read", start, shape, "", ("confirm",),
+                frames=0, at=sw, after=back, left=None)
+        for shape in RAW:
+            add("A8", "session A: after the switches, as the lease is given back", start, shape, "",
+                ("session", "exit", 1, "after"), frames=0, at=sw, after=back, left=None)
+            add("G1", "the gap before the MCP session", start, shape, "", ("gap_before",),
+                frames=0, at=sw, after=back, left=None)
+        # ----- the exports -----
+        for shape in THREE:
+            add("M1", "the MCP session start", start, shape, "", ("mcp_start",),
+                frames=0, at=sw, after=back, left=None)
+            add("M2", "during an export call (the second of two)", start, shape, "", ("on_call", 2),
+                frames=1, at=sw, after=back, left=None)
+        for shape in RAW:
+            add("M3", "between two export calls", start, shape, "", ("between_calls",),
+                frames=1, at=sw, after=back, left=None)
+            add("M4", "the close of the MCP session", start, shape, "", ("mcp_close",),
+                frames=2, at=sw, after=back, left=None)
+            add("M5", "the close of the MCP session, after an export that failed", start, shape, "",
+                ("mcp_close_after_failure",), frames=1, at=sw, after=back, left=None, code="export_failed")
+            add("G2", "the gap after the exports", start, shape, "", ("gap_after",),
+                frames=2, at=sw, after=back, left=None)
+        # ----- session B, before the put-back -----
+        for shape in RAW:
+            add("B1", "session B: the lease wait at entry", start, shape, "", ("session", "enter", 2, "before"),
+                frames=2, at=sw, after=[], left=left)
+        for shape in THREE:
+            add("B2", "session B: the guard at entry (state read)", start, shape, "", ("guard", 2),
+                frames=2, at=sw, after=[], left=left)
+            add("B3", "session B: the read", start, shape, "",
+                ("session", "read", 2, "before" if shape == "CLI" else "after"), frames=2, at=sw, after=[], left=left)
+        # ----- session B, the put-back writes -----
+        if back:
+            for shape, when in _write_shapes():
+                landed = sw + back[:1] if when == "after" else sw
+                unknown = {"code": "not_restored", "stopped": False} if shape == "UNKNOWN" else {}
+                add("B4", "session B: the first put-back write", start, shape, when,
+                    ("session", "write", len(sw) + 1, when), frames=2, at=landed, after=[], left=left, **unknown)
+        if start == "both":
+            for shape in RAW:
+                add("B5", "session B: between the put-backs", start, shape, "", ("between_put_backs",),
+                    frames=2, at=sw + back[:1], after=[], left=ONLY_PROXIES_LEFT)
+            for shape, when in _write_shapes():
+                landed = sw + back if when == "after" else sw + back[:1]
+                unknown = {"code": "not_restored", "stopped": False} if shape == "UNKNOWN" else {}
+                add("B6", "session B: the second put-back write", start, shape, when, ("session", "write", 4, when),
+                    frames=2, at=landed, after=[], left=ONLY_PROXIES_LEFT, **unknown)
+        # ----- after session B -----
+        for shape in RAW:
+            add("B7", "session B: after the put-back, as the lease is given back", start, shape, "",
+                ("session", "exit", 2, "after"), frames=2, at=sw + back, after=[], left=None)
+            add("E1", "after session B, while the payload is made", start, shape, "", ("payload",),
+                frames=2, at=sw + back, after=[], left=None)
+    return cases
+
+
+class _StartStops(ScriptedSession):
+    """An MCP session whose start raises."""
+    stop: BaseException | None = None
+
+    def __enter__(self):
+        raise self.stop
+
+
+def run_stop_case(case: StopCase, bridge_dir, tmp_path, monkeypatch):  # noqa: F811
+    """Run export_frames (two frames) with the stop of `case` placed. Returns (the error, the model, how often
+    the stop was raised)."""
+    model = AppModel(*STARTS[case.start])
+    text = NOT_PICKED_UP if case.how[0] == "session" and case.how[1] == "write" else READ_STOPPED
+    exc = stop_of(case.shape, text)
+    kind = case.how[0]
+    on_call = on_exit = None
+    session_class = ScriptedSession
+    count = {"hits": 0}
+
+    def hit() -> None:
+        count["hits"] += 1
+        raise exc
+    if kind == "session":
+        count = hook_sessions(monkeypatch, frames, case.how[1], case.how[2], case.how[3], exc)
+    elif kind == "guard":                    # WriteSession._guard calls session.guarded_state: once per entry
+        count = raise_at_call(monkeypatch, session_module, "guarded_state", case.how[1], exc)
+    elif kind == "confirm":                  # frames.guarded_state: the confirming read only
+        count = raise_at_call(monkeypatch, frames, "guarded_state", 1, exc)
+    elif kind == "between_switches":         # the second _switch is the activation: raised before it does anything
+        count = raise_at_call(monkeypatch, frames, "_switch", 2, exc)
+    elif kind == "gap_before":               # the call of _export_all stands for the lines before it
+        count = raise_at_call(monkeypatch, frames, "_export_all", 1, exc)
+    elif kind == "gap_after":                # the first call of _restore stands for the lines before it
+        count = raise_at_call(monkeypatch, frames, "_restore", 1, exc)
+    elif kind == "payload":                  # the first payload is cut off; the end must still be reached
+        count = raise_at_call(monkeypatch, frames, "_left_switched", 1, exc)
+    elif kind == "between_calls":            # _stat runs twice per frame: its third call opens the second frame
+        count = raise_at_call(monkeypatch, frames, "_stat", 3, exc)
+    elif kind == "mcp_start":
+        session_class = type("StartStops", (_StartStops,), {"stop": exc})
+    elif kind == "on_call":
+        def on_call(number, arguments):
+            if number == case.how[1]:
+                hit()
+    elif kind == "mcp_close":
+        on_exit = hit
+    elif kind == "mcp_close_after_failure":
+        def on_call(number, arguments):
+            if number == 2:
+                return {"is_error": True, "text": "fake export failure", "structured": None}
+        on_exit = hit
+    elif kind == "between_put_backs":
+        # Armed when the first put-back write (the third write of the run) has returned; raised at the next look
+        # at the switches, which is after its reply was recorded and before the second put-back write.
+        armed = {"on": False}
+        original = frames._active_left
+
+        def active_left(sw):
+            if armed["on"]:
+                armed["on"] = False
+                hit()
+            return original(sw)
+        monkeypatch.setattr(frames, "_active_left", active_left)
+        hook_sessions(monkeypatch, frames, "write", 3, "armed", exc, after_hit=lambda: armed.update(on=True))
+    else:
+        raise AssertionError(kind)
+    made: list = []
+
+    def make(client):
+        made.append(session_class(client, on_call, on_exit))
+        return made[-1]
+    client = BridgeClient(bridge_dir, 0.0)
+    with panel_on(bridge_dir, model):
+        with pytest.raises(CliError) as caught:
+            frames.export_frames(client, make, sequence_id="s1", times=[1.0, 2.0], out_dir=tmp_path / "o")
+    if kind == "mcp_start":
+        count = {"hits": len(made)}
+    return caught.value, model, count["hits"]
+
+
+STOP_CASES = stop_cases()
+
+
+@pytest.mark.parametrize("case", STOP_CASES, ids=[case.id for case in STOP_CASES])
+def test_stop_table_of_export_frames(recipe, tmp_path, monkeypatch, case):
+    """Every row of the stop table: the code, "stopped", the frames, left_switched, the exact writes (so none
+    follows the stop but the one put-back the rule allows), and the lease."""
+    err, model, hits = run_stop_case(case, recipe, tmp_path, monkeypatch)
+    assert hits == 1, "the stop was not raised at the place the case names"
+    assert model.writes == case.at + case.after
+    assert err.code == case.code, err
+    payload = err.payload
+    assert payload["stopped"] is case.stopped
+    assert len(payload["frames"]) == case.frames and payload["exported"] == case.frames
+    assert all(os.path.getsize(frame["path"]) > 0 for frame in payload["frames"])
+    assert payload["left_switched"] == case.left
+    lines = [w for w in payload["warnings"] if "cli-anything-premiere live app" in w]
+    assert len(lines) == (0 if case.left is None else sum(v is not None for v in case.left.values()))
+    assert lease_free(recipe)
+    assert not (recipe / MARKER_FILE).exists()       # no case of the table needs a marker to stop the writes
+
+
+def test_stop_table_covers_every_place_start_and_shape():
+    """The table names every place of the walk, for each start state it can occur in, in each shape it can take."""
+    by_point: dict = {}
+    for case in STOP_CASES:
+        by_point.setdefault(case.point, set()).add((case.start, case.shape, case.when))
+    assert sorted(by_point) == ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "B1", "B2", "B3", "B4", "B5", "B6",
+                                "B7", "E1", "G1", "G2", "M1", "M2", "M3", "M4", "M5"]
+    everywhere = ["A1", "A2", "A3", "A7", "A8", "G1", "M1", "M2", "M3", "M4", "M5", "G2", "B1", "B2", "B3", "B7",
+                  "E1"]
+    for point in everywhere:
+        assert {start for start, _, _ in by_point[point]} == set(ALL_STARTS), point
+    assert {start for start, _, _ in by_point["A4"]} == {"proxies", "both"}
+    assert {start for start, _, _ in by_point["A6"]} == {"active", "both"}
+    assert {start for start, _, _ in by_point["B4"]} == {"proxies", "active", "both"}
+    for point in ("A5", "B5", "B6"):                      # two switches, or two put-backs: only with both
+        assert {start for start, _, _ in by_point[point]} == {"both"}, point
+    for point in ("A4", "A6", "B4", "B6"):                # a write: every shape, before the send and as it returns
+        assert {(shape, when) for _, shape, when in by_point[point]} == set(_write_shapes()), point
+    for point in ("A2", "A3", "A7", "M1", "M2", "B2", "B3"):   # a read or an MCP request: all three shapes
+        assert {shape for _, shape, _ in by_point[point]} == set(THREE), point
+    for case in STOP_CASES:                               # the one put-back: never after a stop during a write
+        if case.how[:2] == ("session", "write"):
+            assert case.after == [], case.id
+    assert len(STOP_CASES) == len({case.id for case in STOP_CASES})
+
+
+def test_is_stop_knows_the_three_shapes_and_nothing_else():
+    assert stops.is_stop(KeyboardInterrupt()) and stops.is_stop(bridge.Interrupted(signal.SIGHUP))
+    assert stops.is_stop(CliError("interrupted", "x"))
+    for other in (CliError("unknown_outcome", "x"), CliError("not_restored", "x"), ValueError("x"), SystemExit(1),
+                  RuntimeError("x"), None):
+        assert not stops.is_stop(other)
+    assert stops.ends_writes(CliError("unknown_outcome", "x")) and stops.ends_writes(KeyboardInterrupt())
+    assert not stops.ends_writes(CliError("recovery_required", "x"))
+    stop = CliError("interrupted", "x")
+    assert stops.as_error(stop) is stop and stops.as_error(KeyboardInterrupt()).code == "interrupted"
+
+
+def test_recipe_reviewer_probe_stop_in_the_activate_put_back(recipe, tmp_path, monkeypatch):
+    """The reviewer's probe (I8.4): proxies on and o1 active at the start; session B's activate put-back raises
+    CliError("interrupted"). No ("proxies", 1) write follows, the code is interrupted, "stopped" is true, and
+    both items are in left_switched."""
+    model = AppModel(proxies=1, active="o1")
+    raise_at_call(monkeypatch, frames, "_activate", 2, CliError("interrupted", NOT_PICKED_UP))
+    err, _ = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == "interrupted"
+    assert model.writes == [("proxies", 0), ("activate", "s1")]
+    assert err.payload["stopped"] is True and len(err.payload["frames"]) == 2
+    assert err.payload["left_switched"] == {"proxies": False, "active_sequence": MAIN}
+    lines = [w for w in err.payload["warnings"] if "cli-anything-premiere live app" in w]
+    assert len(lines) == 2 and all("interrupted" in line for line in lines)
+    assert NOT_PICKED_UP in lines[0] and "--sequence o1" in lines[0] and "proxies on" in lines[1]
+    assert lease_free(recipe)
+
+
+def test_recipe_unknown_outcome_in_a_put_back_ends_the_put_back_without_a_marker(recipe, tmp_path, monkeypatch):
+    """An unknown outcome of the first put-back write: the second one is not sent, also when no marker is on
+    disk to refuse it (the recipe stops, not only the guard). The code is not_restored and "stopped" is false."""
+    model = AppModel(proxies=1, active="o1")
+    hook_sessions(monkeypatch, frames, "write", 3, "after", stop_of("UNKNOWN"))
+    err, _ = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == "not_restored"
+    assert not (recipe / MARKER_FILE).exists()
+    assert model.writes == [("proxies", 0), ("activate", "s1"), ("activate", "o1")]
+    assert err.payload["stopped"] is False
+    assert err.payload["left_switched"] == {"proxies": False, "active_sequence": MAIN}
+    lines = [w for w in err.payload["warnings"] if "cli-anything-premiere live app" in w]
+    assert "unknown_outcome" in lines[0] and "a recovery is open, so nothing was written" in lines[1]
+
+
+@pytest.mark.parametrize("shape", ["CLI", "KI"])
+def test_recipe_stop_in_the_put_back_of_session_a_after_another_error(recipe, tmp_path, monkeypatch, shape):
+    """The activation does not take (not_switched), so session A puts the proxy display back, and the stop
+    arrives in that write. The first error keeps its code, "stopped" is true, nothing more is written."""
+    model = AppModel(proxies=1, active="o1")
+    model.activate_takes = False
+    hook_sessions(monkeypatch, frames, "write", 3, "before", stop_of(shape, NOT_PICKED_UP))
+    err, sessions = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == "not_switched"
+    assert err.payload["stopped"] is True and sessions == []
+    assert model.writes == [("proxies", 0), ("activate", "s1")]
+    assert err.payload["left_switched"] == ONLY_PROXIES_LEFT and lease_free(recipe)
+
+
+@pytest.mark.parametrize("code_name", ["interrupted", "recovery_required", "bridge_down", "precondition"])
+@pytest.mark.parametrize("active", [None, "o1"])
+def test_recipe_activation_that_was_not_sent_is_not_called_switched(recipe, tmp_path, monkeypatch, code_name, active):
+    """A refusal of the activation write that means "not sent" (also a stop before the pickup): no line says the
+    sequence may have been switched, it is not put back and not in left_switched."""
+    model = AppModel(proxies=0, active=active)
+    hook_sessions(monkeypatch, frames, "write", 1, "before", CliError(code_name, "refused before the send"))
+    err, _ = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == code_name
+    assert model.writes == [] and err.payload["left_switched"] is None
+    assert not any("may have been switched" in w or "may still be" in w for w in err.payload["warnings"])
+    assert err.payload["stopped"] is (code_name == "interrupted")
+    assert err.payload["active_sequence"] == {"before": active, "after": active}
+
+
+def test_recipe_proxy_switch_that_was_not_sent_is_not_put_back(recipe, tmp_path, monkeypatch):
+    """The same rule for the proxy switch: a recovery that opened before the write refuses it, so nothing was
+    switched. No put-back is tried and left_switched is empty."""
+    model = AppModel(proxies=1, active="o1")
+    refusal = CliError("recovery_required", "A recovery is open.")
+    count = hook_sessions(monkeypatch, frames, "write", 1, "before", refusal)
+    err, _ = run_recipe(recipe, model, tmp_path)
+    assert err.code == "recovery_required" and model.writes == [] and count["write"] == 1
+    assert err.payload["left_switched"] is None and err.payload["proxies"] == {"before": True, "during": True,
+                                                                              "after": True}
+
+
+def test_recipe_export_error_keeps_its_code_when_the_stop_comes_at_the_close(recipe, tmp_path):
+    """An export fails, and Ctrl-C arrives while the MCP session closes: the export error keeps its code and its
+    message, the payload says stopped, and the one put-back still runs."""
+    model = AppModel(proxies=1, active="o1")
+
+    def fail(number, arguments):
+        return {"is_error": True, "text": "fake export failure", "structured": None}
+
+    def stop():
+        raise KeyboardInterrupt
+    err, _ = run_recipe(recipe, model, tmp_path, on_call=fail, on_exit=stop)
+    assert err.code == "export_failed" and "fake export failure" in err.message
+    assert err.payload["stopped"] is True and err.payload["left_switched"] is None
+    assert model.writes == [("proxies", 0), ("activate", "s1"), ("activate", "o1"), ("proxies", 1)]
+
+
+@pytest.mark.parametrize("shape", RAW)
+def test_recipe_stop_as_the_lease_is_given_back_replaces_an_error_on_its_way_out(recipe, tmp_path, monkeypatch,
+                                                                                 shape):
+    """The one place where an error that came first does not keep its code: not_switched is leaving session A
+    (its put-back is done), and a signal that waited is raised as the lease is given back. bridge._Section puts
+    the stop in the place of the error. The run ends as interrupted with "stopped": true, and nothing is written
+    after it."""
+    model = AppModel(proxies=1, active="o1")
+    model.activate_takes = False
+    exits = []
+
+    class StopsOnTheWayOut(WriteSession):
+        def __exit__(self, *info):
+            super().__exit__(*info)
+            exits.append(info[0])
+            if len(exits) == 1:
+                raise stop_of(shape)
+    monkeypatch.setattr(frames, "WriteSession", StopsOnTheWayOut)
+    err, sessions = run_recipe(recipe, model, tmp_path)
+    assert len(exits) == 1 and exits[0] is CliError          # not_switched was on its way out
+    assert isinstance(err, CliError) and err.code == "interrupted" and sessions == []
+    assert err.payload["stopped"] is True and err.payload["left_switched"] is None
+    assert model.writes == [("proxies", 0), ("activate", "s1"), ("proxies", 1)]
+    assert lease_free(recipe)
+
+
+# ----- the same stops as real signals, through the real bridge -----
+def _signal_in_the_send_of_write(monkeypatch, number: int, signum: int) -> dict:
+    """With the CLI's handlers installed: send `signum` to this process inside the signal section of the send of
+    the number-th write of the run, before the command file is made. The bridge holds the signal back and raises
+    CliError("interrupted", "Stopped before Premiere picked up the command. ...")."""
+    state = {"armed": False, "fired": 0, "writes": 0}
+    real_enter = bridge._Section.__enter__
+
+    def enter(self):
+        section = real_enter(self)
+        if state["armed"]:
+            state["armed"] = False
+            state["fired"] += 1
+            signal.raise_signal(signum)
+            end = time.monotonic() + 5.0
+            while not bridge._Held.pending and time.monotonic() < end:
+                time.sleep(0.001)                # until Python has run the handler: the signal waits now
+        return section
+    monkeypatch.setattr(bridge._Section, "__enter__", enter)
+
+    class Arming(WriteSession):
+        def write(self, body, args=None, **kw):
+            state["writes"] += 1
+            state["armed"] = state["writes"] == number
+            return super().write(body, args, **kw)
+    monkeypatch.setattr(frames, "WriteSession", Arming)
+    return state
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_real_signal_before_the_pickup_of_the_first_put_back_write(recipe, tmp_path, monkeypatch, signum):
+    """The reviewer's case as it happens in the field: the handlers of the CLI are installed, and the signal
+    arrives inside the send of session B's activate put-back. No write follows."""
+    bridge.install_signal_handlers()
+    state = _signal_in_the_send_of_write(monkeypatch, 3, signum)
+    model = AppModel(proxies=1, active="o1")
+    err, _ = run_recipe(recipe, model, tmp_path)
+    assert state["fired"] == 1 and state["writes"] == 3
+    assert isinstance(err, CliError) and err.code == "interrupted"
+    assert model.writes == [("proxies", 0), ("activate", "s1")]
+    assert err.payload["stopped"] is True and len(err.payload["frames"]) == 2
+    assert err.payload["left_switched"] == {"proxies": False, "active_sequence": MAIN}
+    lines = [w for w in err.payload["warnings"] if "cli-anything-premiere live app" in w]
+    assert len(lines) == 2 and NOT_PICKED_UP in lines[0]
+    assert not (recipe / MARKER_FILE).exists() and lease_free(recipe)
+
+
+def test_real_signal_before_the_pickup_of_the_activation_switch(recipe, tmp_path, monkeypatch):
+    """SIGTERM inside the send of session A's activation write: it was not sent, so the sequence was not switched.
+    A stop during a write ends every write: the proxy display, switched before, is not put back and is named in
+    left_switched, alone."""
+    bridge.install_signal_handlers()
+    state = _signal_in_the_send_of_write(monkeypatch, 2, signal.SIGTERM)
+    model = AppModel(proxies=1, active="o1")
+    err, sessions = run_recipe(recipe, model, tmp_path)
+    assert state["fired"] == 1
+    assert isinstance(err, CliError) and err.code == "interrupted" and sessions == []
+    assert model.writes == [("proxies", 0)]
+    assert err.payload["stopped"] is True and err.payload["left_switched"] == ONLY_PROXIES_LEFT
+    assert err.payload["active_sequence"] == {"before": "o1", "after": "o1"}
+    lines = [w for w in err.payload["warnings"] if "cli-anything-premiere live app" in w]
+    assert len(lines) == 1 and "proxies on" in lines[0] and "interrupted" in lines[0]
+    assert lease_free(recipe)
+
+
+def test_real_signal_after_the_pickup_of_the_first_put_back_write(recipe, tmp_path):
+    """SIGTERM while Premiere runs session B's activate put-back (picked up, no answer yet): the bridge reports
+    unknown_outcome and writes a marker. The proxy put-back is not sent; the code is not_restored and "stopped"
+    stays false, as ruled."""
+    bridge.install_signal_handlers()
+    model = AppModel(proxies=1, active="o1")
+    handler = model.handler()
+    seen = {"activations": 0}
+
+    def hang(script):
+        if MARK in script and script_args(script).get("action") == "activate":
+            seen["activations"] += 1
+            if seen["activations"] == 2:
+                return None                     # the put-back: picked up, never answered
+        return handler(script)
+    client = BridgeClient(recipe, 0.0)
+    panel = FakePanel(recipe, handler=hang)
+    panel.start()
+    try:
+        with signal_when(signal.SIGTERM, lambda: seen["activations"] == 2) as sent:
+            with pytest.raises(CliError) as err:
+                frames.export_frames(client, lambda c: ScriptedSession(c), sequence_id="s1", times=[1.0, 2.0],
+                                     out_dir=tmp_path / "o")
+    finally:
+        panel.stop()
+    assert sent["fired"]
+    assert err.value.code == "not_restored" and err.value.payload["stopped"] is False
+    assert (recipe / MARKER_FILE).exists()
+    assert model.writes == [("proxies", 0), ("activate", "s1")]
+    assert err.value.payload["left_switched"] == {"proxies": False, "active_sequence": MAIN}
+    lines = [w for w in err.value.payload["warnings"] if "cli-anything-premiere live app" in w]
+    assert "unknown_outcome" in lines[0] and "a recovery is open" in lines[1]
+    assert lease_free(recipe)
+
+
+def test_command_reports_a_stop_in_the_put_back_with_the_payload(live, bridge_dir, capsys, tmp_path, monkeypatch):  # noqa: F811
+    """The whole command (its own signal handlers, the fake MCP server): SIGTERM inside the send of the first
+    put-back write gives exit 1 with the code interrupted, "stopped": true, both frames and left_switched."""
+    _signal_in_the_send_of_write(monkeypatch, 3, signal.SIGTERM)
+    model = AppModel(proxies=1, active="o1")
+    code, out, _ = export(bridge_dir, capsys, model, tmp_path / "o", "--time", "1", "--time", "2")
+    assert code == 1 and out["ok"] is False and out["code"] == "interrupted"
+    assert out["stopped"] is True and out["exported"] == 2
+    assert out["left_switched"] == {"proxies": False, "active_sequence": MAIN}
+    assert model.writes == [("proxies", 0), ("activate", "s1")]
+    assert lease_free(bridge_dir)

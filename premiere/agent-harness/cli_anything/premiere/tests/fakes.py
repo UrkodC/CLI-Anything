@@ -706,3 +706,41 @@ class _Refused(Exception):
 
     def error(self, prefix: str = "") -> Exception:
         return Exception(f"Error: precondition: {prefix}{self}")
+
+
+# ---------- a Lumetri Color as Premiere 27 shows it (live lut set) ----------
+LUT_TPS = 254016000000
+EMPTY_LUT_SLOT = "﻾"       # what Lumetri index 4 reads with no LUT (measures.md section 4)
+
+
+class LutModel(EffectModel):
+    """EffectModel with the Lumetri Color layout of Premiere 27 on V1[0] (effect index 2): index 2 "Basic
+    Correction" (boolean), index 4 " " holding the one character U+FEFE, index 5 the same, index 6 and 7 "Input
+    LUT" (0). The clips also have an end: V1[0] runs 0 to 6.006 s, V1[1] 6.006 to 12.012 s. The resolve reply
+    carries end_ticks as effect_resolve.jsx does (left out when a clip's "end_ticks" is None).
+
+        model = LutModel()
+        model.lumetri()[4]["value"]            # the LUT slot
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        props = self.lumetri()
+        props[2] = {"name": "Basic Correction", "value": False, "kind": "boolean", "keyframed": False}
+        props[4] = {"name": " ", "value": EMPTY_LUT_SLOT, "kind": "string", "keyframed": False}
+        props[5] = {"name": " ", "value": EMPTY_LUT_SLOT, "kind": "string", "keyframed": False}
+        self.clips[(0, 0)]["end_ticks"] = str(round(6.006 * LUT_TPS))
+        self.clips[(0, 1)]["end_ticks"] = str(round(12.012 * LUT_TPS))
+
+    def lumetri(self, track: int = 0, clip: int = 0, effect_index: int = 2) -> list:
+        return self.clips[(track, clip)]["effects"][effect_index]["properties"]
+
+    def resolve(self, script: str) -> object:
+        reply = super().resolve(script)
+        if isinstance(reply, dict):
+            by_node = {clip["node_id"]: clip for clip in self.clips.values()}
+            for record in reply["entries"]:
+                end = by_node[record["clip"]["node_id"]].get("end_ticks")
+                if end is not None:
+                    record["clip"]["end_ticks"] = end
+        return reply
