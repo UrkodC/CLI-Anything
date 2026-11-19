@@ -642,7 +642,11 @@ def test_help_says_what_it_proves_and_switches():
     assert "makes the output folder" in text
     assert "proxy display off" in text and "puts it back" in text
     assert "active" in text and "puts the old one back" in text
-    assert "live app proxies on" in text
+    # N10.6: no fixed put-back commands; only those the output prints (A5 of the final fix)
+    assert "live app proxies on" not in text and "live app activate" not in text
+    assert "After the owner closes the recovery, run only the commands the output prints." in text
+    assert ("While the command runs, proxy display is off and the sequence is active for every session that works "
+            "in Premiere. Do not run it while another session works on another sequence.") in text
     assert "600" in text
     assert "\u2014" not in result.output
     for name in ("proxies", "activate"):
@@ -2109,3 +2113,155 @@ def test_command_reports_a_stop_in_the_put_back_with_the_payload(live, bridge_di
     assert out["left_switched"] == {"proxies": False, "active_sequence": MAIN}
     assert model.writes == [("proxies", 0), ("activate", "s1")]
     assert lease_free(bridge_dir)
+
+
+# ---------- final fix A2: one "nothing was sent" rule ----------
+NOT_APPLIED_TEXT = "Premiere did not pick up the command. Nothing was changed."
+
+
+def test_recipe_proxy_switch_that_premiere_did_not_pick_up_is_not_put_back(recipe, tmp_path, monkeypatch):
+    """The reviewer's probe (I3): the proxy switch is refused with not_applied. Nothing was switched, so no put-back
+    write goes out, nothing is in left_switched, and no line says proxy display may still be off."""
+    model = AppModel(proxies=1, active="o1")
+    count = hook_sessions(monkeypatch, frames, "write", 1, "before", CliError("not_applied", NOT_APPLIED_TEXT))
+    err, sessions = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == "not_applied"
+    assert model.writes == [] and count["write"] == 1 and sessions == []
+    assert err.payload["left_switched"] is None
+    assert not any("may still be off" in w or "live app" in w for w in err.payload["warnings"])
+    assert lease_free(recipe)
+
+
+@pytest.mark.parametrize("active", [None, "o1"])
+def test_recipe_activation_that_premiere_did_not_pick_up_is_not_called_switched(recipe, tmp_path, monkeypatch,
+                                                                                 active):
+    """N8.15: the activation refused with not_applied was never sent. No "may have been switched" note, no
+    put-back of the activation, and only the proxy display (switched before it) is put back."""
+    model = AppModel(proxies=1, active=active)
+    hook_sessions(monkeypatch, frames, "write", 2, "before", CliError("not_applied", NOT_APPLIED_TEXT))
+    err, _ = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == "not_applied"
+    assert model.writes == [("proxies", 0), ("proxies", 1)]
+    assert err.payload["left_switched"] is None
+    assert not any("may have been switched" in w or "may still be" in w for w in err.payload["warnings"])
+    assert err.payload["active_sequence"] == {"before": active, "after": active}
+
+
+# ---------- final fix A3: no traceback, and never a silent switch, on an unexpected error ----------
+NO_SPACE = OSError(28, "No space left on device")
+BOTH_PUT_BACK = [("proxies", 0), ("activate", "s1"), ("activate", "o1"), ("proxies", 1)]
+
+
+def test_command_error_at_the_lease_release_of_session_a_puts_back_and_prints_json(live, bridge_dir, capsys,  # noqa: F811
+                                                                                   tmp_path, monkeypatch):
+    """The reviewer's probe (I2): an OSError leaves session A as it gives the lease back, after both switches. The
+    command ends as JSON with exit 1 (code recipe_error), session B puts both switches back, and nothing is
+    exported."""
+    model = AppModel(proxies=1, active="o1")
+    hook_sessions(monkeypatch, frames, "exit", 1, "after", NO_SPACE)
+    code, out, _ = export(bridge_dir, capsys, model, tmp_path / "o", "--time", "1")
+    assert code == 1 and out["ok"] is False and out["code"] == "recipe_error"
+    assert out["error"] == "OSError: [Errno 28] No space left on device"
+    assert model.writes == BOTH_PUT_BACK and (model.proxies, model.active) == (1, "o1")
+    assert out["left_switched"] is None and out["exported"] == 0 and calls(tmp_path) == []
+    assert lease_free(bridge_dir)
+
+
+def test_recipe_release_that_fails_before_it_gives_the_lease_back_names_both_switches(recipe, tmp_path,
+                                                                                      monkeypatch):
+    """The same fault, but the lease is still held when it leaves (session B cannot take it): nothing is put back,
+    and left_switched and the warnings name both switches."""
+    model = AppModel(proxies=1, active="o1")
+    real = Lease.release
+    count = {"calls": 0}
+
+    def release(self):
+        count["calls"] += 1
+        if count["calls"] == 1:
+            raise OSError(28, "No space left on device")
+        return real(self)
+    monkeypatch.setattr(Lease, "release", release)
+    client_lease = []
+    original_init = BridgeClient.__init__
+
+    def init(self, *a, **k):
+        original_init(self, *a, **k)
+        client_lease.append(self.lease())
+    monkeypatch.setattr(BridgeClient, "__init__", init)
+    err, sessions = run_recipe(recipe, model, tmp_path)
+    try:
+        assert isinstance(err, CliError) and err.code == "recipe_error" and sessions == []
+        assert model.writes == [("proxies", 0), ("activate", "s1")]
+        assert err.payload["left_switched"] == {"proxies": False, "active_sequence": MAIN}
+        lines = [w for w in err.payload["warnings"] if "cli-anything-premiere live app" in w]
+        assert len(lines) == 2 and all("recipe_error" in line for line in lines)
+    finally:
+        real(client_lease[0])                    # the test gives the lease back itself
+
+
+def test_recipe_program_fault_in_a_put_back_write_of_session_b_goes_on_and_is_reported(recipe, tmp_path,
+                                                                                       monkeypatch):
+    """N7.12: a plain Exception in the activate put-back of session B. It becomes that item's reason, the proxy
+    put-back still runs, and the run ends as not_restored with the payload."""
+    model = AppModel(proxies=1, active="o1")
+    raise_at_call(monkeypatch, frames, "_activate", 2, ValueError("boom"))
+    err, _ = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == "not_restored"
+    assert model.writes == [("proxies", 0), ("activate", "s1"), ("proxies", 1)]
+    assert err.payload["left_switched"] == {"proxies": None, "active_sequence": MAIN}
+    line = next(w for w in err.payload["warnings"] if "live app activate" in w)
+    assert "recipe_error: ValueError: boom" in line and len(err.payload["frames"]) == 2
+    assert lease_free(recipe)
+
+
+def test_recipe_program_fault_in_the_put_back_of_session_a_keeps_the_first_error(recipe, tmp_path, monkeypatch):
+    """The activation does not take (not_switched) and the proxy put-back of session A raises a plain Exception: the
+    first error keeps its code, and left_switched names the proxy display."""
+    model = AppModel(proxies=1, active="o1")
+    model.activate_takes = False
+    raise_at_call(monkeypatch, frames, "_set_proxies", 2, ValueError("boom"))
+    err, sessions = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == "not_switched" and sessions == []
+    assert model.writes == [("proxies", 0), ("activate", "s1")]
+    assert err.payload["left_switched"] == ONLY_PROXIES_LEFT
+    assert any("recipe_error: ValueError: boom" in w and "proxies on" in w for w in err.payload["warnings"])
+    assert lease_free(recipe)
+
+
+def test_recipe_error_as_session_b_gives_the_lease_back_is_reported(recipe, tmp_path, monkeypatch):
+    """Every frame is exported and both switches are put back; then an OSError leaves session B as it gives the
+    lease back. It is not lost: the run ends as recipe_error with the payload."""
+    model = AppModel(proxies=1, active="o1")
+    hook_sessions(monkeypatch, frames, "exit", 2, "after", NO_SPACE)
+    err, _ = run_recipe(recipe, model, tmp_path)
+    assert isinstance(err, CliError) and err.code == "recipe_error"
+    assert err.message == "OSError: [Errno 28] No space left on device"
+    assert model.writes == BOTH_PUT_BACK and err.payload["left_switched"] is None
+    assert len(err.payload["frames"]) == 2 and lease_free(recipe)
+
+
+# ---------- final fix A4: the frame wait and the script wait are apart ----------
+def test_recipe_script_limit_is_apart_from_the_frame_wait(recipe, tmp_path, monkeypatch):
+    """export_frames(hard_limit_s=600, script_limit_s=30): each frame waits 600 s, each script of the write
+    sessions at most 30 s. Without script_limit_s the scripts wait min(hard_limit_s, 120)."""
+    limits, waits = [], []
+
+    class Recording(WriteSession):
+        def __init__(self, client, **kw):
+            limits.append(kw["hard_limit_s"])
+            super().__init__(client, **kw)
+
+    class Timed(ScriptedSession):
+        def call(self, name, arguments, timeout_s=120.0):
+            waits.append(timeout_s)
+            return super().call(name, arguments, timeout_s)
+    monkeypatch.setattr(frames, "WriteSession", Recording)
+    model = AppModel(proxies=1, active="o1")
+    with panel_on(recipe, model):
+        frames.export_frames(BridgeClient(recipe, 0.0), lambda c: Timed(c), sequence_id="s1", times=[1.0],
+                             out_dir=tmp_path / "o", hard_limit_s=600.0, script_limit_s=30.0)
+        assert set(limits) == {30.0} and waits == [600.0]
+        limits.clear(), waits.clear()
+        frames.export_frames(BridgeClient(recipe, 0.0), lambda c: Timed(c), sequence_id="s1", times=[2.0],
+                             out_dir=tmp_path / "o", hard_limit_s=600.0)
+        assert set(limits) == {120.0} and waits == [600.0]

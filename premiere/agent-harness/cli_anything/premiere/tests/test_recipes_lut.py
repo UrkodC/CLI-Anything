@@ -1310,3 +1310,106 @@ def test_export_error_with_a_stopped_payload_counts_as_stopped(bridge_dir, tmp_p
         assert len(model.writes) == 2 and err.payload["stored"] is True and "no verdict" in err.message
         assert app.writes == BOTH_SWITCHED + [("proxies", 0), ("activate", "s1")]
     assert ScriptedSession.count == wanted and lease_free(bridge_dir)
+
+
+# ---------- final fix A2: one "nothing was sent" rule ----------
+def test_index_6_that_premiere_did_not_pick_up_goes_on_to_frame_b(bridge_dir, tmp_path, monkeypatch, ffmpeg):  # noqa: F811
+    """not_applied means the CLI deleted its own command file: index 6 was not sent. That is a refusal, not a
+    stop: the run goes on to frame B and the verdict, and the warning says why index 6 was not written."""
+    model, app = LutModel(), AppModel()
+    hook_sessions(monkeypatch, lut, "write", 2, "before",
+                  CliError("not_applied", "Premiere did not pick up the command. Nothing was changed."))
+    result, _ = run_recipe(bridge_dir, model, tmp_path, cube(tmp_path), app=app)
+    assert isinstance(result, dict), result
+    assert ScriptedSession.count == 2 and result["rendered"] is True and result["stored"] is True
+    assert [write[2] for write in model.writes] == [4]
+    assert ("Index 6 (Input LUT) was not written: Premiere did not pick up the command. Nothing was changed. Use "
+            "--prove to see if the LUT renders." in result["warnings"])
+
+
+# ---------- final fix A4: rendered false only for an empty slot; the --prove wait ----------
+def _not_empty(index_4: str, index_6) -> str:
+    return (f"The picture did not change, but the LUT slot was not empty before the write (index 4 held {index_4}, "
+            f"index 6 read {index_6}), so this run cannot show whether the new LUT renders.")
+
+
+@pytest.mark.parametrize("index_4, index_6, shown_4, shown_6", [
+    (EMPTY_LUT_SLOT, 2.0, '"<U+FEFE>"', "2.0"),              # a LUT chosen from the Input LUT menu
+    ("Look A", 0.0, '"Look A"', "0.0"),                      # a value that is not a .cube path
+    ("/luts/old.cube", 0.0, '"/luts/old.cube"', "0.0"),      # a path without the trailing slash
+    ("x" * 80, 0.0, '"' + "x" * 57 + '..."', "0.0"),         # a long value, cut at 60 characters
+])
+def test_prove_null_when_the_slot_was_not_empty(live, capsys, tmp_path, ffmpeg, index_4, index_6, shown_4, shown_6):
+    """I4: rendered false needs an empty slot before the write: index 4 held U+FEFE or nothing, and index 6 read 0.
+    Any other value gives null, with a warning that names what index 4 held."""
+    ffmpeg["after"] = ffmpeg["before"]
+    model = LutModel()
+    model.lumetri()[4]["value"] = index_4
+    model.lumetri()[6]["value"] = index_6
+    code, out, _ = lut_set(live, capsys, model, cube(tmp_path), *prove_args(tmp_path))
+    assert code == 0, out
+    assert out["rendered"] is None and out["difference"] == 0.0 and out["stored"] is True
+    assert out["path_before"] is None and out["slot_before"] == index_4
+    assert _not_empty(shown_4, shown_6) in out["warnings"]
+    assert SAME_PICTURE not in out["warnings"]
+
+
+@pytest.mark.parametrize("index_4", [EMPTY_LUT_SLOT, ""])
+def test_prove_false_needs_both_index_4_empty_and_index_6_zero(live, capsys, tmp_path, ffmpeg, index_4):
+    ffmpeg["after"] = ffmpeg["before"]
+    model = LutModel()
+    model.lumetri()[4]["value"] = index_4
+    code, out, _ = lut_set(live, capsys, model, cube(tmp_path), *prove_args(tmp_path))
+    assert code == 1 and out["code"] == "not_rendered" and out["rendered"] is False
+    assert out["slot_before"] == index_4 and not any("was not empty" in w for w in out["warnings"])
+
+
+def test_prove_null_when_index_6_changed_before_the_write(bridge_dir, tmp_path, ffmpeg):  # noqa: F811
+    """Session 1 reads an empty slot; while frame A is exported someone sets index 6 to 1. The write follows session
+    2, so the slot was not empty right before it: null."""
+    ffmpeg["after"] = ffmpeg["before"]
+    model = LutModel()
+    model.moves[2] = lambda: model.lumetri()[6].update(value=1.0)
+    result, _ = run_recipe(bridge_dir, model, tmp_path, cube(tmp_path), pixels=ffmpeg["stub"])
+    assert isinstance(result, dict), result
+    assert result["rendered"] is None and _not_empty('"<U+FEFE>"', "1.0") in result["warnings"]
+
+
+def test_human_line_shows_a_slot_value_that_is_not_a_path(live, capsys, tmp_path, ffmpeg):
+    model = LutModel()
+    model.lumetri()[4]["value"] = "Look A"
+    path = cube(tmp_path)
+    with panel_on(live, model):
+        assert dispatch([*SET, "--sequence", "s1", "--track", "0", "--clip", "0", "--lut", str(path), "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert 'index 4 "Look A" -> ' in out and "(no LUT)" not in out
+
+
+def test_prove_exports_wait_at_least_600_seconds(bridge_dir, tmp_path, ffmpeg, monkeypatch):  # noqa: F811
+    """M2: each frame of --prove waits max(--timeout, 600) s (design 5.1: a timeout kills the server mid-export).
+    The scripts of the write sessions keep --timeout."""
+    seen = []
+    real = lut.frames.export_frames
+
+    def spy(*args, **kwargs):
+        seen.append((kwargs["hard_limit_s"], kwargs["script_limit_s"]))
+        return real(*args, **kwargs)
+    monkeypatch.setattr(lut.frames, "export_frames", spy)
+    result, sessions = run_recipe(bridge_dir, LutModel(), tmp_path, cube(tmp_path), pixels=ffmpeg["stub"])
+    assert isinstance(result, dict), result
+    assert seen == [(600.0, 120.0), (600.0, 120.0)]
+    seen.clear()
+    result, _ = run_recipe(bridge_dir, LutModel(), tmp_path, cube(tmp_path), pixels=ffmpeg["stub"], hard_limit_s=30.0)
+    assert seen == [(600.0, 30.0), (600.0, 30.0)]
+    seen.clear()
+    result, _ = run_recipe(bridge_dir, LutModel(), tmp_path, cube(tmp_path), pixels=ffmpeg["stub"], hard_limit_s=900.0)
+    assert seen == [(900.0, 900.0), (900.0, 900.0)]
+
+
+def test_lut_help_says_how_long_prove_waits():
+    from click.testing import CliRunner
+    result = CliRunner().invoke(live_cli.live, ["lut", "set", "--help"])
+    text = " ".join(result.output.split())
+    assert "With --prove, each export waits up to 600 seconds, or up to --timeout when that is longer." in text
+    assert ("The slot counts as empty only when index 4 holds no path (the one character U+FEFE, or nothing) and "
+            "index 6 reads 0.") in text

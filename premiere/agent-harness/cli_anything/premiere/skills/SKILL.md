@@ -105,8 +105,8 @@ you send. No recipe saves the project. Tell the owner that a change is not saved
 - Put a risky write last. A plan stops at the first write that is not stored.
 - Apply ProcAmp before Lumetri Color. Effects render in the order they were applied, and
   ProcAmp must render before the LUT.
-- Before you remove a clip (through `mcp call`), read its ProcAmp, Motion and keyframes. They
-  are lost with the clip.
+- Before you remove a clip (with `mcp call`, `mcp batch` or `live run`), read its ProcAmp,
+  Motion and keyframes. They are lost with the clip.
 
 ### Waiting, dialogs, stops and recoveries
 
@@ -139,7 +139,9 @@ you send. No recipe saves the project. Tell the owner that a change is not saved
 ### Proof
 
 - `stored`: the value read back equals the value written. `rendered`: an exported frame shows
-  the change. The exit status is 1 when either is `false`. `null` means not checked, or, after
+  the change. `rendered: true` means only that the frame changed between before and after. A
+  change by another session to the same clip in that time (a Lumetri grade, say) also gives
+  `true`. The exit status is 1 when either is `false`. `null` means not checked, or, after
   `--prove`, no verdict: the warnings say why. The exit status is then 0. Do not report the LUT
   as rendered.
 - Read-back is not proof for a LUT, a mute or an effect order. Say which level you reached.
@@ -151,21 +153,29 @@ you send. No recipe saves the project. Tell the owner that a change is not saved
 ### live effect set
 
 - It finds and checks every target before the first write. When one entry may not be written,
-  nothing is written. That holds before the first write only: a long plan gives other sessions
-  a turn between writes, checks its targets again, and can stop midway with `target_moved`.
+  nothing is written. That holds before the first write only. A long plan gives other sessions
+  a turn between writes. Then it finds every target again and runs every check again on the
+  entries not yet written, the `expect_old` check too. It can stop midway, with `target_moved`
+  or a refusal. The error says "Nothing more was written", and `results` lists the entries that
+  ran.
+- The write script also reads the old value right before it writes. When it is not the
+  `expect_old` value, the script refuses with `precondition` and writes nothing.
 - It refuses: a property with keyframes; a Gyroflow effect; Lumetri Color index 7, 32 and 34; a
   property that holds an array (such as Position) or a colour; a value it cannot read; a number
   that is not finite or is 4294967296 or more; a name that does not match the index; an effect
   name that occurs twice without `--effect-index`; a clip on an audio track; a property that does
   not hold the `--expect-old` value.
 - A plan stops at the first write that is not stored. The entries after it do not run.
-- When a value crosses zero, 0 is written first. A value below zero gets two tries, then a
-  near value (-2.496 for -2.6). When nothing lands, the old value is put back. A near value that
-  lands still counts as not stored: tell the owner which value landed.
+- When a value goes from above zero to below zero, 0 is written first. A value below zero gets
+  two tries, then a near value (-2.496 for -2.6). When nothing lands, the old value is put
+  back. A near value that lands still counts as not stored: tell the owner which value landed.
 - Run a new plan with `--dry-run` first. It checks every target and writes nothing.
 
 ### live frame export and live lut set
 
+- While `live frame export` or `live lut set --prove` runs, proxy display is off and the target
+  sequence is active for every session. Do not run it while another session works on another
+  sequence. Tell the owner first.
 - `live frame export` exports the sequence named by `--sequence`, also when another one is
   active. It switches proxy display off and makes the sequence active, and puts both back
   after, unless someone changed it meanwhile; then it is left as it is, with a warning.
@@ -225,3 +235,24 @@ to know: `bridge_down` (the panel does not answer), `untested_bridge` and `untes
 `recovery_required`, `lease_busy` (the lock stayed busy for `--lease-wait`), `timeout`,
 `unknown_outcome` (a write may or may not have landed: a recovery is open), `not_stored`,
 `not_rendered`, `interrupted`, `doctor_failed`, `bad_args`.
+
+Codes of the recipes:
+- `precondition`: a target, a name or an `expect_old` value did not match. The write that
+  refused wrote nothing.
+- `refused_parameter`: the property or the value may not be written. `bad_plan`: the plan file
+  is not valid.
+- `target_moved`: a clip or an effect moved while other sessions had a turn. Nothing more was
+  written.
+- `not_applied`: Premiere did not pick up the command, often because a dialog is open. Nothing
+  was changed. Tell the owner.
+- `not_restored`: the frames were exported, but a switch was not put back. Run the put-back
+  commands that the warnings print.
+- `not_switched`: proxy display or the active sequence did not switch. Nothing was exported.
+- `export_failed`: a frame was not exported, or its file check failed. The output says what is
+  still switched.
+- `output_exists`, `output_dir`: a frame file exists, or the folder cannot be used. Nothing
+  was sent.
+- `lumetri_layout`: the Lumetri Color does not have the layout `live lut set` knows. Nothing
+  was written.
+- `ffmpeg_missing`, `ffmpeg_failed`: `--prove` needs ffmpeg, or ffmpeg could not read a frame.
+- `recipe_error`: a fault in this CLI. After an export, the output still names what is switched.

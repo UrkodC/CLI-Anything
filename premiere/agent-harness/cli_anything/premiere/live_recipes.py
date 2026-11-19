@@ -524,10 +524,13 @@ def live_frame_export(ctx: click.Context, sequence_id: str, sequence_name: str |
 
     file check: each file exists and is not empty. It is not a check of the picture.
 
+    While the command runs, proxy display is off and the sequence is active for every session that works in
+    Premiere. Do not run it while another session works on another sequence.
+
     The first frame that fails stops the run. The output lists the frames that were written. After a failed
     export Premiere may open a recovery. Then nothing more is written: the proxy display and the active sequence
-    may stay switched, and the output says how to put them back after the recovery, with
-    `cli-anything-premiere live app proxies on` and `cli-anything-premiere live app activate --sequence ID`.
+    may stay switched. The output names what is still switched (left_switched and the warnings) and prints the
+    commands that put it back. After the owner closes the recovery, run only the commands the output prints.
 
     A time at or after the end of the sequence is refused. --timeout is the longest wait for one frame (600
     seconds by default). A PNG still can carry alpha: composite it over black before you measure it.
@@ -666,8 +669,15 @@ def _lut_lines(payload: dict) -> list[str]:
     if clip:
         name = "?" if clip.get("name") is None else clip["name"]
         before, after = payload.get("path_before"), payload.get("path_after")
+        slot = payload.get("slot_before")
+        if before is not None:
+            shown = _set_value_text(before)
+        elif slot is None or slot in ("", lut.EMPTY_SLOT):
+            shown = "(no LUT)"
+        else:
+            shown = lut.short_value(slot)           # a value that is not a .cube path, as Premiere holds it
         line = (f"V{clip['track'] + 1}[{clip['clip']}] {name}, Lumetri Color[{payload.get('effect_index')}]: "
-                f"index 4 {_set_value_text(before) if before is not None else '(no LUT)'}")
+                f"index 4 {shown}")
         lines.append(line + (f" -> {_set_value_text(after)}" if after is not None else ""))   # nothing written: no arrow
     if payload.get("dry_run"):
         lines += [f"Would export: {path}" for path in payload.get("frames") or []]
@@ -749,10 +759,14 @@ def live_lut_set(ctx: click.Context, sequence_id: str, sequence_name: str | None
     that the clip is visible at that time and that the LUT is not an identity LUT. It is null when the exported
     frame did not change and a LUT was already in the slot or the frame before is one flat color; and when the two
     frames were not taken under the same conditions (someone changed proxy display or the active sequence during
-    the check, or that could not be read). The warnings say which. --prove replaces its own two files
-    (lut_before_... and lut_after_...) from an earlier run at the same time: it removes them before the first
-    export. It needs ffmpeg on PATH. Each export switches proxy display off and makes the sequence active, then
-    puts both back, as `live frame export` does.
+    the check, or that could not be read). The warnings say which. The slot counts as empty only when index 4
+    holds no path (the one character U+FEFE, or nothing) and index 6 reads 0. Any other value before the write,
+    such as a LUT chosen from the Input LUT menu, gives null with a warning that names it. --prove replaces its
+    own two files (lut_before_... and lut_after_...) from an earlier run at the same time: it removes them
+    before the first export. It needs ffmpeg on PATH. With --prove, each export waits up to 600 seconds, or up to
+    --timeout when that is longer. Each export switches proxy display off and makes the sequence active, then
+    puts both back, as `live frame export` does. While it runs, these switches hold for every session that works
+    in Premiere.
     """
     try:
         if node_id is not None:

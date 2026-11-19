@@ -24,9 +24,13 @@ A stop by the user (stops.is_stop: Ctrl-C, SIGTERM, SIGHUP, in any shape) ends t
   display off without a word is worse).
 - A write that ends as unknown_outcome (also one that a stop caused: only its message tells the two apart, and a
   message is not parsed) keeps its code and "stopped": false, and nothing further is written either.
-- A switch write of session A that was refused before it was sent (effects.NOTHING_SENT_CODES, and interrupted,
-  which the bridge raises for a write only before Premiere picked it up) did not switch anything: it is not put
-  back and not in left_switched.
+- A switch write of session A that was refused before it was sent (stops.not_sent: the codes of
+  stops.NOT_SENT_CODES, and interrupted, which the bridge raises for a write only before Premiere picked it up)
+  did not switch anything: it is not put back and not in left_switched.
+
+A fault of this program (an Exception that is neither a CliError nor a stop) never leaves export_frames as a
+traceback. It becomes CliError("recipe_error"), and the run takes the normal path: what was switched is put back
+(or named in left_switched), and the error carries the payload.
 
 These rules hold for one stop, wherever it arrives. A second stop that arrives while the first one is being
 handled is caught wherever a write could follow (_put_back, _restore, _export_all). Outside those it can leave
@@ -44,8 +48,7 @@ from pathlib import Path
 
 from cli_anything.premiere.core import guard, jsx
 from cli_anything.premiere.core.bridge import BridgeClient
-from cli_anything.premiere.core.recipes import effects
-from cli_anything.premiere.core.recipes.stops import STOPPED, as_error, ends_writes, is_stop
+from cli_anything.premiere.core.recipes.stops import STOPPED, as_error, ends_writes, is_stop, not_sent
 from cli_anything.premiere.core.session import DEFAULT_HARD_LIMIT_S, WriteSession, guarded_state
 from cli_anything.premiere.errors import CliError
 
@@ -56,9 +59,6 @@ TICKS_PER_SECOND = 254016000000
 PROGRAM = "cli-anything-premiere"
 PNG_ALPHA = "A PNG still can carry alpha. Composite it over black before you measure it."
 GUARD_REFUSED = "guard refused"
-# A write refused with one of these codes was not sent. "interrupted": BridgeClient.send raises it for a write
-# only when Premiere had not picked the command up (after the pickup a stop gives unknown_outcome).
-NOT_SENT_CODES = (*effects.NOTHING_SENT_CODES, "interrupted")
 
 
 def frame_name(prefix: str, seconds: float, fmt: str) -> str:
@@ -253,6 +253,12 @@ def _reason(err: CliError) -> str:
     return f"putting it back failed ({err.code}: {err.message}). When that is fixed"
 
 
+def _fault(exc: Exception) -> CliError:
+    """A fault of this program (an Exception that is neither a CliError nor a stop) as the error of the run, so the
+    normal path runs: the put-back, left_switched and the payload."""
+    return CliError("recipe_error", f"{type(exc).__name__}: {exc}")
+
+
 def _halt(session: WriteSession, exc: BaseException) -> CliError:
     """sw["halt"] after a write that ended every write of the run (stops.ends_writes): the error whose reason
     goes to each item that is not put back.
@@ -272,7 +278,7 @@ def _switch(session: WriteSession, sw: dict, item: str, send) -> dict:
     """One switch write of session A: send() is _set_proxies or _activate. The item is marked as sent, with its
     value unknown, before the send. A failure goes on to the caller, after this note of what it means:
 
-    - a CliError with a code of NOT_SENT_CODES: the write was not sent, so the item was not switched. It is not
+    - a CliError that stops.not_sent accepts: the write was not sent, so the item was not switched. It is not
       put back and not in left_switched;
     - a stop in any shape, or unknown_outcome (stops.ends_writes): no further write is sent in this run
       (sw["halt"]). A stop as KeyboardInterrupt or bridge.Interrupted does not say whether the write was sent:
@@ -283,7 +289,7 @@ def _switch(session: WriteSession, sw: dict, item: str, send) -> dict:
     try:
         return send()
     except BaseException as exc:
-        if isinstance(exc, CliError) and exc.code in NOT_SENT_CODES:
+        if not_sent(exc):
             sw[f"{item}_sent"], sw[f"{item}_now"] = False, sw[f"{item}_before"]
             if item == "active":
                 sw["active_unknown"] = False
@@ -300,7 +306,9 @@ def _put_back(session: WriteSession, sw: dict) -> None:
     - a write that ends as unknown_outcome: sw["stopped"] stays as it is.
 
     Both set sw["halt"]. With sw["halt"] set (also before the call) nothing is written, and every item that is
-    still switched gets the halt's reason. A stop does not leave this function."""
+    still switched gets the halt's reason. A stop does not leave this function. A fault of this program in one
+    item (an Exception that is neither a CliError nor a stop) becomes that item's reason (recipe_error), and the
+    next item is still tried."""
     sw["tried"] = True
     try:
         items = []
@@ -329,7 +337,10 @@ def _put_back(session: WriteSession, sw: dict) -> None:
                 sw[f"{item}_reason"] = _reason(CliError("session_closed", str(err)))
             except BaseException as exc:
                 if not (isinstance(exc, CliError) or is_stop(exc)):
-                    raise
+                    if not isinstance(exc, Exception):
+                        raise
+                    sw[f"{item}_reason"] = _reason(_fault(exc))
+                    continue
                 sw[f"{item}_reason"] = _reason(as_error(exc))
                 if is_stop(exc):
                     sw["stopped"] = True
@@ -346,7 +357,7 @@ def _put_back(session: WriteSession, sw: dict) -> None:
 
 
 def _restore(client: BridgeClient, guards: dict, project_path: str, sw: dict, warnings: list, *,
-             read_after: bool = False) -> None:
+             read_after: bool = False) -> CliError | None:
     """Session B: a new write session for the put-back. When it cannot start (a recovery marker, the lease,
     another project), nothing is written and the reason goes to every switch that is left.
 
@@ -356,8 +367,12 @@ def _restore(client: BridgeClient, guards: dict, project_path: str, sw: dict, wa
     With sw["halt"] set, no session opens: nothing may be written any more.
 
     A stop anywhere in here (the lease wait, the guard, the read, the put-back, giving the lease back) sets
-    sw["stopped"] and ends the put-back: nothing further is written. A stop does not leave this function."""
+    sw["stopped"] and ends the put-back: nothing further is written. A stop does not leave this function.
+
+    A fault of this program in here (an Exception that is neither a CliError nor a stop) is handled as a CliError
+    with the code recipe_error, and returned, so the caller can make it the error of the run. Otherwise None."""
     opened = False
+    fault = None
     try:
         if sw["halt"] is not None:
             _fail_all(sw, sw["halt"])
@@ -377,11 +392,14 @@ def _restore(client: BridgeClient, guards: dict, project_path: str, sw: dict, wa
         if is_stop(exc):
             sw["stopped"] = True
         elif not isinstance(exc, CliError):
-            raise
+            if not isinstance(exc, Exception):
+                raise
+            exc = fault = _fault(exc)
         err = as_error(exc)
         if opened or read_after:
             _note_unread(sw, err, warnings)
         _fail_all(sw, err)
+    return fault
 
 
 def _note_unread(sw: dict, err: CliError, warnings: list) -> None:
@@ -583,11 +601,13 @@ def _export_all(client: BridgeClient, make_session, times: list[float], paths: l
 # ---------- the whole command ----------
 def export_frames(client: BridgeClient, make_session, *, sequence_id, sequence_name=None, times: list[float],
                   out_dir: Path, prefix="frame", fmt="png", overwrite=False, proxies="off", dry_run=False,
-                  project=None, any_project=False, allow_untested=False, hard_limit_s=EXPORT_TIMEOUT_S) -> dict:
+                  project=None, any_project=False, allow_untested=False, hard_limit_s=EXPORT_TIMEOUT_S,
+                  script_limit_s=None) -> dict:
     """Export one still per time of one sequence. See the module docstring for the order of work.
 
     make_session(client) returns an McpSession (not started). hard_limit_s is the longest wait for one frame;
-    the scripts of the write sessions wait at most DEFAULT_HARD_LIMIT_S (or hard_limit_s when that is lower).
+    the scripts of the write sessions wait at most DEFAULT_HARD_LIMIT_S, or script_limit_s when that is lower
+    (hard_limit_s when script_limit_s is None).
 
     Returns {"sequence", "frames", "exported", "total", "proxies": {"before", "during", "after"},
     "active_sequence": {"before", "after"}, "left_switched", "changed_by_others": {"proxies", "active_sequence"}
@@ -613,7 +633,7 @@ def export_frames(client: BridgeClient, make_session, *, sequence_id, sequence_n
     if not dry_run:
         _make_folder(folder)
     guards = {"project": project, "any_project": any_project, "allow_untested": allow_untested,
-              "hard_limit_s": min(hard_limit_s, DEFAULT_HARD_LIMIT_S)}
+              "hard_limit_s": min(hard_limit_s if script_limit_s is None else script_limit_s, DEFAULT_HARD_LIMIT_S)}
     sw = _new_switches()
     frames: list[dict] = []
     warnings: list[str] = []
@@ -731,12 +751,16 @@ def export_frames(client: BridgeClient, make_session, *, sequence_id, sequence_n
                         raise
                     # A fault of this program: reported with the payload. (SIGTERM and SIGHUP arrive as
                     # bridge.Interrupted, which is an Exception: is_stop keeps them out of here.)
-                    raise CliError("recipe_error", f"{type(exc).__name__}: {exc}") from exc
+                    raise _fault(exc) from exc
         except BaseException as exc:
             if isinstance(exc, CliError):
                 run["error"] = exc
             elif is_stop(exc):
                 run["error"] = CliError("interrupted", f"{STOPPED} Check Premiere before another edit.")
+            elif isinstance(exc, Exception):
+                # A fault of this program outside the put-back above, such as an OSError as session A gives the
+                # lease back: what was switched is put back by session B, as after a failed export.
+                run["error"] = _fault(exc)
             else:
                 raise
         if is_stop(run["error"]):
@@ -753,7 +777,8 @@ def export_frames(client: BridgeClient, make_session, *, sequence_id, sequence_n
 
         # Session B: the read after, when every export ran without an error, then the put-back of what is still
         # switched. After a stop or a failed export, session B runs only when something is left to put back.
-        _restore(client, guards, run["project_path"], sw, warnings, read_after=run["exported"])
+        fault = _restore(client, guards, run["project_path"], sw, warnings, read_after=run["exported"])
+        run["error"] = run["error"] or fault
         return None
 
     outcome = None
@@ -768,7 +793,8 @@ def export_frames(client: BridgeClient, make_session, *, sequence_id, sequence_n
         # stop during the exports: one put-back when something is still switched and none was tried (_restore
         # does nothing otherwise, and handles a further stop itself), then the same end.
         sw["stopped"] = True
-        _restore(client, guards, run["project_path"], sw, warnings)
+        fault = _restore(client, guards, run["project_path"], sw, warnings)
+        run["error"] = run["error"] or fault
         outcome = finish()
     result, error = outcome
     if error is not None:

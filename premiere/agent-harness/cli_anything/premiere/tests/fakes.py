@@ -684,6 +684,11 @@ class EffectModel:
                 raise _Refused("the effect at this place changed")
             if prop["keyframed"] is not False:
                 raise _Refused("property is keyframed")
+            # effect_write.jsx: the value before the first setValue against expect_old (first attempt only)
+            from cli_anything.premiere.core.recipes.effects import _shown, same_value
+            if "expect_old" in args and not same_value(args["expect_old"], prop["value"]):
+                raise _Refused(f"the property holds {_shown(prop['value'])} now, not {_shown(args['expect_old'])} "
+                               "as the plan expects")
         except _Refused as exc:
             return exc.error()
         before, wanted = prop["value"], args["value"]

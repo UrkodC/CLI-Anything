@@ -102,7 +102,7 @@ cli-anything-premiere live state
 cli-anything-premiere recovery show
 ```
 
-The writes name their target by sequence ID, never by the selection or the playhead.
+The recipes that write name their target by sequence ID, never by the selection or the playhead.
 `live state` shows the ID of the active sequence. `cli-anything-premiere mcp call list_sequences`
 lists every sequence with its ID.
 
@@ -125,6 +125,10 @@ cli-anything-premiere live app activate --sequence ID
 
 After a failed export, the output says what is still switched. After the owner closes the
 recovery, run only the commands the output prints (`left_switched` and the warnings name them).
+
+While `live frame export` or `live lut set --prove` runs, proxy display is off and the target
+sequence is active for every session. Do not run it while another session works on another
+sequence. Tell the owner first.
 
 A plan file for `live effect set --from` looks like this:
 

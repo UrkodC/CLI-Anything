@@ -769,3 +769,39 @@ def test_a_written_marker_still_frees_the_lock(bridge_dir):
         err = send_error(client, write=True, timeout_s=0.3)
     assert err.code == "unknown_outcome" and "lock is kept" not in err.message
     assert not client.lease().retained and not (bridge_dir / LOCK).exists()
+
+
+# ---------- final fix A3: a marker that cannot be written is a CliError ----------
+def test_release_with_a_changed_owner_and_no_marker_is_a_cli_error_that_keeps_the_lock(bridge_dir, monkeypatch):
+    """N7.1: the owner record changed, and the marker cannot be written. The error is lease_lost with a plain
+    message (no OSError leaves release), the lease counts as retained, and the lock stays where it is."""
+    lease = bridge.Lease(bridge_dir)
+    lease.acquire()
+    owner = bridge_dir / LOCK / "owner.json"
+    owner.write_text(json.dumps({"version": 1, "pid": os.getpid(), "token": "someone-else"}))
+    calls = _cannot_mark(monkeypatch)
+    with pytest.raises(CliError) as e:
+        lease.release()
+    assert calls == ["unknown_command_outcome"]
+    assert e.value.code == "lease_lost"
+    assert "recovery marker could not be written" in e.value.message and "Check Premiere" in e.value.message
+    assert lease.retained and not lease.held
+    assert owner.exists() and bridge.read_recovery(bridge_dir) is None
+    lease.release()                                  # does nothing now
+    assert owner.exists()
+
+
+def test_a_dead_owner_without_a_marker_is_a_cli_error_and_is_not_reaped(bridge_dir, monkeypatch):
+    """N2.2: the lock of a dead process is cleared only after the marker is written. When the marker cannot be
+    written, acquire raises a CliError with a plain message, and the dead owner's lock stays."""
+    write_owner(bridge_dir, {"version": 1, "pid": dead_pid(), "token": "gone"})
+    calls = _cannot_mark(monkeypatch)
+    lease = bridge.Lease(bridge_dir, wait_s=2.0)
+    with pytest.raises(CliError) as e:
+        lease.acquire()
+    assert calls == ["abandoned_process_lease"]
+    assert e.value.code == "lease_busy"
+    assert "recovery marker could not be written" in e.value.message and "Nothing was sent." in e.value.message
+    assert not lease.held
+    assert json.loads((bridge_dir / LOCK / "owner.json").read_text())["token"] == "gone"
+    assert not (bridge_dir / ".host-owner-reaper").exists()

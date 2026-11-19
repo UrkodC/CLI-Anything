@@ -16,7 +16,7 @@ import pytest
 from cli_anything.premiere import live_cli
 from cli_anything.premiere.core import guard, jsx
 from cli_anything.premiere.core.bridge import BridgeClient
-from cli_anything.premiere.core.recipes import effects
+from cli_anything.premiere.core.recipes import effects, frames, stops
 from cli_anything.premiere.errors import CliError
 from cli_anything.premiere.premiere_cli import dispatch
 from cli_anything.premiere.core import bridge
@@ -1923,3 +1923,230 @@ def test_a_lone_surrogate_in_a_failure_prints_valid_json_and_human_text(live, ca
     assert dispatch([*SET, *BRIGHTNESS, "--value", "-2.6"]) == 1
     captured = capsys.readouterr()
     assert captured.err.startswith("Error: bad ") and "\udcff" not in captured.err
+
+
+# ---------- final fix A2: one "nothing was sent" rule ----------
+NOT_APPLIED_TEXT = "Premiere did not pick up the command. Nothing was changed."
+NOT_PICKED_UP = "Stopped before Premiere picked up the command. Nothing was changed."
+
+
+def refuse_write_send(monkeypatch, number: int, err: CliError) -> dict:
+    """BridgeClient.send raises `err` instead of sending the number-th effect_write script (as the bridge does
+    when Premiere did not pick the command up). Every other script goes out as before."""
+    original = BridgeClient.send
+    count = {"writes": 0}
+
+    def send(self, script, *, write, **kw):
+        if write and WRITE in script:
+            count["writes"] += 1
+            if count["writes"] == number:
+                raise err
+        return original(self, script, write=write, **kw)
+    monkeypatch.setattr(BridgeClient, "send", send)
+    return count
+
+
+def test_a_write_that_premiere_did_not_pick_up_was_not_sent(live, capsys, monkeypatch):
+    """The reviewer's probe (I3): not_applied comes only after the CLI deleted its own command file. The entry was
+    not written: no "may have landed", no entry result, nothing ran, and stored is false."""
+    model = EffectModel()
+    refuse_write_send(monkeypatch, 1, CliError("not_applied", NOT_APPLIED_TEXT))
+    code, out, _ = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3.0")
+    assert code == 1 and out["code"] == "not_applied"
+    assert "may have landed" not in out["error"] and NOT_APPLIED_TEXT in out["error"]
+    assert (out["results"], out["ran"], out["stored"], out["rendered"]) == ([], 0, False, None)
+    assert model.writes == [] and not (live / RECOVERY).exists() and not (live / LOCK).exists()
+
+
+def test_an_interrupted_first_send_does_not_say_the_write_may_have_landed(live, capsys, monkeypatch):
+    """The bridge raises interrupted for a write only before the pickup: nothing of that send went out. The entry
+    keeps its partial record (lut set needs it to tell a stop from a refusal), but the message drops "may have
+    landed"."""
+    model = EffectModel()
+    refuse_write_send(monkeypatch, 1, CliError("interrupted", NOT_PICKED_UP))
+    code, out, _ = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3.0")
+    assert code == 1 and out["code"] == "interrupted"
+    assert "may have landed" not in out["error"] and NOT_PICKED_UP in out["error"]
+    assert out["results"][0]["attempts"] == 0 and model.writes == []
+
+
+@pytest.mark.parametrize("code_name, text", [("not_applied", NOT_APPLIED_TEXT), ("interrupted", NOT_PICKED_UP)])
+def test_a_refusal_of_a_later_attempt_still_says_the_write_may_have_landed(live, capsys, monkeypatch, code_name, text):
+    """Attempt 1 of a negative value went out (it failed): a refusal of attempt 2 does not undo it."""
+    model = EffectModel()
+    model.fail(-2.6, times=1)
+    refuse_write_send(monkeypatch, 2, CliError(code_name, text))
+    code, out, _ = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "-2.6")
+    assert code == 1 and out["code"] == code_name
+    assert "may have landed" in out["error"] and "attempt 2" in out["error"]
+    assert out["results"][0]["stored"] is None and out["stored"] is None
+
+
+def test_the_not_sent_rule_lives_in_stops():
+    assert stops.NOT_SENT_CODES == ("precondition", "recovery_required", "bridge_down", "script_too_large",
+                                    "bad_args", "not_applied")
+    assert "interrupted" not in stops.NOT_SENT_CODES
+    assert stops.not_sent(CliError("not_applied", "x")) and stops.not_sent(CliError("interrupted", "x"))
+    assert not stops.not_sent(CliError("unknown_outcome", "x")) and not stops.not_sent(CliError("timeout", "x"))
+    assert not stops.not_sent(KeyboardInterrupt()) and not stops.not_sent(None)
+    assert not hasattr(effects, "NOTHING_SENT_CODES") and not hasattr(frames, "NOT_SENT_CODES")
+
+
+# ---------- final fix A1: a write after a breath keeps every check ----------
+def test_expect_old_is_checked_again_after_a_breath(live, capsys, tmp_path, monkeypatch):
+    """The reviewer's probe (I1): during the breath another session sets entry 1's property to 9.0, and the plan
+    expects 5.0 there. Entry 1 is not written; entry 0, written before the breath, stays in results."""
+    monkeypatch.setattr(bridge, "MAX_HOLD_S", 0.0)
+    model = EffectModel()
+
+    def other_session_changes_it():
+        model.clips[(0, 1)]["effects"][0]["properties"][0]["value"] = 9.0
+    model.moves[2] = other_session_changes_it
+    plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 3.0),
+                                            write_of(0, 1, "ProcAmp", 0, "Brightness", 4.0, expect_old=5.0)]}
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert model.resolves == 2
+    assert code == 1 and out["code"] == "precondition"
+    assert ("000f4250", 0, 0, 4.0) not in model.writes and model.writes == [("000f4243", 4, 0, 3.0)]
+    assert len(scripts(panel, WRITE)) == 1
+    assert out["error"].startswith("entry 1: ") and "9.0" in out["error"] and "5.0" in out["error"]
+    assert "Nothing more was written." in out["error"] and "Nothing was changed" not in out["error"]
+    assert "Entry 0 was written before" in out["error"]
+    assert [(r["entry"], r["stored"]) for r in out["results"]] == [(0, True)]
+    assert (out["ran"], out["total"], out["stored"], out["rendered"]) == (1, 2, False, None)
+    assert out["resolved"][1]["value_now"] == 9.0                       # the value the re-check read
+    assert not (live / RECOVERY).exists() and not (live / LOCK).exists()
+
+
+def test_every_refusal_is_checked_again_after_a_breath(live, capsys, tmp_path, monkeypatch):
+    """Not only expect_old: a property that got keyframes during the breath is refused before its write."""
+    monkeypatch.setattr(bridge, "MAX_HOLD_S", 0.0)
+    model = EffectModel()
+    model.moves[2] = lambda: model.clips[(0, 1)]["effects"][0]["properties"][0].update(keyframed=True)
+    plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 3.0),
+                                            write_of(0, 1, "ProcAmp", 0, "Brightness", 4.0)]}
+    code, out, _ = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 1 and out["code"] == "refused_parameter"
+    assert out["error"].startswith("entry 1: ") and "keyframes" in out["error"]
+    assert "Nothing more was written. Entry 0 was written before" in out["error"]
+    assert model.writes == [("000f4243", 4, 0, 3.0)]
+
+
+def test_a_written_entry_with_expect_old_is_not_checked_again(live, capsys, tmp_path, monkeypatch):
+    """Entry 0 expects 7.7 and writes 3.0. After the breath it holds 3.0, its own new value: the re-check covers only
+    the entries not yet written, so the plan goes on."""
+    monkeypatch.setattr(bridge, "MAX_HOLD_S", 0.0)
+    model = EffectModel()
+    plan = {"sequence_id": "s1", "writes": [write_of(0, 0, "ProcAmp", 0, "Brightness", 3.0, expect_old=7.7),
+                                            write_of(0, 1, "ProcAmp", 0, "Brightness", 4.0, expect_old=5.0)]}
+    code, out, panel = effect_set(live, capsys, model, "--from", plan_file(tmp_path, plan))
+    assert code == 0 and out["stored"] is True and model.resolves == 2
+    assert out["resolved"][0]["value_now"] == 7.7                       # a written entry keeps its value from before
+    assert [args.get("expect_old") for args in scripts(panel, WRITE)] == [7.7, 5.0]
+
+
+def test_the_write_script_gets_expect_old_on_the_first_attempt_only(live, capsys):
+    """Attempts 2 and 3 of a negative value, and the put-back, carry no expect_old: by then the property holds what
+    this command wrote."""
+    model = EffectModel()
+    model.fail(-2.6, times=2)
+    model.fail(-2.496, times=1)
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "-2.6", "--expect-old", "7.7")
+    assert code == 1 and out["code"] == "not_stored"
+    sent = scripts(panel, WRITE)
+    assert [args["value"] for args in sent] == [-2.6, -2.6, -2.496, 7.7]
+    assert ["expect_old" in args for args in sent] == [True, False, False, False]
+    assert sent[0]["expect_old"] == 7.7 and out["results"][0]["restored"] is True
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3.0")
+    assert code == 0 and "expect_old" not in scripts(panel, WRITE)[0]          # no --expect-old: no key
+
+
+def test_a_change_between_the_resolve_and_the_write_is_refused_by_the_script(live, capsys):
+    """The owner's own click, which the lease cannot order: the property changes after the resolve. The write script
+    reads it before its first setValue and refuses with precondition. Nothing is written."""
+    model = EffectModel()
+
+    def owner_clicks_first(script):
+        model.prop(0, 0, 4, 0)["value"] = 9.0
+        return model.write(script)
+    code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3.0", "--expect-old", "7.7",
+                                  extra={WRITE: owner_clicks_first})
+    assert code == 1 and out["code"] == "precondition"
+    assert "9.0" in out["error"] and "7.7" in out["error"] and "may have landed" not in out["error"]
+    assert (out["results"], out["ran"], out["stored"]) == ([], 0, False)
+    assert model.writes == [] and len(scripts(panel, WRITE)) == 1
+    assert not (live / RECOVERY).exists() and not (live / LOCK).exists()
+
+
+@needs_node
+def test_effect_write_script_refuses_an_expect_old_that_does_not_match():
+    """The real script: the value before the first setValue must be the same value as expect_old (the rules of
+    same_value: 0.001 for numbers, equal strings, equal booleans, never a number for a boolean, never null)."""
+    for prelude, over in [("", {"expect_old": 7.702}),                       # outside the tolerance
+                          ("", {"expect_old": "7.7"}),                       # a string is not a number
+                          (brightness(1), {"expect_old": True}),             # a boolean is not a number
+                          (brightness(0), {"expect_old": False}),
+                          (brightness(7.7, "{readThrows: true}"), {"expect_old": 7.7}),    # unreadable: refused
+                          (brightness(5), {"expect_old": 4, "value": -2.6})]:              # before the zero step
+        reply, seen = run_write(prelude, **over)
+        assert reply["success"] is False, (prelude, over)
+        assert reply["error"].startswith("Error: precondition: the property holds ")
+        assert "as the plan expects" in reply["error"]
+        assert seen["writes"] == [], (prelude, over)
+    reply, _ = run_write("", expect_old=7.702)
+    assert reply["error"] == "Error: precondition: the property holds 7.7 now, not 7.702 as the plan expects"
+    reply, _ = run_write(f"{PROCAMP}.properties[1] = wprop('Contrast', 'a');", index=1, name="Contrast", value="b",
+                         expect_old="x")
+    assert reply["error"] == 'Error: precondition: the property holds "a" now, not "x" as the plan expects'
+
+
+@needs_node
+def test_effect_write_script_writes_when_expect_old_matches():
+    for prelude, over in [("", {"expect_old": 7.7}), ("", {"expect_old": 7.7009}),
+                          (brightness(0), {"expect_old": 0}), (brightness(5), {"expect_old": 5, "value": -2.6}),
+                          (f"{PROCAMP}.properties[1] = wprop('Contrast', false);",
+                           {"index": 1, "name": "Contrast", "value": True, "expect_old": False}),
+                          (f"{PROCAMP}.properties[1] = wprop('Contrast', '');",
+                           {"index": 1, "name": "Contrast", "value": "b", "expect_old": ""})]:
+        reply, seen = run_write(prelude, **over)
+        assert reply["success"] is True and reply["data"]["set_error"] is None, (prelude, over)
+        assert seen["writes"][-1][1] == over.get("value", 3), (prelude, over)
+
+
+# ---------- final fix A4 (M1): every failure payload says stored and rendered ----------
+def test_every_failure_payload_has_stored_and_rendered(live, capsys, tmp_path):
+    model = EffectModel()
+    code, out, _ = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "3", "--expect-old", "1.0")
+    assert out["code"] == "precondition" and (out["stored"], out["rendered"]) == (False, None)
+    code, out, _ = effect_set(live, capsys, model, *_lumetri(7, "Input LUT", "1"))
+    assert out["code"] == "refused_parameter" and (out["stored"], out["rendered"]) == (False, None)
+    calls = []
+
+    def write(script):
+        calls.append(script)
+        return "not a dict" if len(calls) == 2 else model.write(script)
+    code, out, _ = effect_set(live, capsys, model, "--from", _two_entries(tmp_path), extra={WRITE: write})
+    assert out["code"] == "bad_reply" and (out["stored"], out["rendered"]) == (None, None)     # an unknown outcome
+    model.readback[4.0] = 1.0
+    code, out, _ = effect_set(live, capsys, model, "--from", _two_entries(tmp_path))
+    assert out["code"] == "not_stored" and (out["stored"], out["rendered"]) == (False, None)
+
+
+@needs_node
+def test_expect_old_runs_end_to_end_through_both_real_scripts(live, capsys):
+    """effect_resolve.jsx (the plan check) and effect_write.jsx (the check before the first setValue) read the same
+    value, so a matching --expect-old passes both, and one that does not match is refused by the plan check."""
+    state = {**RECIPE_STATE, "active_sequence": {"id": "S-B", "name": "Cut B"}}
+
+    def in_node(script: str):
+        code = SET_PRELUDE + "\nprocess.stdout.write(String(" + script + "));"
+        reply = json.loads(subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=30, check=True).stdout)
+        return reply["data"] if reply["success"] else Exception(reply["error"])
+    argv = [*SET, "--sequence", "S-A", "--track", "0", "--clip", "0", "--effect", "ProcAmp", "--index", "0", "--name",
+            "Brightness", "--value", "-2.6"]
+    with panel_on(live, handler=recipe_handler({RESOLVE: in_node, WRITE: in_node}, state=state)) as panel:
+        code, out = run_json(capsys, [*argv, "--expect-old", "7.7"])
+        code2, out2 = run_json(capsys, [*argv, "--expect-old", "7.0"])
+    assert code == 0 and out["stored"] is True and out["results"][0]["before"] == 7.7
+    assert [script_args(text)["expect_old"] for text in panel.seen if WRITE in text] == [7.7]
+    assert code2 == 1 and out2["code"] == "precondition" and "as the plan expects" in out2["error"]

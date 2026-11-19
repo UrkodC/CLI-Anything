@@ -18,6 +18,7 @@ from pathlib import Path
 
 from cli_anything.premiere.core import bridge, jsx
 from cli_anything.premiere.core.bridge import BridgeClient
+from cli_anything.premiere.core.recipes import stops
 from cli_anything.premiere.core.recipes.clips import _seconds, _tick, _whole
 from cli_anything.premiere.core.session import (DEFAULT_HARD_LIMIT_S, SOFT_TIMEOUT_S, WriteSession, guarded_state,
                                                 run_script)
@@ -411,46 +412,53 @@ def resolve_entries(session: WriteSession, entries: list[dict]) -> list[dict]:
     return resolved
 
 
-def _refused(number: int, why: str) -> CliError:
-    return CliError("refused_parameter", f"entry {number}: {why} Nothing was changed.")
+NOTHING_CHANGED = "Nothing was changed."
+
+
+def _refused(number: int, why: str, tail: str = NOTHING_CHANGED) -> CliError:
+    return CliError("refused_parameter", f"entry {number}: {why} {tail}")
 
 
 def _gyroflow(*names: object) -> bool:
     return any(isinstance(name, str) and "gyroflow" in name.lower() for name in names)
 
 
-def check_entries(entries: list[dict], resolved: list[dict]) -> None:
+def check_entries(entries: list[dict], resolved: list[dict], *, first: int = 0, tail: str = NOTHING_CHANGED) -> None:
     """Refuse the whole plan, before any write, when one entry may not be written. Raises
     CliError("refused_parameter") naming the entry, or CliError("precondition") for an expect_old that does not
-    match the value now. The checks use what Premiere said (the resolved names), not the plan's words."""
-    for number, (entry, found) in enumerate(zip(entries, resolved)):
+    match the value now. The checks use what Premiere said (the resolved names), not the plan's words.
+
+    first: the number of entries[0] in the plan (the messages name entry first + n); tail: the last sentence of a
+    refusal. set_effects runs this again after a breath over the entries not yet written, with the sentence that
+    says what was written before."""
+    for number, (entry, found) in enumerate(zip(entries, resolved), first):
         where = f"{found['effect']} index {found['index']}"
         if found["keyframed"] is not False:
             raise _refused(number, f"{where} has keyframes, or its keyframes could not be read. This command "
-                                   "writes only properties without keyframes.")
+                                   "writes only properties without keyframes.", tail)
         if _gyroflow(found["effect"], found["match_name"], entry["effect"]):
             raise _refused(number, f"{where} belongs to Gyroflow. Gyroflow ignores scripted writes, and a write to it "
-                                   "can leave a recovery.")
+                                   "can leave a recovery.", tail)
         if found["match_name"] == LUMETRI_MATCH and found["index"] in REFUSED_LUMETRI_INDEXES:
             raise _refused(number, f"Lumetri Color index {found['index']} is never written (indexes "
                                    f"{', '.join(str(i) for i in REFUSED_LUMETRI_INDEXES)}): index 7 is the second "
-                                   "Input LUT, and 32 and 34 are the Look slots, which do not render a LUT.")
+                                   "Input LUT, and 32 and 34 are the Look slots, which do not render a LUT.", tail)
         kind, value = found["kind"], entry["value"]
         if kind not in WRITABLE_KINDS:
             raise _refused(number, f"{where} holds a value of kind {kind}, and only numbers, strings and booleans "
                                    "can be written. Arrays (such as Position) and colours are refused, and so is a "
-                                   "value that could not be read.")
+                                   "value that could not be read.", tail)
         fits = {"number": _number(value) and not isinstance(value, bool), "string": isinstance(value, str),
                 "boolean": isinstance(value, bool)}[kind]
         if not fits:
             raise _refused(number, f"{where} holds a {kind}, and the value {json.dumps(value, ensure_ascii=False)} "
-                                   f"is not a {kind}.")
+                                   f"is not a {kind}.", tail)
         fault = _value_fault(value)
         if fault:
-            raise _refused(number, fault)
+            raise _refused(number, fault, tail)
         if "expect_old" in entry and not same_value(entry["expect_old"], found["value_now"]):
             raise CliError("precondition", f"entry {number}: {where} is {_shown(found['value_now'])} now, not "
-                                           f"{_shown(entry['expect_old'])} as the plan expects. Nothing was changed.")
+                                           f"{_shown(entry['expect_old'])} as the plan expects. {tail}")
 
 
 # ---------- write ----------
@@ -484,19 +492,17 @@ def _attempt_error(reply: dict, wanted: object) -> str | None:
     return None
 
 
-# Codes of a session.write failure that mean the script was not run, or refused before its first write.
-NOTHING_SENT_CODES = ("precondition", "recovery_required", "bridge_down", "script_too_large", "bad_args")
 PUT_BACK_FAILED = "Putting the old value back failed: "
 
 
 def _send(session: WriteSession, body: str, args: dict, value: object, where: str, wrote: bool) -> dict:
     """One session.write of effect_write.jsx with this value, its reply checked. A CliError is raised again with
-    `where` in front; "the write may have landed" is added when a write may have gone out (this send, or an
-    earlier one of the same entry: wrote)."""
+    `where` in front; "the write may have landed" is added when a write may have gone out (this send, unless
+    stops.not_sent says it never reached Premiere, or an earlier one of the same entry: wrote)."""
     try:
         reply = session.write(body, {**args, "value": value})
     except CliError as err:
-        landed = wrote or err.code not in NOTHING_SENT_CODES
+        landed = wrote or not stops.not_sent(err)
         tail = " Check this property in Premiere: the write may have landed." if landed else ""
         raise CliError(err.code, f"{where}: {err.message}{tail}") from None
     if not _reply_ok(reply):
@@ -510,7 +516,9 @@ def write_entry(session: WriteSession, entry: dict, resolved: dict) -> dict:
     session.write per attempt. A number below zero gets up to three attempts: the value, the value again, then
     near_value(value); a near value that lands is reported as "landed", and the entry is not stored. Any other
     value gets one attempt. An attempt failed when the write threw (set_error, also a zero step that did not
-    take) or when the read back is not same_value as the value written.
+    take) or when the read back is not same_value as the value written. The first attempt carries the entry's
+    expect_old, when it has one: the script then refuses with precondition before its first setValue when the
+    property does not hold that value.
 
     When nothing landed and the last read back shows that the property no longer holds its value from before
     the first attempt, that old value is written back once (one more session.write with the same script; it
@@ -535,8 +543,18 @@ def write_entry(session: WriteSession, entry: dict, resolved: dict) -> dict:
     errors: list[str] = []
     raw_before = raw_value = None
 
+    def attempt_args(attempt: int) -> dict:
+        """The script's arguments. expect_old goes with the first attempt only: the script refuses before its
+        first setValue when the property does not hold it. Later attempts and the put-back follow this
+        command's own writes, so they carry none."""
+        if attempt == 1 and "expect_old" in entry:
+            return {**args, "expect_old": entry["expect_old"]}
+        return args
+
     def unknown(err: CliError, sent: bool) -> CliError:
-        if sent or err.code not in NOTHING_SENT_CODES:
+        # stops.NOT_SENT_CODES, not stops.not_sent: an "interrupted" first send keeps its record (attempts 0),
+        # which lut.py reads to tell a stop from a refusal.
+        if sent or err.code not in stops.NOT_SENT_CODES:
             err.partial = {**result, "stored": None, "landed": None, "restored": None, "now": None,
                            "error": f"{err.code}: {err.message}"}
         else:
@@ -545,7 +563,8 @@ def write_entry(session: WriteSession, entry: dict, resolved: dict) -> dict:
 
     for attempt, value in enumerate(tries, 1):
         try:
-            reply = _send(session, body, args, value, f"entry {number}, attempt {attempt} of up to {len(tries)}",
+            reply = _send(session, body, attempt_args(attempt), value,
+                          f"entry {number}, attempt {attempt} of up to {len(tries)}",
                           wrote=attempt > 1)
         except CliError as err:
             raise unknown(err, attempt > 1) from None
@@ -591,6 +610,16 @@ def write_entry(session: WriteSession, entry: dict, resolved: dict) -> dict:
 
 
 # ---------- the whole command ----------
+def _more_written(results: list[dict]) -> str:
+    """The last sentence of a refusal after a breath: earlier entries ran, so "Nothing was changed" is not true."""
+    numbers = [str(r["entry"]) for r in results]
+    if len(numbers) == 1:
+        ran = f"Entry {numbers[0]} was written before (see results)."
+    else:
+        ran = f"Entries {', '.join(numbers[:-1])} and {numbers[-1]} were written before (see results)."
+    return f"Nothing more was written. {ran}" if numbers else "Nothing more was written."
+
+
 def _public(record: dict) -> dict:
     """A resolved record as the payload shows it."""
     clip = record["clip"]
@@ -615,13 +644,15 @@ def set_effects(client: BridgeClient, plan: dict, *, dry_run: bool = False, proj
     Order: check the plan (nothing sent), take the session (lease and write guards), target the sequence,
     resolve every entry in one read, refuse the whole plan when one entry may not be written, then (unless
     dry_run) write the entries in order. Between entries the session breathes; when it gave Premiere back, every
-    entry is resolved again and a clip whose node ID changed stops the batch with target_moved. The batch stops
-    at the first entry that is not stored.
+    entry is resolved again, a clip whose node ID changed stops the batch with target_moved, and check_entries
+    runs again on the entries not yet written (its refusals then say "Nothing more was written"). The batch
+    stops at the first entry that is not stored.
 
     Returns {"sequence", "resolved", "results", "ran", "total", "stored", "rendered": None, "warnings"}; with
     dry_run {"dry_run": True, "sequence", "resolved", "planned", "warnings"}. "stored" is True only when every
     entry ran and every entry is stored. A CliError raised after the plan check carries `payload` (results, ran,
-    total, resolved) so the caller sees what landed.
+    total, stored, rendered, resolved, warnings) so the caller sees what landed: stored is None when the outcome
+    of an entry is unknown, else False, and rendered is None.
     """
     plan = check_plan(plan)
     entries = plan["writes"]
@@ -631,8 +662,11 @@ def set_effects(client: BridgeClient, plan: dict, *, dry_run: bool = False, proj
     warnings: list[str] = []
 
     def progress() -> dict:
+        """The failure payload. stored: None when the outcome of an entry is unknown, else False (the run
+        failed, so not every entry is stored). rendered: None, as on success."""
+        stored = None if any(r["stored"] is None for r in results) else False
         return {"results": results, "ran": sum(r["stored"] is not None for r in results), "total": total,
-                "resolved": [_public(r) for r in resolved], "warnings": warnings}
+                "stored": stored, "rendered": None, "resolved": [_public(r) for r in resolved], "warnings": warnings}
 
     try:
         with WriteSession(client, project=project, any_project=any_project, allow_untested=allow_untested,
@@ -662,6 +696,11 @@ def set_effects(client: BridgeClient, plan: dict, *, dry_run: bool = False, proj
                             raise CliError("target_moved", f"entry {old['entry']}: the effect was at index "
                                                            f"{old['effect_index']} and is at {new['effect_index']} "
                                                            "now. Nothing more was written.")
+                    # Another session may have changed a value during the breath: every check runs again on the
+                    # entries not yet written, with what Premiere holds now. A written entry holds its own new
+                    # value, so its expect_old is not checked again, and its record keeps the value from before.
+                    resolved[number:] = again[number:]
+                    check_entries(entries[number:], resolved[number:], first=number, tail=_more_written(results))
                 lut = resolved[number]["match_name"] == LUMETRI_MATCH and entry["index"] in NOT_PROOF_LUMETRI_INDEXES
                 try:
                     result = write_entry(session, entry, resolved[number])

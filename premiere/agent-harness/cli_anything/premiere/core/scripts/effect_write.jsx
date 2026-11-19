@@ -6,7 +6,8 @@
 //        effect: string, effect_index: whole number or null (as the plan gives it),
 //        found_effect_index: whole number: the effect index that effect_resolve.jsx found,
 //        index: whole number, name: string (the exact display name), value: number, string or boolean,
-//        tolerance: number (how near a read back of the zero step must be to 0),
+//        tolerance: number (how near a read back of the zero step must be to 0, and an expect_old to the value),
+//        expect_old: number, string or boolean, only on the first attempt of an entry that has one,
 //        expect: {project_path, sequence_id, sequence_name} (added by the write session)}
 // Reply: {before, zero_first, set_error, value, read_error}
 // - before: prop.getValue() before anything is written (null when it throws or is not a plain value);
@@ -19,8 +20,9 @@
 // Every check comes before the first write, and each one is a "precondition:" refusal, which means nothing was
 // changed: __expect (the project and the sequence), the sequence ID, the clip, the effect and the property with
 // the finders of find.jsx, a clip on a video track (a node ID can name an audio clip), the clip's node ID against the one resolved, the effect index against the one resolved,
-// the keyframes, the value and the tolerance. After the first setValue nothing can throw: every host call sits in
-// its own try and the script always ends in __ok.
+// the keyframes, the value, the tolerance, and (when ARGS has the key expect_old) the value before against
+// expect_old with the rules of same_value in effects.py. After the first setValue nothing can throw: every host
+// call sits in its own try and the script always ends in __ok.
 //
 // Host calls follow tests/gates/run_gates.py (WRITE_PROPERTY_BODY, which ran on Premiere 27) and the server's
 // set_effect_property (dist/tools/keyframes.js):
@@ -43,6 +45,21 @@ var plain = function (value) {
 };
 var errorText = function (e) {
   try { return String(e); } catch (eText) { return "an error that cannot be shown"; }
+};
+// same_value of effects.py: two finite numbers within the tolerance, two equal strings, two equal booleans. A
+// boolean is never the same as a number, and null is never the same as anything.
+var sameValue = function (a, b, tol) {
+  if (typeof a === "boolean" || typeof b === "boolean") {
+    return typeof a === "boolean" && typeof b === "boolean" && a === b;
+  }
+  if (typeof a === "number" && typeof b === "number") return isFinite(a) && isFinite(b) && Math.abs(a - b) <= tol;
+  if (typeof a === "string" && typeof b === "string") return a === b;
+  return false;
+};
+var shownValue = function (value) {
+  if (value === null) return "nothing";
+  if (typeof value === "string") return "\"" + value + "\"";
+  return String(value);
 };
 
 var seq = __expect(ARGS.expect);
@@ -70,9 +87,14 @@ if (typeof tolerance !== "number" || !isFinite(tolerance) || tolerance < 0) {
   throw __precondition("the tolerance must be a number of 0 or more");
 }
 
-// From here on, nothing throws.
 var before = null;
 try { before = plain(prop.getValue()); } catch (eBefore) {}
+if (ARGS.hasOwnProperty("expect_old") && !sameValue(ARGS.expect_old, before, tolerance)) {
+  throw __precondition("the property holds " + shownValue(before) + " now, not " + shownValue(ARGS.expect_old) +
+                       " as the plan expects");
+}
+
+// From here on, nothing throws.
 var zeroFirst = false;
 if (typeof before === "number" && before > 0 && typeof wanted === "number" && wanted < 0) {
   zeroFirst = true;

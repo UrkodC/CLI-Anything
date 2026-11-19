@@ -386,7 +386,11 @@ class Lease:
         if pid_alive(owner[0]) or not self.reap:
             return False          # a live holder, or a dead one that this lease may not clear: wait
         with _Section():          # from the marker to the reaper folder's removal
-            mark_recovery(self.bridge_dir, "abandoned_process_lease")
+            try:
+                mark_recovery(self.bridge_dir, "abandoned_process_lease")
+            except OSError:       # no marker, no reaping: the dead owner's lock stays
+                raise CliError("lease_busy", "A program that ended holds Premiere, and the recovery marker could "
+                                             "not be written, so its lock was not cleared. Nothing was sent.") from None
             reaper = self.bridge_dir / REAPER_DIR
             try:
                 os.mkdir(reaper, 0o700)
@@ -416,7 +420,13 @@ class Lease:
             except (OSError, CliError):
                 owner = None
             if owner != mine:
-                mark_recovery(self.bridge_dir, "unknown_command_outcome")
+                try:
+                    mark_recovery(self.bridge_dir, "unknown_command_outcome")
+                except OSError:   # as _mark_unknown: no marker, so the lock is kept
+                    self.retain()
+                    raise CliError("lease_lost", "The lease changed while this program held it, and the recovery "
+                                                 "marker could not be written, so the lock is kept. Check Premiere "
+                                                 "before another edit.") from None
                 raise CliError("lease_lost", "The lease changed while this program held it. "
                                              "Check Premiere before another edit.")
             os.unlink(self._owner)

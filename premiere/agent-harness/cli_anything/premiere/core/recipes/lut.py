@@ -12,7 +12,11 @@ at --time before the write and after it, through export_frames, and compares the
 
 Order with --prove: the checks (no contact), session 1 (resolve, layout, the time inside the clip), frame A, its
 pixels, session 2 (resolve again, the target must not have moved, write 4 then 6), frame B, its pixels, the
-verdict. No MCP call is made while this process holds the lease: export_frames runs between the sessions.
+verdict. No MCP call is made while this process holds the lease: export_frames runs between the sessions. Each
+export waits max(--timeout, frames.EXPORT_TIMEOUT_S) for its frame.
+
+rendered is false only when the slot was empty before the write (slot_empty: index 4 held U+FEFE, "" or nothing,
+and index 6 read 0, in both reads before the write) and the frame did not change. Any other slot gives null.
 
 A stop by the user (stops.is_stop, in any shape and at any place after the checks) ends the run with the code
 interrupted and the payload. No write follows it and no verdict is made: before or during frame A nothing was
@@ -21,6 +25,7 @@ write that ends as unknown_outcome keeps that code; no write follows it either.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -30,7 +35,7 @@ from pathlib import Path
 
 from cli_anything.premiere.core.bridge import BridgeClient
 from cli_anything.premiere.core.recipes import effects, frames
-from cli_anything.premiere.core.recipes.stops import STOPPED, is_stop
+from cli_anything.premiere.core.recipes.stops import NOT_SENT_CODES, STOPPED, is_stop
 from cli_anything.premiere.core.session import DEFAULT_HARD_LIMIT_S, WriteSession
 from cli_anything.premiere.errors import CliError
 
@@ -60,6 +65,10 @@ UNKNOWN_CONDITIONS = ("The state of proxy display and the active sequence after 
                       "there is no verdict.")
 FOREIGN = ("Someone changed proxy display or the active sequence during the check. The two frames were not taken under "
            "the same conditions, so there is no verdict.")
+EMPTY_SLOT = "\ufefe"                          # what index 4 holds with no LUT (facts.md section 4)
+NOT_EMPTY = ("The picture did not change, but the LUT slot was not empty before the write (index 4 held {}, index 6 "
+             "read {}), so this run cannot show whether the new LUT renders.")
+SHORT_LIMIT = 60                               # characters of a value of index 4 in a warning or a human line
 NOT_RENDERED = ("The exported frame at {} s did not change after the write. The path is in index 4. Check that the "
                 "clip is visible at that time and that the LUT is not an identity LUT.")
 MENU_STOPPED = "the run was stopped before the write was sent"
@@ -206,6 +215,23 @@ def _slot_path(value) -> str | None:
     return value if isinstance(value, str) and value.lower().endswith(".cube/") else None
 
 
+def slot_empty(path_value, menu_value) -> bool:
+    """True when the slot held no LUT: index 4 holds U+FEFE, "" or nothing (None), and index 6 reads 0. A LUT chosen
+    from the Input LUT menu, or any other value in index 4, is not empty."""
+    return (path_value is None or path_value in ("", EMPTY_SLOT)) and effects._number(menu_value) and menu_value == 0
+
+
+def short_value(value) -> str:
+    """A value of index 4 in a warning or a human line: a text in double quotes, with U+FEFE shown as <U+FEFE> and
+    cut at 60 characters; "nothing" for None; anything else as effect set shows it."""
+    if not isinstance(value, str):
+        return effects._shown(value)
+    text = value.replace(EMPTY_SLOT, "<U+FEFE>")
+    if len(text) > SHORT_LIMIT:
+        text = text[:SHORT_LIMIT - 3] + "..."
+    return json.dumps(text, ensure_ascii=False)
+
+
 def _clip(record: dict) -> dict:
     clip = record["clip"]
     return {"node_id": clip["node_id"], "name": clip["name"], "track": clip["track"], "clip": clip["clip"],
@@ -254,7 +280,7 @@ def _stopped_unsent(err: CliError) -> bool:
 def _write(session: WriteSession, entries: list[dict], resolved: list[dict], out: dict) -> None:
     """Index 4, then (when it is stored) index 6. Fills out["stored"], ["path_after"], ["menu_value"] and the
     warnings. A CliError of a write is raised with the place in its message. No write follows a write that
-    raised, with one exception that is not a stop: index 6 refused before it was sent (NOTHING_SENT_CODES)."""
+    raised, with one exception that is not a stop: index 6 refused before it was sent (stops.NOT_SENT_CODES)."""
     out["stored"] = None                        # unknown while the write is in flight (a stop keeps it so)
     try:
         result = effects.write_entry(session, entries[1], resolved[1])
@@ -274,11 +300,11 @@ def _write(session: WriteSession, entries: list[dict], resolved: list[dict], out
     try:
         menu = effects.write_entry(session, entries[2], resolved[2])
     except CliError as err:
-        if err.code in effects.NOTHING_SENT_CODES and getattr(err, "partial", None) is None:
+        if err.code in NOT_SENT_CODES and getattr(err, "partial", None) is None:
             why = re.sub(r"^entry \d+, attempt \d+ of up to \d+: ", "", err.message)
             out["warnings"].append(MENU_NOT_WRITTEN.format(why.rstrip().rstrip(".")))     # refused, nothing sent: go on
             return
-        if _stopped_unsent(err):                # a stop is never "go on": interrupted is not in NOTHING_SENT_CODES
+        if _stopped_unsent(err):                # a stop is never "go on": interrupted is not in NOT_SENT_CODES
             out["warnings"].append(MENU_NOT_WRITTEN.format(MENU_STOPPED))
             raise CliError("interrupted", f"{STOPPED} The LUT path in index 4 was stored. The write of index 6 "
                                           "(Input LUT) was not sent: Premiere had not picked it up.") from None
@@ -295,12 +321,17 @@ def _export(client, make_session, sequence: dict, time: float, path: Path, prefi
             hard_limit_s: float, out: dict) -> dict:
     """One frame through export_frames. Its warnings (but the alpha note: frame_pixels composites over black) and
     its left_switched go into out; a failure is raised with export_frames' payload under out["export"] (and on the
-    error as `exported`). Returns export_frames' payload."""
+    error as `exported`). Returns export_frames' payload.
+
+    The frame waits max(hard_limit_s, frames.EXPORT_TIMEOUT_S), as `live frame export` does by default: a timeout
+    stops the server in the middle of an export and leaves a recovery. The scripts of its write sessions keep
+    hard_limit_s (--timeout)."""
     try:
         result = frames.export_frames(client, make_session, sequence_id=sequence["id"],
                                       sequence_name=sequence["name"], times=[time], out_dir=path.parent,
                                       prefix=prefix, fmt="png", overwrite=False, proxies="off",
-                                      hard_limit_s=hard_limit_s, **guards)
+                                      hard_limit_s=max(hard_limit_s, frames.EXPORT_TIMEOUT_S),
+                                      script_limit_s=hard_limit_s, **guards)
     except CliError as err:
         exported = getattr(err, "payload", None) or {}
         _take_export(out, exported)
@@ -375,12 +406,14 @@ def set_lut(client: BridgeClient, make_session, target: dict, lut: Path, *, effe
     counted from 0). effect_index picks one Lumetri Color when the clip has two. make_session(client) gives an
     McpSession for the exports of --prove; pixels(path) gives the rgb24 bytes of a still (frame_pixels).
 
-    Returns {"sequence", "clip", "lut", "effect_index", "path_before", "path_after", "menu_value", "stored",
-    "rendered", "difference", "frames", "left_switched", "warnings"}; with dry_run {"dry_run": True, ...} where
-    path_after is the text that would be written and frames the files that would be made. Raises CliError; one
+    Returns {"sequence", "clip", "lut", "effect_index", "path_before", "slot_before", "path_after", "menu_value",
+    "stored", "rendered", "difference", "frames", "left_switched", "warnings"}; with dry_run {"dry_run": True, ...}
+    where path_after is the text that would be written and frames the files that would be made. path_before is the
+    .cube path index 4 held before, or None; slot_before is the raw value of index 4 before. Raises CliError; one
     raised after the checks of the arguments carries `payload` (the same keys). Not stored: not_stored. With
     --prove: a frame that changed (also a flat one) gives true; the exported frame did not change, the slot was
-    empty before and frame A is not flat: not_rendered; no change with a path before or a flat frame A gives null;
+    empty before (slot_empty, in both reads before the write) and frame A is not flat: not_rendered; no change
+    with a slot that was not empty (a warning names what index 4 held) or a flat frame A gives null;
     a change by someone else, or a state after an export that could not be read (unknown), gives null whatever the
     difference. Frame A fails: its error, nothing written; stopped: interrupted, nothing written. Frame B fails:
     its error, with stored as it is and rendered None; stopped: interrupted, the same.
@@ -405,7 +438,8 @@ def set_lut(client: BridgeClient, make_session, target: dict, lut: Path, *, effe
         raise CliError("bad_args", "--time and --out-dir go with --prove. Nothing was sent.")
     guards = {"project": project, "any_project": any_project, "allow_untested": allow_untested}
     out = {"sequence": sequence, "clip": None, "lut": str(lut_path), "effect_index": None, "path_before": None,
-           "path_after": None, "menu_value": None, "stored": False, "rendered": None, "difference": None,
+           "slot_before": None, "path_after": None, "menu_value": None, "stored": False, "rendered": None,
+           "difference": None,
            "frames": [], "left_switched": None, "warnings": [NOT_PROOF]}
 
     def fail(err: CliError) -> CliError:
@@ -418,8 +452,18 @@ def set_lut(client: BridgeClient, make_session, target: dict, lut: Path, *, effe
         out["clip"] = _clip(resolved[1])
         out["effect_index"] = resolved[1]["effect_index"]
         out["path_before"] = _slot_path(resolved[1]["value_now"])
+        out["slot_before"] = resolved[1]["value_now"]
         if out["path_before"] == text and SAME_LUT not in out["warnings"]:
             out["warnings"].append(SAME_LUT)
+
+    # The slot before the write, from the two reads: session 1 (frame A shows it) and session 2 (the write follows
+    # it). It is empty only when both read empty; else "seen" holds the values of the first read that was not.
+    before_slot = {"empty": True, "seen": None}
+
+    def note_slot(resolved: list[dict]) -> None:
+        path_value, menu_value = resolved[1]["value_now"], resolved[2]["value_now"]
+        if before_slot["empty"] and not slot_empty(path_value, menu_value):
+            before_slot.update(empty=False, seen=(path_value, menu_value))
 
     def session() -> WriteSession:
         return WriteSession(client, hard_limit_s=hard_limit_s, **guards)
@@ -434,6 +478,7 @@ def set_lut(client: BridgeClient, make_session, target: dict, lut: Path, *, effe
                 first.target(sequence["id"], sequence["name"])
                 resolved = _resolve(first, entries)
                 found(resolved)
+                note_slot(resolved)
                 if prove:
                     _check_inside(resolved[1], time)
                 if dry_run:
@@ -464,6 +509,7 @@ def set_lut(client: BridgeClient, make_session, target: dict, lut: Path, *, effe
                     second.target(sequence["id"], sequence["name"])
                     again = _resolve(second, entries)
                     _same_target(resolved, again)
+                    note_slot(again)
                     _write(second, entries, again, out)
         except BaseException as exc:
             if isinstance(exc, CliError):
@@ -520,10 +566,13 @@ def set_lut(client: BridgeClient, make_session, target: dict, lut: Path, *, effe
             out["warnings"] += ([FOREIGN] if foreign else []) + ([UNKNOWN_CONDITIONS] if unknown else [])
         elif difference >= PROVE_THRESHOLD:
             out["rendered"] = True
-        elif flat or out["path_before"] is not None:
+        elif flat or not before_slot["empty"]:
             out["rendered"] = None                  # the FLAT warning is in already
             if out["path_before"] is not None:
                 out["warnings"].append(SAME_PICTURE)
+            elif not before_slot["empty"]:
+                path_value, menu_value = before_slot["seen"]
+                out["warnings"].append(NOT_EMPTY.format(short_value(path_value), effects._shown(menu_value)))
         else:
             out["rendered"] = False
             if late is None:
