@@ -316,6 +316,316 @@ def export_frame(request_id, arguments):
     reply(request_id, content({"ok": True, "tool": "export_frame", "data": data, "receipt": receipt}))
 
 
+# ---------- the timeline tools (live place, live effect apply) ----------
+# They load, change and save the TimelineModel file named by argv[2] (tests/fakes.py, TimelineModel). Each call is
+# logged in fake_mcp_calls.jsonl as {"tool", "arguments", "lease_held"}. The server's target guard: a call without
+# expected_project_path and expected_cep_target {"backend": "cep", "sequence_id"}, or one whose sequence is not the
+# active one, or whose project is not the model's, writes the recovery marker and fails (as GUARD above).
+# Steering words in item_id (set_item_in_out: MARKFAIL; overwrite_clip: FAIL, MARKER, UNVERIFIED) and in
+# effect_name (apply_effect: FAIL, QEADD). Quirks played as measured (measures.md, RESULTS Task 5): set_item_in_out
+# floors to the item frame and reports the applied seconds, and the marks stay on the item; overwrite_clip rounds
+# the start to the sequence frame and uses the item's marks; set_clip_duration rounds to a whole sequence frame and
+# moves a still's in point by 3600 s. New clips get the node IDs n0001, n0002, ...
+import math
+MODEL = sys.argv[2] if len(sys.argv) > 2 else None
+TPS = 254016000000
+STILL_IN_SHIFT = 3600 * TPS
+
+
+def log_call(tool, arguments):
+    held = os.path.exists(os.path.join(BRIDGE, ".host-owner-lease"))
+    with open(CALLS, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tool": tool, "arguments": arguments, "lease_held": held}) + "\n")
+
+
+def write_marker(nonce):
+    with open(os.path.join(BRIDGE, ".host-recovery.json"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"version": 1, "reason": "unknown_command_outcome", "nonce": nonce}))
+
+
+def model_load():
+    with open(MODEL, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def model_save(data):
+    tmp = MODEL + ".server.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, MODEL)
+
+
+def result(request_id, tool, data):
+    reply(request_id, content({"ok": True, "tool": tool, "data": data}))
+
+
+def guarded(request_id, data, arguments):
+    target = arguments.get("expected_cep_target")
+    active = data.get("active")
+    if (arguments.get("expected_project_path") != data["project"]["path"] or not isinstance(target, dict)
+            or target.get("backend") != "cep" or active is None or target.get("sequence_id") != active):
+        write_marker("fake-guard")
+        tool_error(request_id, GUARD_TEXT)
+        return False
+    return True
+
+
+def find_item(data, wanted):
+    for node_id, item in data["items"].items():          # __findProjectItem: node ID or name, first in walk order
+        if node_id == wanted or item["name"] == wanted:
+            return node_id, item
+    return None
+
+
+def track_clips(data, seq, kind, track):
+    found = [c for c in data["clips"] if c["sequence"] == seq and c["kind"] == kind and c["track"] == track]
+    return sorted(found, key=lambda c: c["start_ticks"])
+
+
+def find_clip(data, node_id):
+    for clip in data["clips"]:
+        if clip["sequence"] == data["active"] and clip["node_id"] == node_id:
+            return clip
+    return None
+
+
+def new_id(data):
+    number = data["next_id"]
+    data["next_id"] = number + 1
+    return "n%04d" % number
+
+
+def unlink(data, node_id):
+    for clip in data["clips"]:
+        if node_id in clip["linked"]:
+            clip["linked"].remove(node_id)
+
+
+def clear_range(data, seq, kind, track, start, end):
+    """Overwrite: what lies in [start, end) on the track is cut away."""
+    for clip in track_clips(data, seq, kind, track):
+        if clip["end_ticks"] <= start or clip["start_ticks"] >= end:
+            continue
+        if clip["start_ticks"] >= start and clip["end_ticks"] <= end:
+            data["clips"].remove(clip)
+            unlink(data, clip["node_id"])
+        elif clip["start_ticks"] < start and clip["end_ticks"] > end:
+            right = dict(clip, node_id=new_id(data), start_ticks=end, linked=[], effects=list(clip["effects"]),
+                         in_ticks=clip["in_ticks"] + (end - clip["start_ticks"]))
+            data["clips"].append(right)
+            clip["out_ticks"] -= clip["end_ticks"] - start
+            clip["end_ticks"] = start
+        elif clip["start_ticks"] < start:
+            clip["out_ticks"] -= clip["end_ticks"] - start
+            clip["end_ticks"] = start
+        else:
+            clip["in_ticks"] += end - clip["start_ticks"]
+            clip["start_ticks"] = end
+    if kind == "video":
+        data["transitions"] = [t for t in data["transitions"]
+                               if not (t["sequence"] == seq and t["track"] == track and t["start_ticks"] < end
+                                       and t["end_ticks"] > start)]
+
+
+def placed_on(data, seq, kind, track, node_id, start, frame):
+    return any(c["item"] == node_id and abs(c["start_ticks"] - start) <= frame
+               for c in track_clips(data, seq, kind, track))
+
+
+def set_item_in_out(request_id, arguments):
+    log_call("set_item_in_out", arguments)
+    data = model_load()
+    if not guarded(request_id, data, arguments):
+        return
+    wanted = str(arguments.get("item_id"))
+    if "MARKFAIL" in wanted:
+        tool_error(request_id, "Premiere rejected the requested project-item in point. Original marks were restored.")
+        return
+    found = find_item(data, wanted)
+    if found is None:
+        tool_error(request_id, "Item not found")
+        return
+    node_id, item = found
+    step = round(TPS / item["fps"])
+    out = {"item": item["name"], "inSet": "in_seconds" in arguments, "outSet": "out_seconds" in arguments,
+           "verified": True, "mediaType": 4}
+    for key, mark, word in (("in_seconds", "in_ticks", "In"), ("out_seconds", "out_ticks", "Out")):
+        if key in arguments:
+            ticks = min(int(math.floor(arguments[key] * item["fps"] + 1e-9)) * step, item["length_ticks"])
+            item[mark] = ticks
+            out["requested" + word + "Seconds"] = arguments[key]
+            out["applied" + word + "Seconds"] = ticks / TPS
+    model_save(data)
+    result(request_id, "set_item_in_out", out)
+
+
+def overwrite_clip(request_id, arguments):
+    log_call("overwrite_clip", arguments)
+    data = model_load()
+    if not guarded(request_id, data, arguments):
+        return
+    seq_id = data["active"]
+    seq = data["sequences"][seq_id]
+    frame = int(seq["frame_ticks"])
+    track, audio = arguments.get("track_index", 0), arguments.get("audio_track_index", 0)
+    if track >= seq["video_tracks"]:
+        tool_error(request_id, "Video track index %d is out of range." % track)
+        return
+    if audio >= seq["audio_tracks"]:
+        tool_error(request_id, "Audio track index %d is out of range." % audio)
+        return
+    wanted = str(arguments.get("item_id"))
+    found = find_item(data, wanted)
+    if found is None:
+        tool_error(request_id, "Project item not found: " + wanted)
+        return
+    node_id, item = found
+    if "MARKER" in wanted:
+        write_marker("fake-place")
+        tool_error(request_id, "overwrite_clip failed after dispatch; the outcome is unknown.")
+        return
+    if "FAIL" in wanted:
+        tool_error(request_id, "fake overwrite failure: nothing was changed")
+        return
+    start = int(round(arguments.get("start_seconds", 0) * TPS / frame)) * frame
+    span = item["out_ticks"] - item["in_ticks"]
+    length = max(int(round(span / frame)), 1) * frame
+    video, sound = item["has_video"], item["has_audio"]
+    was_video = placed_on(data, seq_id, "video", track, node_id, start, frame)
+    was_audio = placed_on(data, seq_id, "audio", audio, node_id, start, frame)
+    if (not video or was_video) and (not sound or was_audio):
+        tool_error(request_id, "overwrite_clip produced no verifiable new placement: project item %s was already "
+                               "present at %ss on the requested track(s)." % (item["name"], arguments.get("start_seconds")))
+        return
+    made = []
+    for kind, number, wanted_stream in (("video", track, video), ("audio", audio, sound and "UNVERIFIED" not in wanted)):
+        if not wanted_stream:
+            continue
+        clear_range(data, seq_id, kind, number, start, start + length)
+        clip = {"node_id": new_id(data), "sequence": seq_id, "kind": kind, "track": number, "item": node_id,
+                "start_ticks": start, "end_ticks": start + length, "in_ticks": item["in_ticks"],
+                "out_ticks": item["in_ticks"] + length, "linked": [],
+                "effects": ["Opacity", "Motion"] if kind == "video" else ["Volume"]}
+        data["clips"].append(clip)
+        made.append(clip)
+    for clip in made:
+        clip["linked"] = [c["node_id"] for c in made if c is not clip]
+    model_save(data)
+    if "UNVERIFIED" in wanted and sound:
+        tool_error(request_id, "overwrite_clip did not place the clip's audio on the requested video track %d / audio "
+                               "track %d. Inspect the timeline before retrying. outcome committed_unverified"
+                               % (track, audio))
+        return
+    result(request_id, "overwrite_clip", {
+        "overwritten": True, "verified": True, "item": item["name"], "trackIndex": track, "audioTrackIndex": audio,
+        "audioTrackAutoSelected": False, "startSeconds": arguments.get("start_seconds", 0),
+        "placedOnVideoTrack": bool(video), "placedOnAudioTrack": bool(sound)})
+
+
+def remove_from_timeline(request_id, arguments):
+    log_call("remove_from_timeline", arguments)
+    data = model_load()
+    if not guarded(request_id, data, arguments):
+        return
+    node_id = str(arguments.get("node_id"))
+    clip = find_clip(data, node_id)
+    if clip is None:
+        tool_error(request_id, "Clip not found: " + node_id)
+        return
+    if arguments.get("ripple") is True:
+        tool_error(request_id, "the fake server does not play a ripple removal")
+        return
+    removed = [node_id]
+    data["clips"].remove(clip)
+    if arguments.get("include_linked") is not False:
+        for other in list(data["clips"]):
+            if other["node_id"] in clip["linked"]:
+                data["clips"].remove(other)
+                removed.append(other["node_id"])
+    unlink(data, node_id)
+    model_save(data)
+    # Shaped like the recorded reply (measures/t5_m8_remove.json).
+    result(request_id, "remove_from_timeline", {"removed": True, "clipName": data["items"].get(clip["item"], {}).get("name"),
+                                                "removedClipIds": removed, "linkedPartnersRemoved": len(removed) - 1,
+                                                "verified": True})
+
+
+def set_clip_duration(request_id, arguments):
+    log_call("set_clip_duration", arguments)
+    data = model_load()
+    if not guarded(request_id, data, arguments):
+        return
+    node_id = str(arguments.get("node_id"))
+    clip = find_clip(data, node_id)
+    if clip is None:
+        tool_error(request_id, "Clip not found: " + node_id)
+        return
+    frame = int(data["sequences"][clip["sequence"]]["frame_ticks"])
+    end = clip["start_ticks"] + int(round(arguments["duration_seconds"] * TPS / frame)) * frame
+    if end - clip["start_ticks"] < frame:
+        tool_error(request_id, "The requested end must be at least one frame after the clip start.")
+        return
+    for other in track_clips(data, clip["sequence"], clip["kind"], clip["track"]):
+        if other is not clip and clip["start_ticks"] < other["start_ticks"] < end:
+            tool_error(request_id, "Refusing to extend: the requested end would overlap the next clip. No change "
+                                   "was attempted.")
+            return
+    delta = end - clip["end_ticks"]
+    still = bool(data["items"].get(clip["item"], {}).get("still"))
+    targets = [clip] + ([c for c in data["clips"] if c["node_id"] in clip["linked"]]
+                        if arguments.get("include_linked") is not False else [])
+    for target in targets:
+        target["end_ticks"] += delta
+        target["out_ticks"] += delta
+        if still and target is clip:
+            target["in_ticks"] += STILL_IN_SHIFT
+            target["out_ticks"] += STILL_IN_SHIFT
+    model_save(data)
+    # Shaped like the recorded reply (measures/t5_m9_dur.json).
+    result(request_id, "set_clip_duration", {
+        "outcome": "verified", "verified": True, "changed": True,
+        "clipName": data["items"].get(clip["item"], {}).get("name"), "trackType": clip["kind"],
+        "trackIndex": clip["track"], "timelineStart": clip["start_ticks"] / TPS, "timelineEnd": clip["end_ticks"] / TPS,
+        "durationSeconds": (clip["end_ticks"] - clip["start_ticks"]) / TPS,
+        "previousEnd": (clip["end_ticks"] - delta) / TPS, "inPoint": clip["in_ticks"] / TPS,
+        "outPoint": clip["out_ticks"] / TPS, "isStillImage": still, "requestedSeconds": arguments["duration_seconds"],
+        "appliedSeconds": (clip["end_ticks"] - clip["start_ticks"]) / TPS,
+        "linkedPartnersEdited": [t["node_id"] for t in targets if t is not clip]})
+
+
+def apply_effect(request_id, arguments):
+    log_call("apply_effect", arguments)
+    data = model_load()
+    if not guarded(request_id, data, arguments):
+        return
+    node_id = str(arguments.get("node_id"))
+    clip = find_clip(data, node_id)
+    if clip is None:
+        tool_error(request_id, "Clip not found: " + node_id)
+        return
+    name = str(arguments.get("effect_name"))
+    if "FAIL" in name:
+        tool_error(request_id, "Premiere added no component for " + name + "; nothing was changed.")
+        return
+    before = len(clip["effects"])
+    clip["effects"].append(name)
+    model_save(data)
+    if "QEADD" in name:
+        tool_error(request_id, "Do not retry blindly: QE may have added the effect even when it is missing from "
+                               "the DOM component list. Inspect the clip before retrying.")
+        return
+    result(request_id, "apply_effect", {
+        "effect": name, "clipName": data["items"].get(clip["item"], {}).get("name"),
+        "componentCountBefore": before, "componentCountAfter": before + 1,
+        "addedComponents": [{"displayName": name, "matchName": name}], "applied": True, "verified": True,
+        "outcome": "verified"})
+
+
+TIMELINE_TOOLS = {"set_item_in_out": set_item_in_out, "overwrite_clip": overwrite_clip,
+                  "remove_from_timeline": remove_from_timeline, "set_clip_duration": set_clip_duration,
+                  "apply_effect": apply_effect}
+
+
 initialized = False
 for line in sys.stdin:
     line = line.strip()
@@ -361,6 +671,8 @@ for line in sys.stdin:
             export_frame(rid, arguments)
         elif name == "calls":
             reply(rid, content({"calls": recorded_calls()}))
+        elif name in TIMELINE_TOOLS and MODEL is not None:     # not in TOOLS either
+            TIMELINE_TOOLS[name](rid, arguments)
         else:
             fail(rid, -32602, "Unknown tool: " + str(name))
     else:
@@ -368,11 +680,13 @@ for line in sys.stdin:
 '''
 
 
-def fake_mcp_command(tmp_path, bridge_dir) -> list[str]:
-    """Write the fake server to a file in tmp_path and return the command that starts it."""
+def fake_mcp_command(tmp_path, bridge_dir, timeline=None) -> list[str]:
+    """Write the fake server to a file in tmp_path and return the command that starts it. timeline: the file of a
+    TimelineModel, for the timeline tools (set_item_in_out, overwrite_clip, remove_from_timeline,
+    set_clip_duration, apply_effect)."""
     path = Path(tmp_path) / "fake_mcp_server.py"
     path.write_text(FAKE_MCP_SERVER, encoding="utf-8")
-    return [sys.executable, str(path), str(bridge_dir)]
+    return [sys.executable, str(path), str(bridge_dir)] + ([] if timeline is None else [str(timeline)])
 
 
 # ---------- a child that takes and gives back the lease while signals hit it ----------
@@ -1129,3 +1443,277 @@ class KeysModel:
         self.writes.append(("scale", node_id, args["value"]))
         prop["value"] = float32(self.scale_lands.pop(node_id, args["value"]))
         return {"before": before, "zero_first": False, "set_error": None, "value": prop["value"], "read_error": None}
+
+
+# ---------- a timeline behind the fake panel and the fake MCP server (live place, live effect apply) ----------
+TIMELINE_TPS = 254016000000
+TIMELINE_FRAME = 10594584000            # one frame at 23.976 fps (seq.timebase)
+TIMELINE_PROJECT = "/p/X Claude.prproj"
+STILL_EXTENSIONS = ("png", "jpg", "jpeg", "tif", "tiff", "psd", "gif", "bmp", "exr")
+STILL_FPS = 29.97                       # what a still item reads as its frame rate (measure M9)
+STILL_SECONDS = 4.96                    # the import length of a still (measure M9)
+
+
+class TimelineModel:
+    """A small Premiere timeline in a JSON file, shared by the fake panel (reads: state.jsx, app_switch.jsx,
+    place_read.jsx, clip_list.jsx) and the fake MCP server (the timeline tools of FAKE_MCP_SERVER, which load,
+    change and save the same file; give the file to fake_mcp_command).
+
+        model = TimelineModel(tmp_path / "timeline.json")          # s1 "Main" (3 video, 6 audio tracks), o1 active
+        model.add_item("000f4241", name="C0001.MP4")                 # picture and sound, 23.976 fps
+        model.add_item("still1", name="card.png", still=True)        # a still: picture only, 4.96 s
+        model.add_clip("000f4241", node_id="x1", track=0, start_f=0, frames=48)
+        panel = FakePanel(bridge_dir, handler=model.handler())
+
+    The file holds {"project": {name, path}, "active": sequence ID or None, "proxies", "sequences": {id: {name,
+    frame_ticks, video_tracks, audio_tracks}}, "items": {node ID: {name, has_video, has_audio, still, fps,
+    length_ticks, in_ticks, out_ticks (the item marks), path, is_sequence}}, "clips": [{node_id, sequence, kind
+    ("video" or "audio"), track, item, start_ticks, end_ticks, in_ticks, out_ticks, linked, effects}],
+    "transitions": [{sequence, track, start_ticks, end_ticks}], "next_id"}. Ticks are integers.
+
+    Records: `writes` lists the app_switch writes as ("activate", id); `place_reads` counts the place_read scripts;
+    `before_place_read` maps a place_read number (1 is the first) to a function run before it answers.
+    """
+
+    def __init__(self, path, *, active: str | None = "o1", video_tracks: int = 3, audio_tracks: int = 6,
+                 frame_ticks: int = TIMELINE_FRAME) -> None:
+        self.path = Path(path)
+        self.writes: list[tuple] = []
+        self.place_reads = 0
+        self.before_place_read: dict[int, Callable[[], None]] = {}
+        self.save({"project": {"name": "X Claude.prproj", "path": TIMELINE_PROJECT}, "active": active, "proxies": 1,
+                   "sequences": {"s1": {"name": "Main", "frame_ticks": frame_ticks, "video_tracks": video_tracks,
+                                        "audio_tracks": audio_tracks},
+                                 "o1": {"name": "Old", "frame_ticks": frame_ticks, "video_tracks": 1,
+                                        "audio_tracks": 1}},
+                   "items": {}, "clips": [], "transitions": [], "next_id": 1})
+
+    # ---------- the file ----------
+    def load(self) -> dict:
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def save(self, data: dict) -> None:
+        tmp = self.path.with_name(self.path.name + ".panel.tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def change(self, fn: Callable[[dict], None]) -> None:
+        data = self.load()
+        fn(data)
+        self.save(data)
+
+    # ---------- set up ----------
+    def add_item(self, node_id: str, *, name: str | None = None, video: bool = True, audio: bool = True,
+                 still: bool = False, fps: float | None = None, length_seconds: float | None = None,
+                 path: str | None = None) -> None:
+        name = name or (f"{node_id}.png" if still else f"{node_id}.MP4")
+        fps = fps or (STILL_FPS if still else 24000 / 1001)
+        length = round((length_seconds or (STILL_SECONDS if still else 600.0)) * TIMELINE_TPS)
+
+        def add(data):
+            data["items"][node_id] = {"name": name, "has_video": video, "has_audio": audio and not still,
+                                      "still": still, "fps": fps, "length_ticks": length, "in_ticks": 0,
+                                      "out_ticks": length, "path": path or f"/media/{name}", "is_sequence": False}
+        self.change(add)
+
+    def add_clip(self, item: str, *, node_id: str, kind: str = "video", track: int = 0, start_f: int = 0,
+                 frames: int = 48, in_f: int = 0, sequence: str = "s1", link: str | None = None,
+                 effects: list | None = None) -> None:
+        def add(data):
+            frame = int(data["sequences"][sequence]["frame_ticks"])
+            start, length = start_f * frame, frames * frame
+            fps = data["items"][item]["fps"] if item in data["items"] else 24000 / 1001
+            in_ticks = in_f * round(TIMELINE_TPS / fps)
+            data["clips"].append({"node_id": node_id, "sequence": sequence, "kind": kind, "track": track,
+                                  "item": item, "start_ticks": start, "end_ticks": start + length,
+                                  "in_ticks": in_ticks, "out_ticks": in_ticks + length,
+                                  "linked": [link] if link else [],
+                                  "effects": list(effects) if effects is not None else
+                                  (["Opacity", "Motion"] if kind == "video" else ["Volume"])})
+            if link:
+                for other in data["clips"]:
+                    if other["node_id"] == link and node_id not in other["linked"]:
+                        other["linked"].append(node_id)
+        self.change(add)
+
+    def add_transition(self, *, track: int = 0, start_f: int, end_f: int, sequence: str = "s1") -> None:
+        def add(data):
+            frame = int(data["sequences"][sequence]["frame_ticks"])
+            data["transitions"].append({"sequence": sequence, "track": track, "start_ticks": start_f * frame,
+                                        "end_ticks": end_f * frame})
+        self.change(add)
+
+    def activate(self, sequence_id: str | None) -> None:
+        self.change(lambda data: data.__setitem__("active", sequence_id))
+
+    def clips(self, kind: str | None = None, track: int | None = None, sequence: str = "s1") -> list[dict]:
+        found = [c for c in self.load()["clips"] if c["sequence"] == sequence and (kind is None or c["kind"] == kind)
+                 and (track is None or c["track"] == track)]
+        return sorted(found, key=lambda c: (c["kind"], c["track"], c["start_ticks"]))
+
+    def item(self, node_id: str) -> dict:
+        return self.load()["items"][node_id]
+
+    # ---------- the panel ----------
+    def handler(self) -> Callable[[str], str]:
+        inner = recipe_handler({"recipe: app_switch": self.app_switch, "recipe: place_read": self.place_read,
+                                "recipe: clip_list": self.clip_list})
+
+        def handle(script: str) -> str:
+            if RECIPE_STATE_MARK in script:
+                return json.dumps({"success": True, "data": self.state()})
+            return inner(script)
+        return handle
+
+    @staticmethod
+    def _ref(data: dict, seq_id):
+        if seq_id is None or seq_id not in data["sequences"]:
+            return None
+        return {"id": seq_id, "name": data["sequences"][seq_id]["name"]}
+
+    def state(self) -> dict:
+        data = self.load()
+        return {**RECIPE_STATE, "projects": [{**data["project"], "active": True}],
+                "active_sequence": self._ref(data, data["active"])}
+
+    @staticmethod
+    def _expect(args: dict, data: dict):
+        """__expect of find.jsx. Returns the expected sequence ID, or None."""
+        expect = args.get("expect") or {}
+        if expect.get("project_path") != data["project"]["path"]:
+            raise _Refused(f"the active project is {data['project']['path']}, not {expect.get('project_path')}")
+        seq_id = expect.get("sequence_id")
+        if seq_id is None:
+            return None
+        if seq_id not in data["sequences"]:
+            raise _Refused(f"no sequence has the ID {seq_id}")
+        name = expect.get("sequence_name")
+        if name is not None and name != data["sequences"][seq_id]["name"]:
+            raise _Refused(f"sequence {seq_id} is named {data['sequences'][seq_id]['name']}, not {name}")
+        return seq_id
+
+    def app_switch(self, script: str):
+        args = script_args(script)
+        data = self.load()
+        try:
+            expected = self._expect(args, data)
+        except _Refused as exc:
+            return exc.error()
+        action = args.get("action")
+        if action == "read":
+            seq = None
+            if expected is not None:
+                seq = {**self._ref(data, expected), "end_ticks": str(600 * TIMELINE_TPS)}
+            return {"proxies": data["proxies"], "active_sequence": self._ref(data, data["active"]), "sequence": seq}
+        if action == "activate":
+            wanted = args.get("sequence_id")
+            if wanted not in data["sequences"]:
+                return Exception(f"Error: precondition: no sequence has the ID {wanted}")
+            before = self._ref(data, data["active"])
+            self.writes.append(("activate", wanted))
+            data["active"] = wanted
+            self.save(data)
+            return {"before": before, "after": self._ref(data, wanted), "set_error": None}
+        if action == "proxies":
+            self.writes.append(("proxies", 1 if args.get("enabled") else 0))
+            before = data["proxies"]
+            data["proxies"] = 1 if args.get("enabled") else 0
+            self.save(data)
+            return {"before": before, "after": data["proxies"], "set_error": None}
+        return Exception(f"Error: precondition: the action must be read, proxies or activate, not {action}")
+
+    @staticmethod
+    def _clip_record(clip: dict) -> dict:
+        return {"node_id": clip["node_id"], "item": clip["item"], "start_ticks": str(clip["start_ticks"]),
+                "end_ticks": str(clip["end_ticks"]), "in_ticks": str(clip["in_ticks"]),
+                "out_ticks": str(clip["out_ticks"])}
+
+    def place_read(self, script: str):
+        """place_read.jsx, played in Python with the same reply."""
+        self.place_reads += 1
+        hook = self.before_place_read.get(self.place_reads)
+        if hook is not None:
+            hook()
+        args = script_args(script)
+        data = self.load()
+        try:
+            seq_id = self._expect(args, data)
+            if seq_id is None:
+                raise _Refused("the script got no sequence ID")
+        except _Refused as exc:
+            return exc.error()
+        seq = data["sequences"][seq_id]
+        frame = int(seq["frame_ticks"])
+        room = frame / 2
+        items = []
+        for wanted in args["items"]:
+            wanted = str(wanted)
+            by_name = [node for node, item in data["items"].items() if item["name"] == wanted]
+            node = wanted if wanted in data["items"] else (by_name[0] if len(by_name) == 1 else None)
+            record = {"query": wanted, "found": node is not None, "node_id": node, "name": None,
+                      "matches": len(by_name), "has_video": None, "has_audio": None, "still": None,
+                      "is_sequence": None, "frame_rate": None}
+            if node is not None:
+                item = data["items"][node]
+                extension = item["path"].rsplit(".", 1)[-1].lower() if "." in item["path"] else ""
+                record.update(name=item["name"], has_video=item["has_video"], has_audio=item["has_audio"],
+                              still=extension in STILL_EXTENSIONS, is_sequence=item["is_sequence"],
+                              frame_rate=item["fps"])
+            items.append(record)
+
+        def on(kind: str, track: int, start: float, end: float):
+            limit = seq["video_tracks"] if kind == "video" else seq["audio_tracks"]
+            if track >= limit:
+                return None
+            return [self._clip_record(c) for c in data["clips"]
+                    if c["sequence"] == seq_id and c["kind"] == kind and c["track"] == track
+                    and c["start_ticks"] < end - room and c["end_ticks"] > start + room]
+        spans = []
+        for span in args["spans"]:
+            start, end = float(span["start_ticks"]), float(span["end_ticks"])
+            spans.append({"entry": span["entry"], "video": on("video", span["track"], start, end),
+                          "audio": on("audio", span["audio_track"], start, end)})
+        first = None
+        v1 = sorted((c for c in data["clips"] if c["sequence"] == seq_id and c["kind"] == "video" and c["track"] == 0),
+                    key=lambda c: c["start_ticks"])
+        if v1:
+            head = any(t["sequence"] == seq_id and t["track"] == 0
+                       and t["start_ticks"] - room <= v1[0]["start_ticks"] <= t["end_ticks"] + room
+                       for t in data["transitions"])
+            first = {"node_id": v1[0]["node_id"], "start_ticks": str(v1[0]["start_ticks"]), "head_transition": head}
+        return {"sequence": {"id": seq_id, "name": seq["name"], "frame_ticks": str(frame),
+                             "video_tracks": seq["video_tracks"], "audio_tracks": seq["audio_tracks"]},
+                "items": items, "spans": spans, "first_v1": first}
+
+    def clip_list(self, script: str):
+        """clip_list.jsx, played in Python (the fields a test of the timeline needs)."""
+        args = script_args(script)
+        data = self.load()
+        seq_id = args.get("sequence_id") or data["active"]
+        if seq_id not in data["sequences"]:
+            return Exception(f"Error: precondition: no sequence has the ID {seq_id}")
+        kinds = ("video", "audio") if args.get("track_type", "both") == "both" else (args["track_type"],)
+        found = []
+        for kind in kinds:
+            limit = data["sequences"][seq_id]["video_tracks" if kind == "video" else "audio_tracks"]
+            for track in range(limit):
+                if args.get("track") is not None and args["track"] != track:
+                    continue
+                here = sorted((c for c in data["clips"] if c["sequence"] == seq_id and c["kind"] == kind
+                               and c["track"] == track), key=lambda c: c["start_ticks"])
+                for number, clip in enumerate(here):
+                    item = data["items"].get(clip["item"], {})
+                    record = {"track_type": kind, "track": track, "clip": number, "node_id": clip["node_id"],
+                              "name": item.get("name"), "start_ticks": str(clip["start_ticks"]),
+                              "end_ticks": str(clip["end_ticks"]), "in_ticks": str(clip["in_ticks"]),
+                              "out_ticks": str(clip["out_ticks"]), "enabled": True, "speed": 1,
+                              "adjustment_layer": False,
+                              "source": {"node_id": clip["item"], "name": item.get("name"), "path": item.get("path")},
+                              "effects": list(clip["effects"])}
+                    if args.get("detail"):
+                        record.update(interpreted_fps=item.get("fps"), linked=list(clip["linked"]), keyframed=[],
+                                      transitions={"head": None, "tail": None})
+                    found.append(record)
+        offset, limit = args.get("offset", 0), args.get("limit", 400)
+        return {"sequence": self._ref(data, seq_id), "used_active": args.get("sequence_id") is None,
+                "total": len(found), "clips": found[offset:offset + limit]}

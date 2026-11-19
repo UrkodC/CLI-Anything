@@ -1,0 +1,882 @@
+{
+ "fps": 23.976023976023978,
+ "shots": [
+  {
+   "name": "S01",
+   "item": "000f4241",
+   "track": 0,
+   "audio_track": 5,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 3.003,
+   "in_f": 72,
+   "src_in": 3.003,
+   "src_out": 8.75875,
+   "start_f": 0,
+   "end_f": 138,
+   "frames": 138,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S02",
+   "item": "000f4242",
+   "track": 0,
+   "audio_track": 1,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 0.0,
+   "in_f": 0,
+   "src_in": 0.0,
+   "src_out": 3.294958,
+   "start_f": 138,
+   "end_f": 217,
+   "frames": 79,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S03",
+   "item": "000f4243",
+   "track": 0,
+   "audio_track": 0,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 5.588917,
+   "in_f": 134,
+   "src_in": 5.588917,
+   "src_out": 8.091417,
+   "start_f": 217,
+   "end_f": 277,
+   "frames": 60,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S04",
+   "item": "000f4245",
+   "track": 0,
+   "audio_track": 1,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 0.5005,
+   "in_f": 12,
+   "src_in": 0.5005,
+   "src_out": 2.085417,
+   "start_f": 277,
+   "end_f": 315,
+   "frames": 38,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S05",
+   "item": "000f424c",
+   "track": 0,
+   "audio_track": 0,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 1.126125,
+   "in_f": 27,
+   "src_in": 1.126125,
+   "src_out": 7.882875,
+   "start_f": 315,
+   "end_f": 477,
+   "frames": 162,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S06",
+   "item": "000f4244",
+   "track": 0,
+   "audio_track": 1,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 0.917583,
+   "in_f": 22,
+   "src_in": 0.917583,
+   "src_out": 3.878875,
+   "start_f": 477,
+   "end_f": 548,
+   "frames": 71,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S07",
+   "item": "000f4249",
+   "track": 0,
+   "audio_track": 0,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 8.5085,
+   "in_f": 204,
+   "src_in": 8.5085,
+   "src_out": 12.5125,
+   "start_f": 548,
+   "end_f": 644,
+   "frames": 96,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S08",
+   "item": "000f4247",
+   "track": 0,
+   "audio_track": 1,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 0.291958,
+   "in_f": 7,
+   "src_in": 0.291958,
+   "src_out": 4.295958,
+   "start_f": 644,
+   "end_f": 740,
+   "frames": 96,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S09",
+   "item": "000f4248",
+   "track": 0,
+   "audio_track": 0,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 0.417083,
+   "in_f": 10,
+   "src_in": 0.417083,
+   "src_out": 4.587917,
+   "start_f": 740,
+   "end_f": 840,
+   "frames": 100,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S10",
+   "item": "000f4246",
+   "track": 0,
+   "audio_track": 1,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 3.670333,
+   "in_f": 88,
+   "src_in": 3.670333,
+   "src_out": 5.880875,
+   "start_f": 840,
+   "end_f": 893,
+   "frames": 53,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S11",
+   "item": "000f424b",
+   "track": 0,
+   "audio_track": 0,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 2.5025,
+   "in_f": 60,
+   "src_in": 2.5025,
+   "src_out": 5.5055,
+   "start_f": 893,
+   "end_f": 965,
+   "frames": 72,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S12",
+   "item": "000f424a",
+   "track": 0,
+   "audio_track": 1,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 0.291958,
+   "in_f": 7,
+   "src_in": 0.291958,
+   "src_out": 3.795458,
+   "start_f": 965,
+   "end_f": 1049,
+   "frames": 84,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S13",
+   "item": "000f424d",
+   "track": 0,
+   "audio_track": 0,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 2.585917,
+   "in_f": 62,
+   "src_in": 2.585917,
+   "src_out": 5.296958,
+   "start_f": 1049,
+   "end_f": 1114,
+   "frames": 65,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S14",
+   "item": "000f424e",
+   "track": 0,
+   "audio_track": 1,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 9.009,
+   "in_f": 216,
+   "src_in": 9.009,
+   "src_out": 11.720042,
+   "start_f": 1114,
+   "end_f": 1179,
+   "frames": 65,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S15",
+   "item": "000f424f",
+   "track": 0,
+   "audio_track": 0,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 0.5005,
+   "in_f": 12,
+   "src_in": 0.5005,
+   "src_out": 5.714042,
+   "start_f": 1179,
+   "end_f": 1304,
+   "frames": 125,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S16",
+   "item": "000f4250",
+   "track": 0,
+   "audio_track": 5,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 2.043708,
+   "in_f": 49,
+   "src_in": 2.043708,
+   "src_out": 3.586917,
+   "start_f": 1304,
+   "end_f": 1341,
+   "frames": 37,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S17",
+   "item": "000f4251",
+   "track": 0,
+   "audio_track": 5,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 1.626625,
+   "in_f": 39,
+   "src_in": 1.626625,
+   "src_out": 6.006,
+   "start_f": 1341,
+   "end_f": 1446,
+   "frames": 105,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S18",
+   "item": "000f4253",
+   "track": 0,
+   "audio_track": 5,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 0.208542,
+   "in_f": 5,
+   "src_in": 0.208542,
+   "src_out": 4.087417,
+   "start_f": 1446,
+   "end_f": 1539,
+   "frames": 93,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S19",
+   "item": "000f4252",
+   "track": 0,
+   "audio_track": 5,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 9.009,
+   "in_f": 216,
+   "src_in": 9.009,
+   "src_out": 14.014,
+   "start_f": 1539,
+   "end_f": 1659,
+   "frames": 120,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S20",
+   "item": "000f4254",
+   "track": 0,
+   "audio_track": 5,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 9.009,
+   "in_f": 216,
+   "src_in": 9.009,
+   "src_out": 12.804458,
+   "start_f": 1659,
+   "end_f": 1750,
+   "frames": 91,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S21",
+   "item": "000f4256",
+   "track": 0,
+   "audio_track": 0,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 0.0,
+   "in_f": 0,
+   "src_in": 0.0,
+   "src_out": 0.583917,
+   "start_f": 1750,
+   "end_f": 1764,
+   "frames": 14,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S22",
+   "item": "000f4257",
+   "track": 0,
+   "audio_track": 1,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 0.125125,
+   "in_f": 3,
+   "src_in": 0.125125,
+   "src_out": 0.959292,
+   "start_f": 1764,
+   "end_f": 1784,
+   "frames": 20,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S23",
+   "item": "000f4257",
+   "track": 0,
+   "audio_track": 0,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 2.544208,
+   "in_f": 61,
+   "src_in": 2.544208,
+   "src_out": 3.086417,
+   "start_f": 1784,
+   "end_f": 1797,
+   "frames": 13,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S24",
+   "item": "000f4258",
+   "track": 0,
+   "audio_track": 1,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 0.0,
+   "in_f": 0,
+   "src_in": 0.0,
+   "src_out": 0.625625,
+   "start_f": 1797,
+   "end_f": 1812,
+   "frames": 15,
+   "media_length": null,
+   "note": ""
+  },
+  {
+   "name": "S25",
+   "item": "000f4258",
+   "track": 0,
+   "audio_track": 0,
+   "item_fps": 23.976023976023978,
+   "src_in_req": 4.462792,
+   "in_f": 107,
+   "src_in": 4.462792,
+   "src_out": 8.299958,
+   "start_f": 1812,
+   "end_f": 1904,
+   "frames": 92,
+   "media_length": null,
+   "note": ""
+  }
+ ],
+ "calls": [
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4241",
+    "in_seconds": 3.004,
+    "out_seconds": 8.75975,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4241",
+    "start_seconds": 0.001,
+    "track_index": 0,
+    "audio_track_index": 5,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4242",
+    "in_seconds": 0.001,
+    "out_seconds": 3.295958,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4242",
+    "start_seconds": 5.75675,
+    "track_index": 0,
+    "audio_track_index": 1,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4243",
+    "in_seconds": 5.589917,
+    "out_seconds": 8.092417,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4243",
+    "start_seconds": 9.051708,
+    "track_index": 0,
+    "audio_track_index": 0,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4245",
+    "in_seconds": 0.5015,
+    "out_seconds": 2.086417,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4245",
+    "start_seconds": 11.554208,
+    "track_index": 0,
+    "audio_track_index": 1,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f424c",
+    "in_seconds": 1.127125,
+    "out_seconds": 7.883875,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f424c",
+    "start_seconds": 13.139125,
+    "track_index": 0,
+    "audio_track_index": 0,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4244",
+    "in_seconds": 0.918583,
+    "out_seconds": 3.879875,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4244",
+    "start_seconds": 19.895875,
+    "track_index": 0,
+    "audio_track_index": 1,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4249",
+    "in_seconds": 8.5095,
+    "out_seconds": 12.5135,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4249",
+    "start_seconds": 22.857167,
+    "track_index": 0,
+    "audio_track_index": 0,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4247",
+    "in_seconds": 0.292958,
+    "out_seconds": 4.296958,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4247",
+    "start_seconds": 26.861167,
+    "track_index": 0,
+    "audio_track_index": 1,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4248",
+    "in_seconds": 0.418083,
+    "out_seconds": 4.588916,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4248",
+    "start_seconds": 30.865167,
+    "track_index": 0,
+    "audio_track_index": 0,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4246",
+    "in_seconds": 3.671333,
+    "out_seconds": 5.881875,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4246",
+    "start_seconds": 35.036,
+    "track_index": 0,
+    "audio_track_index": 1,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f424b",
+    "in_seconds": 2.5035,
+    "out_seconds": 5.5065,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f424b",
+    "start_seconds": 37.246542,
+    "track_index": 0,
+    "audio_track_index": 0,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f424a",
+    "in_seconds": 0.292958,
+    "out_seconds": 3.796458,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f424a",
+    "start_seconds": 40.249542,
+    "track_index": 0,
+    "audio_track_index": 1,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f424d",
+    "in_seconds": 2.586917,
+    "out_seconds": 5.297959,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f424d",
+    "start_seconds": 43.753042,
+    "track_index": 0,
+    "audio_track_index": 0,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f424e",
+    "in_seconds": 9.01,
+    "out_seconds": 11.721042,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f424e",
+    "start_seconds": 46.464083,
+    "track_index": 0,
+    "audio_track_index": 1,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f424f",
+    "in_seconds": 0.5015,
+    "out_seconds": 5.715042,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f424f",
+    "start_seconds": 49.175125,
+    "track_index": 0,
+    "audio_track_index": 0,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4250",
+    "in_seconds": 2.044708,
+    "out_seconds": 3.587916,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4250",
+    "start_seconds": 54.388667,
+    "track_index": 0,
+    "audio_track_index": 5,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4251",
+    "in_seconds": 1.627625,
+    "out_seconds": 6.007,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4251",
+    "start_seconds": 55.931875,
+    "track_index": 0,
+    "audio_track_index": 5,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4253",
+    "in_seconds": 0.209542,
+    "out_seconds": 4.088417,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4253",
+    "start_seconds": 60.31125,
+    "track_index": 0,
+    "audio_track_index": 5,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4252",
+    "in_seconds": 9.01,
+    "out_seconds": 14.015,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4252",
+    "start_seconds": 64.190125,
+    "track_index": 0,
+    "audio_track_index": 5,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4254",
+    "in_seconds": 9.01,
+    "out_seconds": 12.805458,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4254",
+    "start_seconds": 69.195125,
+    "track_index": 0,
+    "audio_track_index": 5,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4256",
+    "in_seconds": 0.001,
+    "out_seconds": 0.584917,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4256",
+    "start_seconds": 72.990583,
+    "track_index": 0,
+    "audio_track_index": 0,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4257",
+    "in_seconds": 0.126125,
+    "out_seconds": 0.960292,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4257",
+    "start_seconds": 73.5745,
+    "track_index": 0,
+    "audio_track_index": 1,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4257",
+    "in_seconds": 2.545208,
+    "out_seconds": 3.087416,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4257",
+    "start_seconds": 74.408667,
+    "track_index": 0,
+    "audio_track_index": 0,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4258",
+    "in_seconds": 0.001,
+    "out_seconds": 0.626625,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4258",
+    "start_seconds": 74.950875,
+    "track_index": 0,
+    "audio_track_index": 1,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "set_item_in_out",
+   "args": {
+    "item_id": "000f4258",
+    "in_seconds": 4.463792,
+    "out_seconds": 8.300959,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  },
+  {
+   "tool": "overwrite_clip",
+   "args": {
+    "item_id": "000f4258",
+    "start_seconds": 75.5765,
+    "track_index": 0,
+    "audio_track_index": 0,
+    "expected_project_path": "/p/X Claude.prproj"
+   }
+  }
+ ]
+}

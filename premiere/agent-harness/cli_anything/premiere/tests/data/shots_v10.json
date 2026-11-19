@@ -1,0 +1,232 @@
+{
+ "fps": "24000/1001",
+ "shots": [
+  {
+   "name": "S01",
+   "item": "000f4241",
+   "start_f": 0,
+   "frames": 138,
+   "track": 0,
+   "audio_track": 5,
+   "cam_in_f": 72,
+   "cam_fps": "120000/1001",
+   "interpreted": true
+  },
+  {
+   "name": "S02",
+   "item": "000f4242",
+   "start_f": 138,
+   "frames": 79,
+   "track": 0,
+   "audio_track": 1,
+   "src_in_f": 0
+  },
+  {
+   "name": "S03",
+   "item": "000f4243",
+   "start_f": 217,
+   "frames": 60,
+   "track": 0,
+   "audio_track": 0,
+   "src_in_f": 134
+  },
+  {
+   "name": "S04",
+   "item": "000f4245",
+   "start_f": 277,
+   "frames": 38,
+   "track": 0,
+   "audio_track": 1,
+   "src_in_f": 12
+  },
+  {
+   "name": "S05",
+   "item": "000f424c",
+   "start_f": 315,
+   "frames": 162,
+   "track": 0,
+   "audio_track": 0,
+   "src_in_f": 27
+  },
+  {
+   "name": "S06",
+   "item": "000f4244",
+   "start_f": 477,
+   "frames": 71,
+   "track": 0,
+   "audio_track": 1,
+   "src_in_f": 22
+  },
+  {
+   "name": "S07",
+   "item": "000f4249",
+   "start_f": 548,
+   "frames": 96,
+   "track": 0,
+   "audio_track": 0,
+   "src_in_f": 204
+  },
+  {
+   "name": "S08",
+   "item": "000f4247",
+   "start_f": 644,
+   "frames": 96,
+   "track": 0,
+   "audio_track": 1,
+   "src_in_f": 7
+  },
+  {
+   "name": "S09",
+   "item": "000f4248",
+   "start_f": 740,
+   "frames": 100,
+   "track": 0,
+   "audio_track": 0,
+   "src_in_f": 10
+  },
+  {
+   "name": "S10",
+   "item": "000f4246",
+   "start_f": 840,
+   "frames": 53,
+   "track": 0,
+   "audio_track": 1,
+   "src_in_f": 88
+  },
+  {
+   "name": "S11",
+   "item": "000f424b",
+   "start_f": 893,
+   "frames": 72,
+   "track": 0,
+   "audio_track": 0,
+   "src_in_f": 60
+  },
+  {
+   "name": "S12",
+   "item": "000f424a",
+   "start_f": 965,
+   "frames": 84,
+   "track": 0,
+   "audio_track": 1,
+   "src_in_f": 7
+  },
+  {
+   "name": "S13",
+   "item": "000f424d",
+   "start_f": 1049,
+   "frames": 65,
+   "track": 0,
+   "audio_track": 0,
+   "src_in_f": 62
+  },
+  {
+   "name": "S14",
+   "item": "000f424e",
+   "start_f": 1114,
+   "frames": 65,
+   "track": 0,
+   "audio_track": 1,
+   "src_in_f": 216
+  },
+  {
+   "name": "S15",
+   "item": "000f424f",
+   "start_f": 1179,
+   "frames": 125,
+   "track": 0,
+   "audio_track": 0,
+   "src_in_f": 12
+  },
+  {
+   "name": "S16",
+   "item": "000f4250",
+   "start_f": 1304,
+   "frames": 37,
+   "track": 0,
+   "audio_track": 5,
+   "src_in_f": 49
+  },
+  {
+   "name": "S17",
+   "item": "000f4251",
+   "start_f": 1341,
+   "frames": 105,
+   "track": 0,
+   "audio_track": 5,
+   "src_in_f": 39
+  },
+  {
+   "name": "S18",
+   "item": "000f4253",
+   "start_f": 1446,
+   "frames": 93,
+   "track": 0,
+   "audio_track": 5,
+   "src_in_f": 5
+  },
+  {
+   "name": "S19",
+   "item": "000f4252",
+   "start_f": 1539,
+   "frames": 120,
+   "track": 0,
+   "audio_track": 5,
+   "src_in_f": 216
+  },
+  {
+   "name": "S20",
+   "item": "000f4254",
+   "start_f": 1659,
+   "frames": 91,
+   "track": 0,
+   "audio_track": 5,
+   "src_in_f": 216
+  },
+  {
+   "name": "S21",
+   "item": "000f4256",
+   "start_f": 1750,
+   "frames": 14,
+   "track": 0,
+   "audio_track": 0,
+   "src_in_f": 0
+  },
+  {
+   "name": "S22",
+   "item": "000f4257",
+   "start_f": 1764,
+   "frames": 20,
+   "track": 0,
+   "audio_track": 1,
+   "src_in_f": 3
+  },
+  {
+   "name": "S23",
+   "item": "000f4257",
+   "start_f": 1784,
+   "frames": 13,
+   "track": 0,
+   "audio_track": 0,
+   "src_in_f": 61
+  },
+  {
+   "name": "S24",
+   "item": "000f4258",
+   "start_f": 1797,
+   "frames": 15,
+   "track": 0,
+   "audio_track": 1,
+   "src_in_f": 0
+  },
+  {
+   "name": "S25",
+   "item": "000f4258",
+   "start_f": 1812,
+   "frames": 92,
+   "track": 0,
+   "audio_track": 0,
+   "src_in_f": 107
+  }
+ ]
+}

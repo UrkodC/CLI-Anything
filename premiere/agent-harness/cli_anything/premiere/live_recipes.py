@@ -18,7 +18,7 @@ from pathlib import Path
 import click
 
 from cli_anything.premiere import live_cli
-from cli_anything.premiere.core.recipes import clips, effects, frames, keys, lut, results
+from cli_anything.premiere.core.recipes import clips, effects, frames, keys, lut, place, results
 from cli_anything.premiere.errors import CliError
 from cli_anything.premiere.live_cli import (DEFAULT_LEASE_WAIT_S, STOPPED_LOOK, STOPPED_RUN, _client, _warning_lines,
                                             live, live_options, stops_cleanly)
@@ -1030,3 +1030,85 @@ def live_keys_set(ctx: click.Context, sequence_id: str, sequence_name: str | Non
         _entries_failure(ctx, err)
         return
     _emit(ctx, payload, _keys_set_text(payload))
+
+
+# ---------- live place ----------
+def _place_planned_line(item: dict) -> str:
+    """One line of a dry run: what one shot would get."""
+    head = f"  {item['entry']} " + ("" if item.get("name") is None else f"{item['name']} ")
+    if item.get("refusal"):
+        return head + f"refused | {item['refusal']['code']}: {item['refusal']['reason']}"
+    if item.get("skip"):
+        return head + f"nothing to do | {item['skip']}"
+    what = [call["tool"] for call in item.get("calls") or []] + [call["tool"] for call in item.get("after") or []]
+    return head + f"{item['would']} | {item.get('node_id')}: " + ", ".join(what)
+
+
+def _marks_lines(payload: dict) -> list[str]:
+    """Marks: 000f4241 in 3.003 s, out 8.75875 s (set by shot 0). The item marks stay as set."""
+    return [f"Marks: {m['item']} in {_seconds_text(m.get('in_seconds'))} s, out {_seconds_text(m.get('out_seconds'))} "
+            f"s (set by shot {m.get('set_by')})" for m in payload.get("marks") or []]
+
+
+def _place_text(payload: dict) -> str:
+    if payload.get("dry_run"):
+        lines = [_place_planned_line(item) for item in payload["planned"]]
+        lines.append("Dry run: nothing was written.")
+    else:
+        lines = _entry_lines(payload) + _marks_lines(payload)
+    return "\n".join(lines + _warning_lines(payload.get("warnings") or []))
+
+
+@live.command("place")
+@click.option("--sequence", "sequence_id", required=True, metavar="ID",
+              help="ID of the sequence to place the shots on (see `live state`).")
+@click.option("--sequence-name", "sequence_name", metavar="NAME",
+              help="The name the sequence must have. Nothing is written when it is named otherwise.")
+@click.option("--plan", "plan_path", required=True, type=click.Path(path_type=Path), metavar="SHOTS.json",
+              help="The placement plan: {\"fps\", \"shots\": [...]}, as the film planner reads it.")
+@click.option("--overwrite", is_flag=True,
+              help="Place a shot over clips that lie in its span: they are cut. Without it, such a shot is refused.")
+@click.option("--skip-refused", "skip_refused", is_flag=True,
+              help="Place the other shots when one is refused. Without it, one refusal stops the run before any "
+                   "write.")
+@click.option("--dry-run", "dry_run", is_flag=True,
+              help="Read and check every shot, show the exact calls, and write nothing. The active sequence is not "
+                   "switched.")
+@click.option("--project", help="Path of the project that must be the active one.")
+@click.option("--any-project", is_flag=True,
+              help="Allow a write to a project that is not a Claude working copy. Needs --project.")
+@live_options
+@json_option
+@click.pass_context
+@stops_cleanly(STOPPED_RUN)
+def live_place(ctx: click.Context, sequence_id: str, sequence_name: str | None, plan_path: Path, overwrite: bool,
+               skip_refused: bool, dry_run: bool, project: str | None, any_project: bool, lease_wait: float,
+               timeout: float, allow_untested: bool) -> None:
+    """Place the shots of a placement plan on a sequence, frame-exact, and check each one.
+
+    Per shot: set_item_in_out marks the part of the project item, then overwrite_clip places it at its start on
+    its video and audio track. Overwrite only, never insert. The item marks stay as set, and the output lists
+    them. A shot with "audio_only": true is placed with its picture on its track, then the picture is removed and
+    the sound kept. A still that comes in shorter than its shot is extended to the planned length.
+
+    Every shot is checked before the first write: the item (by node ID, or by a name only one item has), the
+    tracks, overlaps inside the plan, and the clips already in the span. A shot that is already in place is
+    skipped, so a re-run finishes a partial run. A clip in the span is refused unless --overwrite. The plan's fps
+    must match the sequence.
+
+    The tools work on the active sequence, so the command makes this sequence active and puts the old one back at
+    the end. While it runs, the sequence is active for every session that works in Premiere. The first failed
+    step stops the run. At the end each shot is read back: start to the frame, in and out to the item frame. The
+    project is not saved.
+    """
+    try:
+        plan = place.load_shots(plan_path)
+        client = _client(lease_wait)
+        payload = place.place_shots(client, live_cli.make_session, plan, sequence_id=sequence_id,
+                                    sequence_name=sequence_name, overwrite=overwrite, skip_refused=skip_refused,
+                                    dry_run=dry_run, project=project, any_project=any_project,
+                                    allow_untested=allow_untested, hard_limit_s=timeout)
+    except CliError as err:
+        _entries_failure(ctx, err)
+        return
+    _emit(ctx, payload, _place_text(payload))
