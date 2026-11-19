@@ -322,7 +322,9 @@ def export_frame(request_id, arguments):
 # expected_project_path and expected_cep_target {"backend": "cep", "sequence_id"}, or one whose sequence is not the
 # active one, or whose project is not the model's, writes the recovery marker and fails (as GUARD above).
 # Steering words in item_id (set_item_in_out: MARKFAIL; overwrite_clip: FAIL, MARKER, UNVERIFIED) and in
-# effect_name (apply_effect: FAIL, QEADD). Quirks played as measured (measures.md, RESULTS Task 5): set_item_in_out
+# effect_name (apply_effect: FAIL, QEADD, APPEND). apply_effect puts a new component at index 2, before older
+# effects (Plan 2 measures.md section 4); APPEND puts it last instead. Quirks played as measured (measures.md,
+# RESULTS Task 5): set_item_in_out
 # floors to the item frame and reports the applied seconds, and the marks stay on the item; overwrite_clip rounds
 # the start to the sequence frame and uses the item's marks; set_clip_duration rounds to a whole sequence frame and
 # moves a still's in point by 3600 s. New clips get the node IDs n0001, n0002, ...
@@ -608,7 +610,10 @@ def apply_effect(request_id, arguments):
         tool_error(request_id, "Premiere added no component for " + name + "; nothing was changed.")
         return
     before = len(clip["effects"])
-    clip["effects"].append(name)
+    if "APPEND" in name:                  # steering: lands last in component order (renders first), not as measured
+        clip["effects"].append(name)
+    else:                                 # as measured: index 2, after Opacity and Motion, before older effects
+        clip["effects"].insert(min(2, before), name)
     model_save(data)
     if "QEADD" in name:
         tool_error(request_id, "Do not retry blindly: QE may have added the effect even when it is missing from "

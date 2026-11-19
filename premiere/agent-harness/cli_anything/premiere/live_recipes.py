@@ -18,7 +18,7 @@ from pathlib import Path
 import click
 
 from cli_anything.premiere import live_cli
-from cli_anything.premiere.core.recipes import clips, effects, frames, keys, lut, place, results
+from cli_anything.premiere.core.recipes import apply, clips, effects, frames, keys, lut, place, results
 from cli_anything.premiere.errors import CliError
 from cli_anything.premiere.live_cli import (DEFAULT_LEASE_WAIT_S, STOPPED_LOOK, STOPPED_RUN, _client, _warning_lines,
                                             live, live_options, stops_cleanly)
@@ -1112,3 +1112,109 @@ def live_place(ctx: click.Context, sequence_id: str, sequence_name: str | None, 
         _entries_failure(ctx, err)
         return
     _emit(ctx, payload, _place_text(payload))
+
+
+# ---------- live effect apply ----------
+def _apply_planned_line(item: dict) -> str:
+    """One line of a dry run: what one entry would get."""
+    head = f"  {item['entry']} {item['name']} "
+    if item.get("refusal"):
+        return head + f"refused | {item['refusal']['code']}: {item['refusal']['reason']}"
+    if item.get("call") is None:
+        return head + f"nothing to do | {item.get('skip')}"
+    return head + f"apply | apply_effect on {item['node_id']}"
+
+
+def _index_lines(payload: dict) -> list[str]:
+    """V1 clip 0: ProcAmp at effect index 3. One line per entry whose effect is on the clip."""
+    return [f"{r['name']} at effect index {r['effect_index']}" for r in payload.get("results") or []
+            if r.get("effect_index") is not None and r["status"] in ("done", "skipped")]
+
+
+def _apply_text(payload: dict) -> str:
+    if payload.get("dry_run"):
+        lines = []
+        for item in payload["planned"]:
+            lines.append(_apply_planned_line(item))
+            lines += [f"    {line}" for line in _warning_lines(item.get("warnings") or [])]
+        lines.append("Dry run: nothing was written.")
+    else:
+        lines = _entry_lines(payload) + _index_lines(payload)
+    return "\n".join(lines + _warning_lines(payload.get("warnings") or []))
+
+
+def _clip_numbers(text: str | None) -> list[int] | None:
+    """--clips 0,3,5 -> [0, 3, 5]. A usage error when a part is not a whole number of 0 or more."""
+    if text is None:
+        return None
+    parts = [part.strip() for part in text.split(",")]
+    if not parts or not all(part.isascii() and part.isdigit() for part in parts):
+        raise click.UsageError(f"--clips takes clip numbers of 0 or more, split by commas (0,3,5), not {text!r}.")
+    return [int(part) for part in parts]
+
+
+@live_effect.command("apply")
+@click.option("--sequence", "sequence_id", required=True, metavar="ID", help="ID of the sequence (see `live state`).")
+@click.option("--sequence-name", "sequence_name", metavar="NAME",
+              help="The name the sequence must have. Nothing is written when it is named otherwise.")
+@click.option("--track", type=click.IntRange(min=0), required=True, metavar="N",
+              help="Video track, counted from 0 (V1 is 0).")
+@click.option("--clips", "clips_text", metavar="0,3,5",
+              help="Numbers of the clips on the track, counted from 0 (see `live clip list`). Not with --all.")
+@click.option("--all", "all_clips", is_flag=True, help="Every clip of the track (at most 400). Not with --clips.")
+@click.option("--effect", "effect_names", multiple=True, metavar="NAME",
+              help="Display name of an effect, such as ProcAmp or \"Lumetri Color\". Repeat it for more effects; "
+                   "they are applied in the order named.")
+@click.option("--any-order", "any_order", is_flag=True,
+              help="Apply Lumetri Color before ProcAmp when they are named that way. Without it such a request is "
+                   "refused.")
+@click.option("--allow-second", "allow_second", is_flag=True,
+              help="Apply an effect to a clip that holds one of that name already. Without it the entry is skipped.")
+@click.option("--skip-refused", "skip_refused", is_flag=True,
+              help="Apply the other entries when one is refused. Without it, one refusal stops the run before any "
+                   "write.")
+@click.option("--dry-run", "dry_run", is_flag=True,
+              help="Read and check every entry, show the exact calls, and write nothing. The active sequence is not "
+                   "switched.")
+@click.option("--project", help="Path of the project that must be the active one.")
+@click.option("--any-project", is_flag=True,
+              help="Allow a write to a project that is not a Claude working copy. Needs --project.")
+@live_options
+@json_option
+@click.pass_context
+@stops_cleanly(STOPPED_RUN)
+def live_effect_apply(ctx: click.Context, sequence_id: str, sequence_name: str | None, track: int,
+                      clips_text: str | None, all_clips: bool, effect_names: tuple, any_order: bool,
+                      allow_second: bool, skip_refused: bool, dry_run: bool, project: str | None, any_project: bool,
+                      lease_wait: float, timeout: float, allow_untested: bool) -> None:
+    """Apply effects to clips of one video track, in render order, and check each one.
+
+    One entry per clip and effect: clip by clip (in the order of --clips, or track order), effects in the order
+    named. Track N counts from 0 (V1 is 0). A new effect renders after every effect the clip holds, so name them
+    in render order: ProcAmp before Lumetri Color. A request with Lumetri Color first is refused unless
+    --any-order. A clip that holds an effect of that name already is skipped (has effect), so a re-run finishes a
+    partial run; --allow-second applies a second one. When an effect the clip holds already will change the order
+    (an old Lumetri Color before a new ProcAmp), the entry gets a warning. Gyroflow gets its defaults only.
+
+    The tool works on the active sequence, so the command makes this sequence active and puts the old one back at
+    the end. While it runs, the sequence is active for every session that works in Premiere. The first failed
+    call stops the run. At the end each clip is read back: an entry is done when the clip holds one more effect of
+    that name. The output gives the effect index of each effect, for `live effect set` and `live lut set`. The
+    project is not saved.
+    """
+    if clips_text is not None and all_clips:
+        raise click.UsageError("Name the clips with --clips or --all, not both.")
+    if clips_text is None and not all_clips:
+        raise click.UsageError("Name the clips with --clips or --all.")
+    clip_numbers = _clip_numbers(clips_text)
+    try:
+        client = _client(lease_wait)
+        payload = apply.apply_effects(client, live_cli.make_session, sequence_id=sequence_id,
+                                      sequence_name=sequence_name, track=track, clips=clip_numbers,
+                                      effects=list(effect_names), any_order=any_order, allow_second=allow_second,
+                                      skip_refused=skip_refused, dry_run=dry_run, project=project,
+                                      any_project=any_project, allow_untested=allow_untested, hard_limit_s=timeout)
+    except CliError as err:
+        _entries_failure(ctx, err)
+        return
+    _emit(ctx, payload, _apply_text(payload))
