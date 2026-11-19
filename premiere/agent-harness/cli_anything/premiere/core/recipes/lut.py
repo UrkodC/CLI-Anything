@@ -418,6 +418,10 @@ def set_lut(client: BridgeClient, make_session, target: dict, lut: Path, *, effe
     difference. Frame A fails: its error, nothing written; stopped: interrupted, nothing written. Frame B fails:
     its error, with stored as it is and rendered None; stopped: interrupted, the same.
 
+    The warning NOT_PROOF ("Use --prove") is in the warnings until a verdict is made: with --prove it is removed
+    when rendered is true or false (also in the payload of the not_rendered error), and it stays when rendered is
+    None and without --prove.
+
     A stop by the user at any place after the checks ends as interrupted with the payload: no write and no export
     follows it, and rendered is None. stored is False before the write of index 4 (also when the stop came before
     Premiere picked that write up), None when a stop hit that write and it is not known whether it was sent, and
@@ -575,8 +579,12 @@ def set_lut(client: BridgeClient, make_session, target: dict, lut: Path, *, effe
                 out["warnings"].append(NOT_EMPTY.format(short_value(path_value), effects._shown(menu_value)))
         else:
             out["rendered"] = False
-            if late is None:
-                raise fail(CliError("not_rendered", NOT_RENDERED.format(f"{time:g}")))
+        if out["rendered"] is not None:
+            # N12.1: a verdict (true or false) is more than the read-back, so "Use --prove" no longer applies. It
+            # stays with no verdict (rendered None), and without --prove. Dropped before any error below is raised.
+            out["warnings"][:] = [w for w in out["warnings"] if w != NOT_PROOF]
+        if out["rendered"] is False and late is None:
+            raise fail(CliError("not_rendered", NOT_RENDERED.format(f"{time:g}")))
         if late is not None:
             raise fail(late)
         return out

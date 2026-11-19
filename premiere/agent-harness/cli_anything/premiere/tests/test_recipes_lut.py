@@ -374,7 +374,7 @@ def test_prove_true_when_the_frame_changes(live, capsys, tmp_path, ffmpeg):
         "lut_before_00001000ms.png", "lut_after_00001000ms.png"]
     assert all(c["lease_held"] is False for c in calls(tmp_path))
     assert model.writes == [(NODE, 2, 4, written(path)), (NODE, 2, 6, 1)]
-    assert NOT_PROOF in out["warnings"]
+    assert NOT_PROOF not in out["warnings"]             # N12.1: the verdict is there, so "Use --prove" is out
     assert lease_free(live)
 
 
@@ -422,6 +422,58 @@ def test_prove_null_with_the_same_lut_says_both(live, capsys, tmp_path, ffmpeg):
     code, out, _ = lut_set(live, capsys, model, path, *prove_args(tmp_path))
     assert code == 0 and out["rendered"] is None
     assert SAME_PICTURE in out["warnings"] and "The same LUT was already set." in out["warnings"]
+
+
+def test_prove_true_drops_the_use_prove_warning(live, capsys, tmp_path, ffmpeg):
+    code, out, _ = lut_set(live, capsys, LutModel(), cube(tmp_path), *prove_args(tmp_path))
+    assert code == 0 and out["rendered"] is True
+    assert NOT_PROOF not in out["warnings"]
+    assert out["warnings"] == []                         # nothing else was in the list for this run
+
+
+def test_prove_false_drops_the_use_prove_warning(live, capsys, tmp_path, ffmpeg):
+    ffmpeg["after"] = ffmpeg["before"]
+    code, out, _ = lut_set(live, capsys, LutModel(), cube(tmp_path), *prove_args(tmp_path))
+    assert code == 1 and out["code"] == "not_rendered" and out["rendered"] is False
+    assert NOT_PROOF not in out["warnings"]              # the payload of the failure, not only a success
+
+
+def test_prove_null_keeps_the_warning(live, capsys, tmp_path, ffmpeg):
+    ffmpeg["after"] = ffmpeg["before"]
+    model = LutModel()
+    model.lumetri()[4]["value"] = "/luts/old.cube/"       # a LUT was there: no verdict, the read-back is all there is
+    code, out, _ = lut_set(live, capsys, model, cube(tmp_path), *prove_args(tmp_path))
+    assert code == 0 and out["rendered"] is None
+    assert NOT_PROOF in out["warnings"]
+
+
+def test_prove_null_for_a_flat_frame_keeps_the_warning(live, capsys, tmp_path, ffmpeg):
+    ffmpeg["before"] = b"\x00" * N
+    ffmpeg["after"] = b"\x00" * (N // 2) + b"\x01" * (N - N // 2)
+    code, out, _ = lut_set(live, capsys, LutModel(), cube(tmp_path), *prove_args(tmp_path))
+    assert code == 0 and out["rendered"] is None
+    assert NOT_PROOF in out["warnings"]
+
+
+def test_prove_null_after_a_change_by_others_keeps_the_warning(bridge_dir, tmp_path, ffmpeg):  # noqa: F811
+    ffmpeg["after"] = ffmpeg["before"]
+    model, app = LutModel(), AppModel(proxies=1, active="o1")
+    result, _ = run_recipe(bridge_dir, model, tmp_path, cube(tmp_path), app=app,
+                           on_call=_someone_else(app, 2, "proxies"))
+    assert isinstance(result, dict) and result["rendered"] is None
+    assert FOREIGN in result["warnings"] and NOT_PROOF in result["warnings"]
+
+
+def test_no_prove_keeps_the_warning(live, capsys, tmp_path):
+    code, out, _ = lut_set(live, capsys, LutModel(), cube(tmp_path))
+    assert code == 0 and out["rendered"] is None
+    assert NOT_PROOF in out["warnings"]
+
+
+def test_prove_dry_run_keeps_the_warning(live, capsys, tmp_path, ffmpeg):
+    code, out, _ = lut_set(live, capsys, LutModel(), cube(tmp_path), "--dry-run", *prove_args(tmp_path))
+    assert code == 0 and out["dry_run"] is True and out["rendered"] is None
+    assert NOT_PROOF in out["warnings"]
 
 
 def test_prove_just_below_the_threshold(live, capsys, tmp_path, ffmpeg):
@@ -490,7 +542,7 @@ def test_human_output(live, capsys, tmp_path, ffmpeg):
     assert code == 0
     assert "Stored: yes" in out.out and "Rendered: yes" in out.out and "48.0" in out.out
     assert "lut_after_00001000ms.png" in out.out
-    assert NOT_PROOF in out.out or NOT_PROOF in out.err
+    assert NOT_PROOF not in out.out and NOT_PROOF not in out.err
 
 
 def test_human_failure_output(live, capsys, tmp_path, ffmpeg):
@@ -503,7 +555,7 @@ def test_human_failure_output(live, capsys, tmp_path, ffmpeg):
     assert code == 1
     assert f"index 4 (no LUT) -> \"{written(path)[:60]}..." in out.out           # cut at 60 in human output
     assert "Stored: yes" in out.out and "Rendered: no (difference 0.0" in out.out
-    assert "Error: " + NOT_RENDERED in out.err and NOT_PROOF in out.err
+    assert "Error: " + NOT_RENDERED in out.err and NOT_PROOF not in out.err
     assert "Error" not in out.out
 
 
@@ -653,6 +705,19 @@ def test_recipe_frame_b_not_restored_still_compares(bridge_dir, tmp_path, ffmpeg
     assert err.payload["left_switched"]["active_sequence"] == {"id": "s1", "name": "Main"}
     assert any("live app activate" in w for w in err.payload["warnings"])
     assert len(err.payload["frames"]) == 2 and lease_free(bridge_dir)
+
+
+def test_recipe_verdict_with_a_failed_put_back_drops_the_warning(bridge_dir, tmp_path, ffmpeg):  # noqa: F811
+    """The verdict is made before the not_restored error is raised, so its payload has no "Use --prove" either."""
+    model, app = LutModel(), AppModel(proxies=1, active="o1")
+
+    def delete_old(number, arguments):
+        if number == 2:
+            del app.sequences["o1"]
+    err, _ = run_recipe(bridge_dir, model, tmp_path, cube(tmp_path), on_call=delete_old, app=app)
+    assert isinstance(err, CliError) and err.code == "not_restored" and err.payload["rendered"] is True
+    assert NOT_PROOF not in err.payload["warnings"]
+    assert any("live app activate" in w for w in err.payload["warnings"])      # the other warnings stay
 
 
 def test_recipe_target_moved_between_the_sessions(bridge_dir, tmp_path, ffmpeg):  # noqa: F811

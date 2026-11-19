@@ -18,7 +18,7 @@ from pathlib import Path
 import click
 
 from cli_anything.premiere import live_cli
-from cli_anything.premiere.core.recipes import clips, effects, frames, lut
+from cli_anything.premiere.core.recipes import clips, effects, frames, lut, results
 from cli_anything.premiere.errors import CliError
 from cli_anything.premiere.live_cli import (DEFAULT_LEASE_WAIT_S, STOPPED_LOOK, STOPPED_RUN, _client, _warning_lines,
                                             live, live_options, stops_cleanly)
@@ -792,3 +792,78 @@ def live_lut_set(ctx: click.Context, sequence_id: str, sequence_name: str | None
         _lut_failure(ctx, err, carried)
         return
     _emit(ctx, payload, "\n".join(_lut_lines(payload) + _warning_lines(payload["warnings"])))
+
+
+# ---------- entry results (the plan commands) ----------
+def _now_text(now: object) -> str:
+    """What the read-back holds, for one line: a value as `live effect set` shows it, anything else as JSON, cut
+    at HUMAN_STRING_LIMIT (never in --json). None gives an empty text."""
+    if now is None:
+        return ""
+    if isinstance(now, (bool, int, float, str)):
+        return _set_value_text(now)
+    text = json.dumps(now, ensure_ascii=False)
+    return text if len(text) <= HUMAN_STRING_LIMIT else text[:HUMAN_STRING_LIMIT] + "..."
+
+
+def _entry_detail(record: dict) -> str:
+    """The part of an entry line after the bar: the read-back for done, the reason for skipped, the error for
+    failed. Nothing for an entry that did not run."""
+    status = record["status"]
+    if status == "done":
+        return _now_text(record.get("now"))
+    if status == "skipped":
+        kind = "refused" if record.get("skip") == results.REFUSED else "nothing to do"
+        return ": ".join(part for part in (kind, record.get("reason_code"), record.get("reason")) if part)
+    if status == "failed":
+        return ("outcome unknown: " if record.get(results.UNKNOWN) else "") + (record.get("error") or "")
+    return ""
+
+
+def _entry_lines(payload: dict) -> list[str]:
+    """One line per entry, then the counts:
+
+      3 S04 done | {"start": 12}
+      4 S05 skipped | refused: clip_changed: The clip was trimmed after the plan was made.
+      5 S06 not run
+    1 done, 1 skipped (1 refused), 0 failed, 1 not run. The first entry that did not run is 5.
+
+    The line starts with two spaces. A warning of an entry follows its line. No entries: no lines.
+    """
+    records = payload.get("results") or []
+    if not records:
+        return []
+    lines = []
+    for record in records:
+        head = f"  {record['entry']} " + ("" if record.get("name") is None else f"{record['name']} ")
+        head += record["status"].replace("_", " ")
+        detail = _entry_detail(record)
+        lines.append(head + (f" | {detail}" if detail else ""))
+        lines += [f"    {line}" for line in _warning_lines(record.get("warnings") or [])]
+    total = payload.get("counts") or results.counts(records)
+    refused = f" ({total['refused']} refused)" if total.get("refused") else ""
+    line = (f"{total['done']} done, {total['skipped']} skipped{refused}, {total['failed']} failed, "
+            f"{total['not_run']} not run.")
+    first = payload.get("first_not_run")
+    lines.append(line if first is None else f"{line} The first entry that did not run is {first}.")
+    return lines
+
+
+def _entries_failure(ctx: click.Context, err: CliError) -> None:
+    """Exit 1 with the failure and the result of every entry, as `_frame_failure` does. The payload is
+    `err.payload` (results.refused_error and results.outcome_error carry it). An error without one is a plain
+    failure: `_fail`."""
+    payload = getattr(err, "payload", None)
+    if payload is None:
+        _fail(ctx, err)
+        return
+    if _json(ctx):
+        _echo_json({"ok": False, "error": err.message, "code": err.code, **payload}, indent=2)
+    else:
+        lines = _entry_lines(payload)
+        if lines:
+            _echo_text("\n".join(lines))
+        _echo_text(f"Error: {err.message}", err=True)
+        for line in _warning_lines(payload.get("warnings") or []):
+            _echo_text(line, err=True)
+    ctx.exit(1)
