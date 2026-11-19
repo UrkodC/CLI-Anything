@@ -749,3 +749,140 @@ class LutModel(EffectModel):
                 if end is not None:
                     record["clip"]["end_ticks"] = end
         return reply
+
+
+# ---------- keys: the Motion keyframes of clips (live keys get) ----------
+KEYS_TPS = 254016000000
+KEYS_FRAME_TICKS = 10594584000        # one frame at 23.976 fps (seq.timebase)
+KEYS_CLIP_TICKS = 79 * KEYS_FRAME_TICKS
+
+
+class KeysModel:
+    """A small Premiere for `keys_get.jsx` (and, in later tasks, `keys_check.jsx` and `keys_write.jsx`), played in
+    Python by the fake panel.
+
+    It reads the ARGS of the script text it gets and answers as the real script does: the same reply shapes and
+    the same "precondition:" texts for the faults the tests use. Values stay between calls. Sequence s1 "Main"
+    is the only one.
+
+        model = KeysModel()
+        model.add_clip("000f4276", name="S02 C2246", rotation=[(0, 1.26), (316757952000, 1.01)])   # keys
+        model.add_clip("000f4277", name="S03 C2248", rotation=0.67, scale=104.4)                    # static values
+        panel = FakePanel(bridge_dir, handler=recipe_handler(model.replies()))
+
+    clips maps a node ID to {"name", "track_type", "track", "clip", "in_ticks", "out_ticks", "start_ticks",
+    "end_ticks" (ints, sequence ticks for start and end, media ticks for in and out), "speed", "reversed", "effects"}.
+    effects is the component list of Premiere: Opacity (Opacity, Blend Mode twice) and Motion (Position, Scale,
+    Scale Width, Uniform Scale, Rotation, Anchor Point). A property is {"name", "value", "keys"}: keys is None for
+    a property with no keys, else a list of (media ticks, value). add_clip takes `rotation` and `scale` as a
+    number (static) or a list of (ticks, value) (keys). `calls` lists the ARGS of every keys_get script.
+    """
+
+    def __init__(self) -> None:
+        self.sequence = {"id": "s1", "name": "Main"}
+        self.clips: dict[str, dict] = {}
+        self.calls: list[dict] = []
+
+    @staticmethod
+    def _prop(name: str, value) -> dict:
+        if isinstance(value, list) and value and all(isinstance(item, tuple) for item in value):
+            return {"name": name, "value": None, "keys": [tuple(item) for item in value]}
+        return {"name": name, "value": value, "keys": None}
+
+    def add_clip(self, node_id: str, *, name: str, track: int = 0, track_type: str = "video", in_ticks: int = 0,
+                 out_ticks: int | None = None, start_ticks: int = 0, end_ticks: int | None = None,
+                 length_ticks: int = KEYS_CLIP_TICKS, speed: float = 1, reversed_: bool = False,
+                 rotation=0.0, scale=100.0) -> dict:
+        number = sum(1 for clip in self.clips.values() if (clip["track_type"], clip["track"]) == (track_type, track))
+        self.clips[node_id] = {
+            "name": name, "track_type": track_type, "track": track, "clip": number,
+            "in_ticks": in_ticks, "out_ticks": in_ticks + length_ticks if out_ticks is None else out_ticks,
+            "start_ticks": start_ticks, "end_ticks": start_ticks + length_ticks if end_ticks is None else end_ticks,
+            "speed": speed, "reversed": reversed_,
+            "effects": [
+                {"name": "Opacity", "match_name": "AE.ADBE Opacity", "properties": [
+                    self._prop("Opacity", 100.0), self._prop("Blend Mode", 0), self._prop("Blend Mode", 0)]},
+                {"name": "Motion", "match_name": "AE.ADBE Motion", "properties": [
+                    self._prop("Position", [0.5, 0.5]), self._prop("Scale", scale), self._prop("Scale Width", 100.0),
+                    self._prop("Uniform Scale", True), self._prop("Rotation", rotation),
+                    self._prop("Anchor Point", [0.5, 0.5])]}]}
+        return self.clips[node_id]
+
+    def replies(self) -> dict:
+        return {"recipe: keys_get": self.keys_get}
+
+    def prop(self, node_id: str, effect: str, name: str, nth: int = 0) -> dict:
+        """The nth property of that name in that effect of the clip (the model's own record)."""
+        component = next(e for e in self.clips[node_id]["effects"] if e["name"] == effect)
+        return [p for p in component["properties"] if p["name"] == name][nth]
+
+    # ---------- the finders, with the texts of find.jsx and keys.jsx ----------
+    def _find_clip(self, target: dict) -> tuple[str, dict]:
+        if target.get("node_id") is not None:
+            if target["node_id"] in self.clips:
+                return target["node_id"], self.clips[target["node_id"]]
+            raise _Refused(f"no clip has the node ID {target['node_id']} in sequence {self.sequence['name']}")
+        kind, track, number = target.get("track_type") or "video", target["track"], target["clip"]
+        if not any((c["track_type"], c["track"]) == (kind, track) for c in self.clips.values()):
+            raise _Refused(f"the sequence has no {kind} track {track}")
+        for node_id, clip in self.clips.items():
+            if (clip["track_type"], clip["track"], clip["clip"]) == (kind, track, number):
+                return node_id, clip
+        raise _Refused(f"{kind} track {track} has no clip {number}")
+
+    @staticmethod
+    def _find_effect(clip: dict, name: str) -> int:
+        found = [i for i, e in enumerate(clip["effects"]) if name in (e["name"], e["match_name"])]
+        if not found:
+            raise _Refused(f"no effect named {name} on this clip")
+        if len(found) > 1:
+            raise _Refused(f"ambiguous_effect: {len(found)} effects are named {name}; pass effect_index")
+        return found[0]
+
+    @staticmethod
+    def _find_property(effect: dict, name: str, index) -> int:
+        props = effect["properties"]
+        if index is not None:
+            if index >= len(props):
+                raise _Refused(f"{effect['name']} has no property {index}")
+            if props[index]["name"] != name:
+                raise _Refused(f"property {index} of {effect['name']} is named {props[index]['name']}, not {name}")
+            return index
+        found = [i for i, p in enumerate(props) if p["name"] == name]
+        if not found:
+            raise _Refused(f"no property named {name} in {effect['name']}")
+        if len(found) > 1:
+            raise _Refused(f"ambiguous_property: {len(found)} properties of {effect['name']} are named {name}; "
+                           "pass property_index")
+        return found[0]
+
+    # ---------- the script ----------
+    def keys_get(self, script: str) -> object:
+        args = script_args(script)
+        self.calls.append(args)
+        try:
+            if args.get("sequence_id") is None:
+                raise _Refused("the script got no sequence ID")
+            if args["sequence_id"] != self.sequence["id"]:
+                raise _Refused(f"no sequence has the ID {args['sequence_id']}")
+            node_id, clip = self._find_clip(args["target"])
+            effect_index = self._find_effect(clip, args["effect"])
+            effect = clip["effects"][effect_index]
+            index = self._find_property(effect, args["property"], args.get("property_index"))
+        except _Refused as exc:
+            return exc.error()
+        prop = effect["properties"][index]
+        if prop["keys"] is None:
+            read = {"is_time_varying": False, "keys": [], "value": prop["value"]}
+        else:
+            read = {"is_time_varying": True, "keys": [{"ticks": str(t), "value": v} for t, v in prop["keys"]],
+                    "value": None}
+        return {"sequence": dict(self.sequence),
+                "clip": {"in_ticks": str(clip["in_ticks"]), "out_ticks": str(clip["out_ticks"]),
+                         "start_ticks": str(clip["start_ticks"]), "end_ticks": str(clip["end_ticks"]),
+                         "speed": clip["speed"], "reversed": clip["reversed"], "node_id": node_id,
+                         "name": clip["name"], "track_type": clip["track_type"], "track": clip["track"],
+                         "clip": clip["clip"]},
+                "effect": {"name": effect["name"], "effect_index": effect_index},
+                "property": {"name": prop["name"], "index": index},
+                "read": read}

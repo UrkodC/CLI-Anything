@@ -1,5 +1,5 @@
 """The recipe commands of the `live` group: `live clip list`, `live effect get`, `live effect set`, `live frame
-export`, `live app`, `live lut set`, and the commands that later tasks add.
+export`, `live app`, `live lut set`, `live keys get`, and the commands that later tasks add.
 
 live_cli.py imports this module as its last line, so the `live` group exists when the commands attach.
 The logic of each command is in core/recipes; this file holds only the click side.
@@ -18,7 +18,7 @@ from pathlib import Path
 import click
 
 from cli_anything.premiere import live_cli
-from cli_anything.premiere.core.recipes import clips, effects, frames, lut, results
+from cli_anything.premiere.core.recipes import clips, effects, frames, keys, lut, results
 from cli_anything.premiere.errors import CliError
 from cli_anything.premiere.live_cli import (DEFAULT_LEASE_WAIT_S, STOPPED_LOOK, STOPPED_RUN, _client, _warning_lines,
                                             live, live_options, stops_cleanly)
@@ -867,3 +867,82 @@ def _entries_failure(ctx: click.Context, err: CliError) -> None:
         for line in _warning_lines(payload.get("warnings") or []):
             _echo_text(line, err=True)
     ctx.exit(1)
+
+
+# ---------- live keys ----------
+@live.group("keys")
+def live_keys() -> None:
+    """Look at the keyframes of a clip in the running Premiere."""
+
+
+def _keys_text(payload: dict) -> str:
+    """Motion.Rotation of 000f4276 (S02 C2246): 4 keys, then one line per key:
+
+      1.247 s  316757952000  1.01
+
+    A property with no keys gives one line: ...: static 0.67. A key with no time in seconds shows "?".
+    """
+    clip, effect, prop = payload["clip"], payload["effect"], payload["property"]
+    head = (f"{'?' if effect.get('name') is None else effect['name']}.{'?' if prop.get('name') is None else prop['name']} "
+            f"of {clip.get('node_id') or '-'} ({'?' if clip.get('name') is None else clip['name']}): ")
+    if not payload["is_time_varying"]:
+        return "\n".join([head + f"static {_set_value_text(payload['value'])}"] + _warning_lines(payload["warnings"]))
+    count = len(payload["keys"])
+    lines = [head + f"{count} key" + ("" if count == 1 else "s")]
+    lines += [f"  {_seconds_text(item['seconds'])} s  {item['media_ticks']}  {_set_value_text(item['value'])}"
+              for item in payload["keys"]]
+    return "\n".join(lines + _warning_lines(payload["warnings"]))
+
+
+@live_keys.command("get")
+@click.option("--sequence", "sequence_id", required=True, metavar="ID",
+              help="ID of the sequence that holds the clip (see `live state`).")
+@click.option("--track", type=click.IntRange(min=0), metavar="N",
+              help="Track of the clip, counted from 0 (V1 and A1 are track 0). Goes with --clip.")
+@click.option("--clip", type=click.IntRange(min=0), metavar="N",
+              help="Number of the clip on that track, counted from 0 (see `live clip list`). Goes with --track.")
+@click.option("--track-type", "track_type", type=click.Choice(effects.TRACK_TYPES),
+              help="Video or audio track, for --track and --clip. The default is video.")
+@click.option("--node-id", "node_id", metavar="ID",
+              help="The clip by its node ID (see `live clip list`), instead of --track and --clip.")
+@click.option("--effect", default="Motion", show_default=True, metavar="NAME",
+              help="The display name or match name of the effect. Exactly one effect of the clip may have it.")
+@click.option("--property", "prop", default="Rotation", show_default=True, metavar="NAME",
+              help="The exact display name of the property.")
+@click.option("--property-index", "property_index", type=click.IntRange(min=0), metavar="N",
+              help="The place of the property in the effect (see `live effect get`). Needed when two properties "
+                   "have the name: Opacity has two named Blend Mode.")
+@live_options
+@json_option
+@click.pass_context
+@stops_cleanly(STOPPED_LOOK)
+def live_keys_get(ctx: click.Context, sequence_id: str, track: int | None, clip: int | None, track_type: str | None,
+                  node_id: str | None, effect: str, prop: str, property_index: int | None, lease_wait: float,
+                  timeout: float, allow_untested: bool) -> None:
+    """List the keys of one property of one clip, or show its value when it has none. Only reads: nothing in the
+    project changes.
+
+    Name the sequence with --sequence and the clip with --track and --clip together, or with --node-id. The
+    effect is Motion and the property is Rotation unless --effect and --property say otherwise.
+
+    Each key shows its time in seconds from the clip start, its media ticks, and its value. Premiere stores a key
+    in media time, which is the clip's in point plus the time in the clip. A clip with a speed change or a reverse
+    has no time in seconds: the line shows ? and the media ticks stay. A property that holds a colour with keys
+    cannot be read.
+    """
+    if node_id is not None:
+        if track is not None or clip is not None or track_type is not None:
+            raise click.UsageError("--node-id cannot be used with --track, --clip or --track-type.")
+        target = {"node_id": node_id}
+    elif track is None or clip is None:
+        raise click.UsageError("Name the clip with --track and --clip together, or with --node-id.")
+    else:
+        target = {"track_type": track_type or "video", "track": track, "clip": clip}
+    try:
+        client = _client(lease_wait)
+        payload = keys.get_keys(client, target, sequence_id=sequence_id, effect=effect, prop=prop,
+                                property_index=property_index, allow_untested=allow_untested, hard_limit_s=timeout)
+    except CliError as err:
+        _fail(ctx, err)
+        return
+    _emit(ctx, payload, _keys_text(payload))
