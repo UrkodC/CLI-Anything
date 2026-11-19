@@ -1,4 +1,4 @@
-"""cli-anything-premiere: read Adobe Premiere Pro project files (sequences, clips, effects, Color Mode). Read-only."""
+"""cli-anything-premiere: read Adobe Premiere Pro project files; the live commands (lazy groups) change a running Premiere 27."""
 from __future__ import annotations
 
 import json
@@ -24,6 +24,22 @@ REPL_COMMANDS = {
     "colormode list FILE": "Clips that carry a Color Mode grade",
     "live state": "Version, open projects, active sequence and selection of the running Premiere",
     "live run SCRIPT.jsx [--args JSON] [--write] [--verify CHECK.jsx] [--project PATH]": "Run a script in the running Premiere",
+    "doctor": "Check the connection to the running Premiere. Changes nothing",
+    "recovery show": "Show an open recovery of the bridge. Changes nothing",
+    "mcp list [--query TEXT]": "List the tools of the premiere-pro-mcp server",
+    "mcp describe TOOL": "What one tool of the server does and what arguments it takes",
+    "mcp call TOOL [--args JSON]": "Run one tool of the server. No write check of the CLI runs",
+    "mcp batch FILE": "Run the calls in FILE in one server session. No write check of the CLI runs",
+    "ui mode get": "Show which mode is checked in Window > Mode",
+    "ui mode set MODE": "Switch Premiere to import, edit, color or export mode",
+    "live clip list --sequence ID [--track-type video|audio|both] [--track N] [--detail]": "The clips of one sequence, one line per clip",
+    "live effect get --sequence ID (--track N --clip N | --node-id ID) [--effect NAME]": "The effects of one clip and their properties",
+    "live effect set --sequence ID (--track N --clip N | --node-id ID) --effect NAME --index N --name NAME --value JSON [--dry-run]": "Write one effect value, read it back",
+    "live effect set --from PLAN.json [--dry-run]": "Write the values of a plan file, each read back",
+    "live frame export --sequence ID --time SECONDS --out-dir DIR [--overwrite]": "Export still frames of one sequence",
+    "live app proxies on|off": "Switch the proxy display of Premiere",
+    "live app activate --sequence ID": "Make a sequence the active one",
+    "live lut set --sequence ID (--track N --clip N | --node-id ID) --lut FILE.cube [--prove --time SECONDS --out-dir DIR]": "Write a LUT into Lumetri Color, read it back",
     "help": "Show this list",
     "exit": "Leave the shell",
 }
@@ -47,18 +63,36 @@ def _json(ctx: click.Context) -> bool:
     return bool((ctx.obj or {}).get("json") or (root.obj or {}).get("json"))
 
 
+def _echo_json(value: dict, indent: int | None = None) -> None:
+    """Print JSON. Text that the output cannot encode (a lone surrogate from Premiere) is escaped, so the
+    output stays valid JSON and loses nothing."""
+    try:
+        click.echo(json.dumps(value, indent=indent, ensure_ascii=False))
+    except UnicodeEncodeError:
+        click.echo(json.dumps(value, indent=indent, ensure_ascii=True))
+
+
+def _echo_text(text: str, err: bool = False) -> None:
+    """Print text. What the output cannot encode is replaced."""
+    try:
+        click.echo(text, err=err)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stderr if err else sys.stdout, "encoding", None) or "utf-8"
+        click.echo(text.encode(encoding, "replace").decode(encoding), err=err)
+
+
 def _emit(ctx: click.Context, payload: dict, human: str) -> None:
     if _json(ctx):
-        click.echo(json.dumps({"ok": True, **payload}, indent=2, ensure_ascii=False))
+        _echo_json({"ok": True, **payload}, indent=2)
     else:
-        click.echo(human)
+        _echo_text(human)
 
 
 def _fail(ctx: click.Context, err: CliError) -> None:
     if _json(ctx):
-        click.echo(json.dumps({"ok": False, "error": err.message, "code": err.code}, ensure_ascii=False))
+        _echo_json({"ok": False, "error": err.message, "code": err.code})
     else:
-        click.echo(f"Error: {err.message}", err=True)
+        _echo_text(f"Error: {err.message}", err=True)
     ctx.exit(1)
 
 
@@ -87,7 +121,7 @@ def _load(ctx: click.Context, file: Path) -> prproj.Project:
 @click.version_option(__version__, prog_name=PROG)
 @click.pass_context
 def cli(ctx: click.Context) -> None:
-    """Read Premiere Pro project files: sequences, clips, effects and Color Mode grades. Never writes."""
+    """Read Premiere Pro project files: sequences, clips and effects. The file commands never write. The live commands change the running Premiere 27."""
     ctx.ensure_object(dict)
     if ctx.invoked_subcommand is None:
         _run_repl(ctx)
@@ -102,7 +136,8 @@ def status(ctx: click.Context) -> None:
     lines = [f"Premiere: {info['app'] or 'not found'}" + (f" (version {info['version']})" if info["version"] else "")]
     lines.append("Tested project formats: " + ", ".join(f"{k} ({v})" for k, v in info["tested_project_formats"].items()))
     lines.append("Smoke-read only (no errors, values not compared with Premiere): " + ", ".join(f"{k} ({v})" for k, v in info["smoke_read_project_formats"].items()))
-    lines.append("This tool only reads project files. It needs no running Premiere.")
+    lines.append("The file commands only read project files and need no running Premiere. "
+                 "The live commands need Premiere 27 with the MCP Bridge panel.")
     try:  # the live panel, from its heartbeat file only: no lease, no script
         import importlib
 

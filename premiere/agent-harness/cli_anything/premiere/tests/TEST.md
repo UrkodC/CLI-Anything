@@ -119,3 +119,80 @@ The interactive shell was started once by hand with piped input (`help`, `status
 - Values on formats other than 46 (only read without error, plus the LUT spot check on 45).
 - Audio effects, transitions, nested sequences, multicam, adjustment layers, titles.
 - Very large projects (speed and memory).
+
+## Live unit tests
+
+These test the live commands with no Premiere. Each file needs nothing but Python, and `node`
+for the script tests (they skip without it).
+
+| File | Tests | What it checks |
+|---|---|---|
+| `test_bridge.py` | 52 | The bridge client: folder checks, lease, heartbeat, command and reply, timeouts, recovery marker, signals. |
+| `test_guard.py` | 99 | The version checks, the project guard, two projects, the recovery check. |
+| `test_jsx.py` | 69 | The script builder and the helper and state scripts, run in node with a stub `app`. |
+| `test_session.py` | 21 | The write session: one lease, the checks before a write, the breath between writes. |
+| `test_live_cli.py` | 53 | `live state`, `live run`, the lazy command groups, the help texts, the output of any text. |
+| `test_mcp_client.py` | 74 | The MCP client and `mcp list`, `describe`, `call`, `batch`. |
+| `test_ui.py` | 53 | `ui mode get` and `set`. No test runs the real osascript, ps or sleep. |
+| `test_doctor.py` | 54 | `doctor` (its thirteen checks), `recovery show`, the `live` key of `status`. |
+| `test_recipes_clips.py` | 87 | `live clip list`. |
+| `test_recipes_effects.py` | 255 | `live effect get` and `live effect set`: refusals, plans, negative values, put-back. |
+| `test_recipes_frames.py` | 356 | `live frame export` and `live app`: switches, put-back, failed exports, stops. |
+| `test_recipes_lut.py` | 153 | `live lut set` and `--prove`. |
+
+What the fakes cover (`fakes.py`, unless named):
+- `FakePanel`: a thread that plays the MCP Bridge panel in a private temp bridge folder. It writes
+  the heartbeat, picks up each command, and answers through a handler. It can be busy or never
+  answer. The live commands run their real bridge, lease and signal code against it.
+- A fake `premiere-pro-mcp` server on stdio, with a few tools (`ping`, `echo`, `fail`, `env`, a
+  lease probe, and `export_frame`, which writes a small file and can fail on request).
+- `EffectModel` and `LutModel`, and `AppModel` in `test_recipes_frames.py`: small Premieres in
+  Python that answer the recipe scripts (clips, effects, proxy display, the active sequence).
+- The picture check of `--prove` uses a stub. Only `test_frame_pixels_with_real_ffmpeg` needs
+  ffmpeg, and it skips without it.
+- Most files have an autouse fixture that points `PREMIERE_TEMP_DIR` at a missing folder, so a
+  test that misses its fake does not reach the real bridge.
+
+The fakes do not show how Premiere itself behaves. That is what the end-to-end tests are for.
+
+Last run of the whole unit suite (2026-11-19, macOS, Python 3.14.7, pytest 9.2.0):
+
+```
+1364 passed, 1 skipped in 171.72s (0:02:51)
+```
+
+The one skip is `test_live_e2e.py`, which needs the variable below.
+
+## Live end-to-end tests
+
+`test_live_e2e.py` runs the installed command on the RUNNING Premiere. It runs only when all of
+this is true:
+- the variable `PREMIERE_LIVE_E2E` is 1;
+- the MCP Bridge panel has a fresh heartbeat;
+- `live state` shows exactly one open project, named `fixture27 Claude.prproj`.
+
+Otherwise the module is skipped. When the variable is 1 and the heartbeat is fresh but
+`live state` fails, the module fails at collection: that is a broken setup.
+
+```bash
+PREMIERE_LIVE_E2E=1 python -m pytest cli_anything/premiere/tests/test_live_e2e.py -q -s
+```
+
+The write tests work on a duplicate of "Fixture seq" named "E2E copy". The run deletes it at the
+end, makes "Fixture seq" active again and puts proxy display back. No test saves the project.
+Close the project without saving after the run.
+
+Last real results (Premiere Pro 27.0.0 build 88, panel 1.25.0, `premiere-pro-mcp` 1.25.0; the
+details are in `PREMIERE.md`, "Live checks of Plan 2"):
+- Round 1, 2026-11-18 (write path, `live clip list`, `live effect get`, `live effect set`):
+  24 passed in 48 s. No recovery marker.
+- Round 2, 2026-11-18 (`live frame export`, `live app`, `live lut set`): 39 passed in 117 s
+  (the 24 tests of round 1 and 15 new ones). No recovery marker. A first run of this round had 2
+  failures from a wrong size floor in the tests, not from the CLI.
+
+Not shown on the real app (they ran in unit tests only): a failed negative write, so the near
+value and the put-back; a plan long enough to pass the 15 s lease limit; a failed export that
+leaves proxy display or the active sequence switched; Ctrl-C during an export or a put-back; a
+LUT in a converted project; a clip with two Lumetri Color effects.
+
+The five gate tests that came before the recipes are in `PREMIERE.md`, "Gate tests, 2026-11-18".

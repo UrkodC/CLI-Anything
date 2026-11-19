@@ -499,3 +499,163 @@ def test_root_help_and_version_are_kept(capsys):
     assert "Read Premiere Pro project files" in capsys.readouterr().out
     assert dispatch(["--version"]) == 0
     assert "0.1.0" in capsys.readouterr().out
+
+
+# ---------- plan 2, task 10: documents and help text ----------
+STATUS_KEYS_BEFORE = ["ok", "app", "version", "tested_project_formats", "smoke_read_project_formats",
+                      "writes_projects", "live"]
+LIVE_GROUPS = ("live", "mcp", "ui", "recovery", "doctor")
+
+
+def _help_text(capsys, argv) -> str:
+    assert dispatch([*argv, "--help"]) == 0, argv
+    return " ".join(capsys.readouterr().out.split())
+
+
+def _command_paths(command: click.Command, path: list[str]):
+    yield path
+    if isinstance(command, click.Group):
+        for name in command.list_commands(None):
+            yield from _command_paths(command.get_command(None, name), [*path, name])
+
+
+def test_root_help_says_what_writes(capsys):
+    text = _help_text(capsys, [])
+    assert "Read Premiere Pro project files" in text
+    assert ("Read Premiere Pro project files: sequences, clips and effects. The file commands never write. "
+            "The live commands change the running Premiere 27.") in text
+    assert "effects and Color Mode grades" not in text      # the colormode group keeps its own line
+    assert "The file commands never write." in text
+    assert "The live commands change the running Premiere 27." in text
+    assert "Never writes." not in text
+
+
+def test_status_keeps_keys_and_adds_live_commands(capsys):
+    code, data = run_json(capsys, ["status"])
+    assert code == 0
+    for key in STATUS_KEYS_BEFORE:
+        assert key in data, key
+    assert data["live_commands"] is True
+    assert data["writes_projects"] is False
+    assert dispatch(["status"]) == 0
+    out = capsys.readouterr().out
+    assert ("The file commands only read project files and need no running Premiere. "
+            "The live commands need Premiere 27 with the MCP Bridge panel.") in out
+    assert "This tool only reads project files." not in out
+
+
+def test_every_recipe_has_help_with_its_proof_level(capsys):
+    assert "stored" in _help_text(capsys, ["live", "effect", "set"])
+    lut = _help_text(capsys, ["live", "lut", "set"])
+    assert "stored" in lut and "--prove" in lut
+    assert "file check" in _help_text(capsys, ["live", "frame", "export"])
+
+
+def test_no_em_dash_in_any_help_text(capsys):
+    seen = 0
+    for group in LIVE_GROUPS:
+        target = getattr(live_cli, group)
+        for path in _command_paths(target, [group]):
+            text = _help_text(capsys, path)
+            assert "\u2014" not in text and "\u2013" not in text, path
+            seen += 1
+    assert seen >= 25          # every group, subgroup and command of the five groups
+    root = _help_text(capsys, [])
+    assert "\u2014" not in root and "\u2013" not in root
+
+
+def test_repl_lists_the_new_commands():
+    from cli_anything.premiere.premiere_cli import REPL_COMMANDS
+    for start in ("doctor", "recovery show", "mcp call", "ui mode", "live clip list", "live effect set",
+                  "live frame export", "live lut set"):
+        assert any(key.startswith(start) for key in REPL_COMMANDS), start
+
+
+def test_repl_commands_are_real_commands(capsys):
+    from cli_anything.premiere.premiere_cli import REPL_COMMANDS
+    for key in REPL_COMMANDS:
+        if key in ("help", "exit"):
+            continue
+        words = []
+        for word in key.split():
+            if word.startswith(("[", "-")) or word.isupper() or "|" in word:
+                break
+            words.append(word)
+        assert dispatch([*words, "--help"]) == 0, key
+        capsys.readouterr()
+
+
+# ---------- plan 2, task 10: output that any text survives ----------
+def test_emit_and_fail_print_a_lone_surrogate_as_valid_json(capsys):
+    from cli_anything.premiere.errors import CliError
+    from cli_anything.premiere.premiere_cli import _emit, _fail
+
+    @click.command()
+    @click.pass_context
+    def emit_cmd(ctx):
+        ctx.ensure_object(dict)["json"] = True
+        _emit(ctx, {"name": "bad \ud800 name"}, "unused")
+
+    @click.command()
+    @click.pass_context
+    def fail_cmd(ctx):
+        ctx.ensure_object(dict)["json"] = True
+        _fail(ctx, CliError("script_failed", "bad \udcff text"))
+
+    emit_cmd.main(args=[], standalone_mode=False)
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "name": "bad \ud800 name"}
+    assert fail_cmd.main(args=[], standalone_mode=False) == 1
+    assert json.loads(capsys.readouterr().out) == {"ok": False, "error": "bad \udcff text", "code": "script_failed"}
+
+
+def test_emit_and_fail_print_a_lone_surrogate_in_human_text(capsys):
+    from cli_anything.premiere.errors import CliError
+    from cli_anything.premiere.premiere_cli import _emit, _fail
+
+    @click.command()
+    @click.pass_context
+    def emit_cmd(ctx):
+        _emit(ctx, {}, "Name: bad \ud800 name")
+
+    @click.command()
+    @click.pass_context
+    def fail_cmd(ctx):
+        _fail(ctx, CliError("script_failed", "bad \udcff text"))
+
+    emit_cmd.main(args=[], standalone_mode=False)
+    out = capsys.readouterr().out
+    assert out.startswith("Name: bad ") and out.rstrip().endswith(" name")
+    assert fail_cmd.main(args=[], standalone_mode=False) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("Error: bad ") and err.rstrip().endswith(" text")
+
+
+def test_emit_and_fail_keep_non_ascii_letters(capsys):
+    from cli_anything.premiere.errors import CliError
+    from cli_anything.premiere.premiere_cli import _emit, _fail
+
+    @click.command()
+    @click.pass_context
+    def emit_cmd(ctx):
+        ctx.ensure_object(dict)["json"] = True
+        _emit(ctx, {"name": "Película ñ"}, "unused")
+
+    @click.command()
+    @click.pass_context
+    def fail_cmd(ctx):
+        _fail(ctx, CliError("x", "Película ñ"))
+
+    emit_cmd.main(args=[], standalone_mode=False)
+    assert '"name": "Película ñ"' in capsys.readouterr().out
+    assert fail_cmd.main(args=[], standalone_mode=False) == 1
+    assert capsys.readouterr().err == "Error: Película ñ\n"
+
+
+def test_live_run_not_stored_with_a_lone_surrogate_prints_valid_json(live, tmp_path, capsys):
+    body = script_file(tmp_path, "body.jsx", BODY)
+    check = script_file(tmp_path, "check.jsx", CHECK_FALSE)
+    handler = handler_for(body_data={"name": "bad \ud800 name"}, check_data={"stored": False})
+    with panel_on(live, handler=handler):
+        code, out = run_json(capsys, ["live", "run", body, "--write", "--verify", check])
+    assert code == 1 and out["code"] == "not_stored"
+    assert out["data"] == {"name": "bad \ud800 name"}

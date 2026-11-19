@@ -40,7 +40,7 @@ STATE_OWN = {**STATE_OK, "projects": [{"name": "Family film.prproj", "path": "/p
 SUMMARY = {"project": "X Claude.prproj", "active_sequence": {"id": "s1", "name": "Main"},
            "video_tracks": 2, "audio_tracks": 2, "video_clips": 5, "audio_clips": 3}
 NAMES = ["premiere_running", "bridge_folder", "panel_heartbeat", "bridge_protocol", "panel_version", "lease",
-         "recovery", "premiere_version", "projects", "project_guard", "mcp_server", "accessibility"]
+         "recovery", "premiere_version", "projects", "project_guard", "mcp_server", "accessibility", "recipes"]
 STATE_CHECKS = ["premiere_version", "projects", "project_guard"]
 
 
@@ -167,11 +167,11 @@ def test_all_pass(bridge_dir, panel, stubs, capsys, cli_stubs):  # noqa: F811
     assert re.search(r"[0-9]", found["panel_heartbeat"]["detail"])
     code, out = run_json(capsys, ["doctor"])
     assert code == 0 and out["ok"] is True
-    assert out["summary"] == {"pass": 12, "warn": 0, "fail": 0}
+    assert out["summary"] == {"pass": 13, "warn": 0, "fail": 0}
     assert [c["name"] for c in out["checks"]] == NAMES
     assert dispatch(["doctor"]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert sum(line.startswith("PASS") for line in lines) == 12
+    assert sum(line.startswith("PASS") for line in lines) == 13
 
 
 def test_no_panel(bridge_dir, stubs, capsys, cli_stubs):  # noqa: F811
@@ -659,3 +659,19 @@ def test_an_ownerless_lock_says_what_to_do(bridge_dir, panel, stubs):  # noqa: F
     assert found["lease"]["status"] == "fail"
     assert "delete" in detail and str(bridge_dir / LOCK) in detail
     assert (bridge_dir / LOCK).is_dir()
+
+
+# ---------- plan 2, task 10: the recipes check ----------
+def test_recipes_check_passes_when_the_recipes_load(bridge_dir, panel, stubs):  # noqa: F811
+    checks = doctor.run_checks(look(bridge_dir), **stubs)
+    assert checks[-1] == {"name": "recipes", "status": "pass", "detail": "the recipe commands are loaded"}
+
+
+def test_recipes_check_fails_with_the_reason(bridge_dir, panel, stubs, capsys, cli_stubs, monkeypatch):  # noqa: F811
+    checks = doctor.run_checks(look(bridge_dir), **stubs, recipes_error="ImportError: boom")
+    assert checks[-1] == {"name": "recipes", "status": "fail", "detail": "ImportError: boom"}
+    monkeypatch.setattr(live_cli, "RECIPES_ERROR", "SyntaxError: bad line")
+    code, out = run_json(capsys, ["doctor"])
+    assert code == 1 and out["code"] == "doctor_failed" and "recipes" in out["error"]
+    assert [c["name"] for c in out["checks"]] == NAMES
+    assert out["checks"][-1] == {"name": "recipes", "status": "fail", "detail": "SyntaxError: bad line"}

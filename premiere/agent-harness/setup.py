@@ -36,7 +36,7 @@ setup(
     version=PACKAGE_VERSION,
     author="cli-anything contributors",
     author_email="",
-    description="Agent-native, read-only CLI for Adobe Premiere Pro project files: sequences, clips, effects, keyframes, Color Mode",
+    description="Agent-native CLI for Adobe Premiere Pro: reads project files (sequences, clips, effects, keyframes, Color Mode); its live commands change a running Premiere 27",
     long_description=LONG_DESCRIPTION,
     long_description_content_type="text/markdown",
     url="https://github.com/HKUDS/CLI-Anything",

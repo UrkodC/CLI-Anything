@@ -1900,3 +1900,26 @@ def test_a_huge_integer_is_refused_without_a_crash(live, capsys, tmp_path):
     code, out, panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", big)
     assert code == 1 and out["code"] == "refused_parameter" and panel.seen == []
     assert effects.same_value(10 ** 400, 1.0) is False and effects.same_value(10 ** 400, 10 ** 400) is False
+
+
+# ---------- task 10 fix round 1: a failure payload with a lone surrogate ----------
+def test_a_lone_surrogate_in_a_failure_prints_valid_json_and_human_text(live, capsys, monkeypatch):
+    model = EffectModel()
+    model.fail(-2.6, times=2)
+    model.fail(-2.496, times=1)
+    code, out, _panel = effect_set(live, capsys, model, *BRIGHTNESS, "--value", "-2.6")
+    assert code == 1 and out["code"] == "not_stored"
+    payload = {k: v for k, v in out.items() if k not in ("ok", "error", "code")}
+    payload["results"][0]["error"] = "Illegal \ud800 type"           # Premiere can send such text
+
+    def failing(*_a, **_k):
+        err = CliError("not_stored", "bad \udcff text")
+        err.payload = payload
+        raise err
+    monkeypatch.setattr(effects, "set_effects", failing)
+    code, out = run_json(capsys, [*SET, *BRIGHTNESS, "--value", "-2.6"])
+    assert code == 1 and out["error"] == "bad \udcff text"
+    assert out["results"][0]["error"] == "Illegal \ud800 type"       # nothing lost: the JSON escapes it
+    assert dispatch([*SET, *BRIGHTNESS, "--value", "-2.6"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("Error: bad ") and "\udcff" not in captured.err

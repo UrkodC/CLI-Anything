@@ -134,9 +134,12 @@ def run_checks(client: BridgeClient, *, premiere: Callable[[], dict | None] = ui
                panel: Callable[[], str | None] = guard.panel_version,
                which: Callable[[str], str | None] = shutil.which,
                server: Callable[[], str | None] = guard.server_version,
-               osascript: Callable[[str], str] = ui.run_osascript) -> list[dict]:
-    """All twelve checks, in a fixed order. Never changes anything. The only CliError it raises is
+               osascript: Callable[[str], str] = ui.run_osascript,
+               recipes_error: str | None = None) -> list[dict]:
+    """All thirteen checks, in a fixed order. Never changes anything. The only CliError it raises is
     "interrupted", when a signal stops the state read; Interrupted and KeyboardInterrupt pass through.
+
+    `recipes_error` is live_cli.RECIPES_ERROR: why the recipe commands did not load, or None.
 
     `client` must be built with reap=False (RuntimeError otherwise)."""
     _require_look_only(client)
@@ -274,8 +277,14 @@ def run_checks(client: BridgeClient, *, premiere: Callable[[], dict | None] = ui
             found["accessibility"] = _check("accessibility", "fail" if err.code == "no_accessibility" else "warn",
                                             err.message)
 
+    # recipes
+    if recipes_error is None:
+        found["recipes"] = _check("recipes", "pass", "the recipe commands are loaded")
+    else:
+        found["recipes"] = _check("recipes", "fail", recipes_error)
+
     order = ("premiere_running", "bridge_folder", "panel_heartbeat", "bridge_protocol", "panel_version", "lease",
-             "recovery", *STATE_CHECKS, "mcp_server", "accessibility")
+             "recovery", *STATE_CHECKS, "mcp_server", "accessibility", "recipes")
     return [found[name] for name in order]
 
 

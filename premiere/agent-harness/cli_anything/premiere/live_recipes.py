@@ -22,7 +22,7 @@ from cli_anything.premiere.core.recipes import clips, effects, frames, lut
 from cli_anything.premiere.errors import CliError
 from cli_anything.premiere.live_cli import (DEFAULT_LEASE_WAIT_S, STOPPED_LOOK, STOPPED_RUN, _client, _warning_lines,
                                             live, live_options, stops_cleanly)
-from cli_anything.premiere.premiere_cli import _emit, _fail, _json, json_option
+from cli_anything.premiere.premiere_cli import _echo_json, _echo_text, _emit, _fail, _json, json_option
 
 
 @live.group("clip")
@@ -336,14 +336,14 @@ SINGLE_FLAGS = (("sequence_id", "--sequence"), ("sequence_name", "--sequence-nam
 def _set_failure(ctx: click.Context, code: str, message: str, payload: dict, requested: list) -> None:
     """Exit 1 with the failure and what ran so far, as `mcp batch` does."""
     if _json(ctx):
-        click.echo(json.dumps({"ok": False, "error": message, "code": code, **payload}, indent=2, ensure_ascii=False))
+        _echo_json({"ok": False, "error": message, "code": code, **payload}, indent=2)
     else:
         lines = _set_lines(payload, requested)
         if lines:
-            click.echo("\n".join(lines))
-        click.echo(f"Error: {message}", err=True)
+            _echo_text("\n".join(lines))
+        _echo_text(f"Error: {message}", err=True)
         for line in _warning_lines(payload.get("warnings") or []):
-            click.echo(line, err=True)
+            _echo_text(line, err=True)
     ctx.exit(1)
 
 
@@ -478,15 +478,14 @@ def _frame_lines(payload: dict) -> list[str]:
 def _frame_failure(ctx: click.Context, err: CliError, payload: dict) -> None:
     """Exit 1 with the failure and what was written, as `mcp batch` does."""
     if _json(ctx):
-        click.echo(json.dumps({"ok": False, "error": err.message, "code": err.code, **payload}, indent=2,
-                              ensure_ascii=False))
+        _echo_json({"ok": False, "error": err.message, "code": err.code, **payload}, indent=2)
     else:
         lines = _frame_lines(payload)
         if lines:
-            click.echo("\n".join(lines))
-        click.echo(f"Error: {err.message}", err=True)
+            _echo_text("\n".join(lines))
+        _echo_text(f"Error: {err.message}", err=True)
         for line in _warning_lines(payload.get("warnings") or []):
-            click.echo(line, err=True)
+            _echo_text(line, err=True)
     ctx.exit(1)
 
 
@@ -573,12 +572,11 @@ def _app_failure(ctx: click.Context, err: CliError) -> None:
         _fail(ctx, err)
         return
     if _json(ctx):
-        click.echo(json.dumps({"ok": False, "error": err.message, "code": err.code, **carried}, indent=2,
-                              ensure_ascii=False))
+        _echo_json({"ok": False, "error": err.message, "code": err.code, **carried}, indent=2)
     else:
-        click.echo(f"Error: {err.message}", err=True)
+        _echo_text(f"Error: {err.message}", err=True)
         for line in _warning_lines(carried.get("warnings") or []):
-            click.echo(line, err=True)
+            _echo_text(line, err=True)
     ctx.exit(1)
 
 
@@ -690,15 +688,14 @@ def _lut_lines(payload: dict) -> list[str]:
 def _lut_failure(ctx: click.Context, err: CliError, payload: dict) -> None:
     """Exit 1 with the failure and what was written, as `mcp batch` does."""
     if _json(ctx):
-        click.echo(json.dumps({"ok": False, "error": err.message, "code": err.code, **payload}, indent=2,
-                              ensure_ascii=False))
+        _echo_json({"ok": False, "error": err.message, "code": err.code, **payload}, indent=2)
     else:
         lines = _lut_lines(payload)
         if lines:
-            click.echo("\n".join(lines))
-        click.echo(f"Error: {err.message}", err=True)
+            _echo_text("\n".join(lines))
+        _echo_text(f"Error: {err.message}", err=True)
         for line in _warning_lines(payload.get("warnings") or []):
-            click.echo(line, err=True)
+            _echo_text(line, err=True)
     ctx.exit(1)
 
 

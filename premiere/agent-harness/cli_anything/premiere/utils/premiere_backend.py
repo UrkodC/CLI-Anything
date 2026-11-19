@@ -1,8 +1,10 @@
 """The parts of the real Adobe Premiere Pro install this CLI looks at.
 
-Premiere Pro has no headless mode and no command line for project work. This CLI
-reads the native project file (.prproj) directly and never starts or drives the
-app. The install is only inspected to report which Premiere wrote the files.
+Premiere Pro has no headless mode and no command line for project work. The file
+commands of this CLI read the native project file (.prproj) directly and never
+start or drive the app. The install is only inspected to report which Premiere
+wrote the files. The live commands (live_cli.py) are another route: they drive
+a running Premiere 27 through the MCP Bridge panel.
 """
 from __future__ import annotations
 
@@ -39,4 +41,5 @@ def status() -> dict:
         "tested_project_formats": {str(k): v for k, v in TESTED_PROJECT_VERSIONS.items()},
         "smoke_read_project_formats": {str(k): v for k, v in SMOKE_READ_PROJECT_VERSIONS.items()},
         "writes_projects": False,
+        "live_commands": True,
     }

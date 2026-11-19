@@ -9,11 +9,13 @@ Checked on macOS on 2026-11-18 with Adobe Premiere Pro 27.0.0 (build 88).
   of its own (rendering goes through Adobe Media Encoder).
 - **Scripting exists, but only inside the running app.** ExtendScript (CEP panels) and UXP
   plugins run inside Premiere. They need the GUI open and a panel loaded. Other projects
-  build MCP servers on that route. This harness does not use it.
+  build MCP servers on that route. The file commands of this harness do not use it. The live
+  commands use it through the MCP Bridge panel.
 - **The project file is open to reading.** A `.prproj` file is gzip-compressed XML.
 
-Result: this harness reads the native project file directly. It does not start Premiere, and it
-has no render or export command, because Premiere offers no way to render without its GUI.
+Result: the file commands of this harness read the native project file directly. They do not
+start Premiere and have no render or export command, because Premiere offers no way to render
+without its GUI. `live frame export` exports stills through the running app.
 The real software enters through the files it writes, and the end-to-end tests check the reader
 against values read back from Premiere itself.
 
@@ -73,15 +75,26 @@ Temperature sits at index 14 and Tint at index 15.
 
 ## Commands
 
-`status`, `project info`, `project media`, `sequence list`, `sequence clips`, `clip effects`,
-`colormode list`, `repl`. All read-only, all with `--json`.
+File commands: `status`, `project info`, `project media`, `sequence list`, `sequence clips`, `clip effects`,
+`colormode list`. All read-only, all with `--json`. `repl` runs any command, the live ones too.
+
+Live commands, on a running Premiere 27 through the MCP Bridge panel, all with `--json`:
+- Look only: `doctor` (thirteen checks), `recovery show`, `live state`, `live clip list`,
+  `live effect get`, `ui mode get`, `mcp list`, `mcp describe`.
+- Change the running app: `live effect set`, `live lut set`, `live frame export`,
+  `live app proxies on|off`, `live app activate`, `ui mode set`.
+- Run what the caller sends: `live run` (write checks only with `--write`), `mcp call`,
+  `mcp batch` (no write checks of the CLI; the server applies its own rules).
+
+No recipe saves the project. `mcp call`, `mcp batch` and `live run` can, because they run what the caller sends.
 
 ## Not done, and why
 
-- No write commands. An undocumented format and a live editor make writes risky. A later version
-  can add them on copies only, with the app closed.
-- No preview or export. Premiere cannot render without its GUI.
 - Color Mode detection check and decoding. Both need one small project with an Adjust operation and a mask.
+- Milestone 2 of the design. It gets its own short design first, and it brings four recipes:
+  `live place` (a list of shots placed by in and out point), `live effect copy` (an ordered effect
+  chain from one clip to others), `live track disable-clips` (disables every clip of a track, the
+  fix for a track mute that does not hold) and `live sequence duplicate`.
 
 ## Gate tests, 2026-11-18
 

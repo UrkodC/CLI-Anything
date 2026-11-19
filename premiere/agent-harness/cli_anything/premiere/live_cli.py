@@ -21,7 +21,7 @@ from cli_anything.premiere.core.mcp_client import McpSession
 from cli_anything.premiere.core.session import (DEFAULT_HARD_LIMIT_S, SOFT_TIMEOUT_S, guarded_state,  # noqa: F401
                                                 run_script)
 from cli_anything.premiere.errors import CliError
-from cli_anything.premiere.premiere_cli import _emit, _fail, _json, json_option
+from cli_anything.premiere.premiere_cli import _echo_json, _echo_text, _emit, _fail, _json, json_option
 
 DEFAULT_LEASE_WAIT_S = 30.0
 
@@ -179,11 +179,11 @@ def live_run(ctx: click.Context, script: Path, args_json: str | None, write: boo
     if stored is False:
         message = "The check script says the change was not stored."
         if _json(ctx):
-            click.echo(json.dumps({"ok": False, "error": message, "code": "not_stored", **payload}, indent=2, ensure_ascii=False))
+            _echo_json({"ok": False, "error": message, "code": "not_stored", **payload}, indent=2)
         else:
-            click.echo(f"Error: {message}", err=True)
+            _echo_text(f"Error: {message}", err=True)
             for line in _warning_lines(warnings):
-                click.echo(line, err=True)
+                _echo_text(line, err=True)
         ctx.exit(1)
     lines = [json.dumps(data, indent=2, ensure_ascii=False)]
     lines.append("Stored: " + ("not checked" if stored is None else "yes"))
@@ -384,10 +384,10 @@ def mcp_batch(ctx: click.Context, file: Path, timeout: float, lease_wait: float)
         return
     code, message = failure
     if _json(ctx):
-        click.echo(json.dumps({"ok": False, "error": message, "code": code, **summary}, indent=2, ensure_ascii=False))
+        _echo_json({"ok": False, "error": message, "code": code, **summary}, indent=2)
     else:
-        click.echo(f"Error: {message}", err=True)
-        click.echo(f"Ran {summary['ran']} of {summary['total']} calls.", err=True)
+        _echo_text(f"Error: {message}", err=True)
+        _echo_text(f"Ran {summary['ran']} of {summary['total']} calls.", err=True)
     ctx.exit(1)
 
 
@@ -495,7 +495,7 @@ def doctor(ctx: click.Context) -> None:
     try:
         checks = doctor_core.run_checks(client, premiere=ui_core.running_premiere, panel=guard.panel_version,
                                         which=shutil.which, server=guard.server_version,
-                                        osascript=ui_core.run_osascript)
+                                        osascript=ui_core.run_osascript, recipes_error=RECIPES_ERROR)
     except CliError as err:                  # interrupted: the only CliError run_checks lets through
         _fail(ctx, err)
         return
@@ -509,11 +509,10 @@ def doctor(ctx: click.Context) -> None:
     failed = [c["name"] for c in checks if c["status"] == "fail"]
     message = f"{len(failed)} check{'' if len(failed) == 1 else 's'} failed: {', '.join(failed)}."
     if _json(ctx):
-        click.echo(json.dumps({"ok": False, "error": message, "code": "doctor_failed", **payload},
-                              indent=2, ensure_ascii=False))
+        _echo_json({"ok": False, "error": message, "code": "doctor_failed", **payload}, indent=2)
     else:
-        click.echo("\n".join(lines))
-        click.echo(f"Error: {message}", err=True)
+        _echo_text("\n".join(lines))
+        _echo_text(f"Error: {message}", err=True)
     ctx.exit(1)
 
 # The recipe commands (live_recipes.py) attach to the `live` group above. A fault in them must not take the
