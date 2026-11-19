@@ -40,6 +40,10 @@ REPL_COMMANDS = {
     "live app proxies on|off": "Switch the proxy display of Premiere",
     "live app activate --sequence ID": "Make a sequence the active one",
     "live lut set --sequence ID (--track N --clip N | --node-id ID) --lut FILE.cube [--prove --time SECONDS --out-dir DIR]": "Write a LUT into Lumetri Color, read it back",
+    "live keys get --sequence ID (--track N --clip N | --node-id ID) [--effect NAME] [--property NAME]": "The keys of one property of one clip (Motion Rotation unless named)",
+    "live keys set --sequence ID --from LEVEL.json [--no-scale] [--skip-refused] [--dry-run]": "Write Rotation keys and one static Scale per clip from a level plan, each read back",
+    "live place --sequence ID --plan SHOTS.json [--overwrite] [--skip-refused] [--dry-run]": "Place the shots of a placement plan on a sequence, each read back",
+    "live effect apply --sequence ID --track N (--clips 0,3,5 | --all) --effect NAME [--skip-refused] [--dry-run]": "Apply effects to the clips of a video track in render order, each read back",
     "help": "Show this list",
     "exit": "Leave the shell",
 }

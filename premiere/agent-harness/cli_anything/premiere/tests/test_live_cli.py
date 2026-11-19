@@ -571,6 +571,66 @@ def test_repl_lists_the_new_commands():
         assert any(key.startswith(start) for key in REPL_COMMANDS), start
 
 
+# ---------- plan 3, task 9: documents and help text ----------
+PLAN_COMMANDS = (["live", "keys", "set"], ["live", "place"], ["live", "effect", "apply"])
+STYLE_BANNED = ("delve", "leverage", "robust", "seamless", "comprehensive", "crucial")
+
+
+def test_plan_commands_have_help(capsys):
+    for path in PLAN_COMMANDS:
+        text = _help_text(capsys, path)
+        for needle in ("--dry-run", "--skip-refused", "not saved"):
+            assert needle in text, (path, needle)
+        # the first step and the exit rule, in words
+        assert "Run --dry-run first" in text, path
+        assert "exit status is 0 only when every entry is done or had nothing to do" in text, path
+
+
+def test_effect_set_help_is_as_complete_as_the_skill(capsys):
+    text = _help_text(capsys, ["live", "effect", "set"])
+    for needle in ("A clip on an audio track is refused.", "--effect-index", "does not match the index",
+                   "target_moved", "Nothing more was written", "precondition", "--expect-old"):
+        assert needle in text, needle
+
+
+def test_frame_export_help_says_proxies_off_only_for_proxies_off(capsys):
+    text = _help_text(capsys, ["live", "frame", "export"])
+    assert "proxy display is off unless you give --proxies keep" in text
+    assert "While the command runs, proxy display is off and" not in text
+
+
+def test_no_em_dash_or_banned_word_in_any_help_text_with_the_plan_commands(capsys):
+    paths = [path for group in LIVE_GROUPS for path in _command_paths(getattr(live_cli, group), [group])]
+    for needed in (["live", "keys"], ["live", "keys", "get"], ["live", "keys", "set"], ["live", "place"],
+                   ["live", "effect", "apply"]):
+        assert needed in paths, needed
+    for path in paths:
+        text = _help_text(capsys, path)
+        assert "\u2014" not in text and "\u2013" not in text, path
+        assert not [word for word in STYLE_BANNED if word in text.lower()], path
+
+
+def test_repl_lists_the_plan_commands():
+    from cli_anything.premiere.premiere_cli import REPL_COMMANDS
+    for start in ("live keys get", "live keys set", "live place", "live effect apply"):
+        lines = [key for key in REPL_COMMANDS if key.startswith(start)]
+        assert len(lines) == 1, (start, lines)
+        assert REPL_COMMANDS[lines[0]].strip() and "\u2014" not in REPL_COMMANDS[lines[0]], start
+    for start in ("status", "project info", "sequence clips", "clip effects", "live effect set", "live lut set"):
+        assert any(key.startswith(start) for key in REPL_COMMANDS), start     # the older lines stay
+
+
+def test_root_help_and_status_unchanged_by_the_plan_commands(capsys):
+    assert dispatch(["--help"]) == 0
+    assert "Read Premiere Pro project files" in capsys.readouterr().out
+    assert dispatch(["--version"]) == 0
+    assert "0.1.0" in capsys.readouterr().out
+    code, data = run_json(capsys, ["status"])
+    assert code == 0 and data["writes_projects"] is False
+    for key in STATUS_KEYS_BEFORE:
+        assert key in data, key
+
+
 def test_repl_commands_are_real_commands(capsys):
     from cli_anything.premiere.premiere_cli import REPL_COMMANDS
     for key in REPL_COMMANDS:

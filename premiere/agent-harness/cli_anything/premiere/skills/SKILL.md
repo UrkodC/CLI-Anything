@@ -7,7 +7,8 @@ description: >-
   effect. Looks for Premiere 27 Color Mode markers (not checked on a real grade). The file
   commands work on the saved file, with no running Premiere, and never change a project. The
   CLI's live commands (doctor, live, mcp, ui, recovery) read and change a running Premiere 27
-  through the MCP Bridge panel: clip lists, effect values, LUTs, still frames.
+  through the MCP Bridge panel: clip lists, effect values, LUTs, still frames, Rotation keys,
+  shots placed from a plan, and effects applied in render order.
 ---
 
 # cli-anything-premiere
@@ -68,10 +69,13 @@ prints the LUT file and the Lumetri values of the fifth clip on V1.
 ## Live commands on the running Premiere 27
 
 These commands talk to the running Premiere through its MCP Bridge panel. `doctor`,
-`recovery show`, `live state`, `live clip list`, `live effect get` and `ui mode get` only look.
-`live effect set`, `live lut set`, `live frame export`, `live app proxies`, `live app activate`
-and `ui mode set` change the running app. `live run`, `mcp call` and `mcp batch` run whatever
-you send. No recipe saves the project. Tell the owner that a change is not saved.
+`recovery show`, `live state`, `live clip list`, `live effect get`, `live keys get` and
+`ui mode get` only look. `live effect set`, `live lut set`, `live frame export`,
+`live app proxies`, `live app activate`, `live keys set`, `live place`, `live effect apply` and
+`ui mode set` change the running app. The commands for keys, placing and applying effects have
+their own section, "Plan files on the running Premiere 27", below. `live run`, `mcp call` and
+`mcp batch` run whatever you send. No recipe saves the project. Tell the owner that a change is
+not saved.
 
 ### Before the first live command
 
@@ -96,15 +100,17 @@ you send. No recipe saves the project. Tell the owner that a change is not saved
 - Name the target. Give `--sequence ID`. Give the clip by `--track N --clip N` (from
   `live clip list`) or by `--node-id ID`. Give the effect by name, with `--effect-index N` when
   the name occurs twice on the clip. Give the property by `--index N` together with its
-  `--name`. No recipe uses the selection, the playhead or the active sequence.
+  `--name`. No recipe uses the selection, the playhead or the active sequence, except
+  `live frame export`, `live lut set --prove`, `live place` and `live effect apply`, which switch
+  the active sequence and put it back.
 - `live state` shows the ID of the active sequence. `mcp call list_sequences` lists every
   sequence with its ID. Pass `--sequence` to the reads too: without it `live clip list` and
   `live effect get` read the active sequence and only warn.
 - Lumetri Color has 130 properties. Temperature, Saturation and Contrast occur more than once,
   so always give the index with the name.
 - Put a risky write last. A plan stops at the first write that is not stored.
-- Apply ProcAmp before Lumetri Color. Effects render in the order they were applied, and
-  ProcAmp must render before the LUT.
+- Apply effects in render order: Gyroflow (when used), then ProcAmp, then Lumetri Color. Effects
+  render in the order they were applied, and ProcAmp must render before the LUT.
 - Before you remove a clip (with `mcp call`, `mcp batch` or `live run`), read its ProcAmp,
   Motion and keyframes. They are lost with the clip.
 
@@ -173,8 +179,9 @@ you send. No recipe saves the project. Tell the owner that a change is not saved
 
 ### live frame export and live lut set
 
-- While `live frame export` or `live lut set --prove` runs, proxy display is off and the target
-  sequence is active for every session. Do not run it while another session works on another
+- While `live lut set --prove` runs, and while `live frame export` runs without `--proxies keep`,
+  proxy display is off and the target sequence is active for every session. With `--proxies keep`
+  only the active sequence is switched. Do not run it while another session works on another
   sequence. Tell the owner first.
 - `live frame export` exports the sequence named by `--sequence`, also when another one is
   active. It switches proxy display off and makes the sequence active, and puts both back
@@ -243,16 +250,191 @@ Codes of the recipes:
   is not valid.
 - `target_moved`: a clip or an effect moved while other sessions had a turn. Nothing more was
   written.
-- `not_applied`: Premiere did not pick up the command, often because a dialog is open. Nothing
-  was changed. Tell the owner.
-- `not_restored`: the frames were exported, but a switch was not put back. Run the put-back
-  commands that the warnings print.
-- `not_switched`: proxy display or the active sequence did not switch. Nothing was exported.
+- `not_applied`: Premiere did not pick up one command, often because a dialog is open. That
+  command changed nothing. An earlier command of the same run may have landed (the second or third
+  try of a write, say): read the output for what ran. Tell the owner.
+- `not_restored`: the work was done (frames exported, shots placed or effects applied), but a
+  switch was not put back. Run the put-back commands that the warnings print.
+- `not_switched`: proxy display or the active sequence did not switch. Nothing was exported,
+  placed or applied.
 - `export_failed`: a frame was not exported, or its file check failed. The output says what is
   still switched.
-- `output_exists`, `output_dir`: a frame file exists, or the folder cannot be used. Nothing
-  was sent.
+- `output_exists`, `output_dir`: a frame file exists, or the folder cannot be used. No frame was
+  exported and nothing was written to the project.
 - `lumetri_layout`: the Lumetri Color does not have the layout `live lut set` knows. Nothing
   was written.
 - `ffmpeg_missing`, `ffmpeg_failed`: `--prove` needs ffmpeg, or ffmpeg could not read a frame.
-- `recipe_error`: a fault in this CLI. After an export, the output still names what is switched.
+- `recipe_error`: a fault in this CLI. After an export, a placing or an apply, the output still
+  names what is switched.
+
+Codes of the plan commands (`live keys set`, `live place`, `live effect apply`). The `code` of a
+failed run is one of these (`bad_plan`, `bad_args`, `not_restored`, `interrupted`,
+`unknown_outcome` and `recipe_error` are explained above):
+- `refused`: a check refused an entry, and `--skip-refused` was not given. The message names the
+  first refused entry and its reason code. Nothing was written. A dry run gives it too.
+- `not_done`: the run ended, and not every entry is `done` or skipped for nothing to do. The
+  message gives the counts (done, skipped, failed, not run) and the first entry that did not run.
+- `fps_mismatch` (`live place`): the plan's `fps` is not the frame rate of the sequence. Nothing
+  was written.
+- `bad_order` (`live effect apply`): the request names Lumetri Color before ProcAmp. It is refused
+  before any contact, unless `--any-order` is given.
+- `too_many_clips` (`live effect apply`): the track holds more than 400 clips. The command read
+  the track and applied nothing.
+- `bad_reply`: a script answered in a shape this CLI does not know. After a write, check the clip
+  in Premiere.
+
+The `reason_code` of one entry, in `results`. A refusal is `skipped` and is not success. A reason
+marked "nothing to do" is `skipped` and counts as success. `render_order` belongs to a `failed`
+entry:
+- `no_clip`: the clip is not there. `live keys set`: no clip with that node ID in the sequence.
+  `live effect apply`: no clip with that number on the track.
+- `clip_changed` (`live keys set`): the clip shows other media than the plan's `src_in` to
+  `src_out` (more than half a frame apart), so it was trimmed or slipped after the plan was made.
+  Also given when Premiere did not report the in or out point.
+- `retimed` (`live keys set`): the clip has a speed change or is reversed, or Premiere did not
+  report either. Keys are written on clips at normal speed only.
+- `slow_motion_unproven` (`live keys set`): only given when `SLOW_MOTION_PROVEN` is false in the
+  code. Measure M6 proved slow motion, so it is true and this build never gives the code. A clip
+  whose item frame rate Premiere did not report gets a warning instead.
+- `motion_layout` (`live keys set`): no Motion effect, or Scale is not at Motion index 1, or
+  Rotation is not at index 4.
+- `keyed` (`live keys set`): Motion Scale has keys, or Premiere would not say. Give `--no-scale`
+  to leave Scale as it is.
+- `bad_length` (`live keys set`): the length of the clip in the sequence is not a whole number of
+  frames, so keys cannot go on the frame grid.
+- `negative_key` (`live keys set`): a key time is before the clip start.
+- `key_clash` (`live keys set`): two keys fall on the same frame of the clip. A key at the end
+  moves to the last frame, so two end keys clash.
+- `no_change` (nothing to do, `live keys set`): the entry has no keys and is not `"static": true`.
+- `no_item`, `ambiguous_item` (`live place`): no project item has that node ID or name, or more
+  than one has that name. Name the item by its node ID.
+- `no_track` (`live place`): the sequence has fewer video or audio tracks than the shot names.
+- `plan_overlap` (`live place`): the shot overlaps another shot of the plan on one track.
+- `no_sound` (`live place`): the shot is sound only (`audio_only`), and the item has no sound.
+- `placed_differently` (`live place`): the item is already at that start, but not as planned: with
+  other in and out points, as a picture without the sound of a sound-only shot, or as a still that
+  is longer than planned. `--overwrite` cannot place the same item at the same start.
+- `span_not_empty` (`live place`): clips lie in the span of the shot. Give `--overwrite` to cut
+  them. A sound-only shot needs an empty picture span on its video track, also with `--overwrite`:
+  name a spare track.
+- `already_placed` (nothing to do, `live place`): the shot is in place already.
+- `effects_unread` (`live effect apply`): Premiere did not report the effects of the clip, so it
+  is not known whether it holds the effect.
+- `has_effect` (nothing to do, `live effect apply`): the clip holds an effect of that name.
+  `--allow-second` applies another.
+- `render_order` (`live effect apply`, failed): the effect landed, but the requested effects do
+  not end the render order of the clip in request order. The message says where it landed.
+
+## Plan files on the running Premiere 27
+
+`live keys set`, `live place` and `live effect apply` check every entry of a plan before the first
+write and give one result per entry. `live keys get` only looks. They follow every rule of "Live
+commands on the running Premiere 27" above: `doctor` first, the project guard, one lock, no saving.
+The target is always the sequence you name by ID, as before. Two of them also switch the active
+sequence while they run (see below).
+
+```bash
+cli-anything-premiere --json live keys get --sequence ID (--track N --clip N | --node-id ID) [--track-type video|audio] [--effect NAME] [--property NAME] [--property-index N]
+cli-anything-premiere --json live keys set --sequence ID [--sequence-name NAME] --from LEVEL.json [--no-scale] [--static-spread DEG] [--skip-refused] [--dry-run]
+cli-anything-premiere --json live place --sequence ID [--sequence-name NAME] --plan SHOTS.json [--overwrite] [--skip-refused] [--dry-run]
+cli-anything-premiere --json live effect apply --sequence ID [--sequence-name NAME] --track N (--clips 0,3,5 | --all) --effect NAME [--effect NAME] [--any-order] [--allow-second] [--skip-refused] [--dry-run]
+```
+
+The three writers also take `--project PATH`, `--any-project`, `--lease-wait`, `--timeout` and
+`--allow-untested`, as the other writing recipes do.
+
+### Rules for an agent
+
+- Run `--dry-run` first and read every refusal. A dry run reads and checks every entry, writes
+  nothing and does not switch the active sequence. When an entry is refused, find out why and tell
+  the owner. Do not add `--skip-refused` to get past a refusal you have not understood: it runs
+  the other entries and leaves the refused ones `skipped`.
+- Name the sequence by ID (`--sequence ID`, from `live state` or `mcp call list_sequences`).
+  A level plan holds the node ID of each clip. A placement plan holds the node ID or the name of
+  each project item. A node ID holds for one open of a project only, and node IDs repeat across
+  open projects. After a project was opened again, read them again (`live clip list` for clips).
+  Never reuse IDs from an earlier open.
+- The plan formats are those of the film planner scripts, unchanged: `level_plan.py` (its output
+  is the level plan of `live keys set`) and `place_plan.py` (its input is the placement plan of
+  `live place`). Do not convert them. A key the command does not read passes, and a warning names
+  it.
+- Keys replace the old Rotation keys of the clip. A key time is seconds from the first visible
+  frame of the clip. A key at the clip end, or less than half a frame before it, moves to one frame
+  before the end, and the entry lists the move. The interpolation is the default of `addKey`; it is
+  never set. One static Scale is written first (`--no-scale` leaves Scale as it is). An entry with
+  `"static": true` gets one Rotation value and no keys. `--static-spread DEG` decides static or
+  keys by the spread of the keys instead of the plan's flag, and a warning says when that changes
+  an entry.
+- Slow motion: measure M6 proved the time base of keys on a clip whose item is interpreted to
+  another frame rate (`SLOW_MOTION_PROVEN` is true). Such a clip is written, with a warning that
+  its keys are in media time. A retimed clip (speed not 1, or reversed) is refused (`retimed`).
+  Do not work round that. Most slow motion in the films is a speed change (2.5x or 5x slow), and
+  those clips are refused today. How keys behave on them was not measured (open measure `mspeed`:
+  `premiere-pro-mcp` 1.25.0 has no speed setter).
+- Placing is overwrite only: a shot goes over what lies in its span, and nothing is inserted or
+  rippled. `set_item_in_out` changes the marks of the project item, and they stay as set. The
+  output lists them (`marks`): tell the owner that the item marks changed. A clip in the span is
+  refused unless you give `--overwrite`, and then it is cut, with a warning. A sound-only shot
+  (`audio_only`) puts its picture on its video track first and removes it again, so that track
+  must be empty in the span, also with `--overwrite`: name a spare track. A still is told by its
+  file extension, and it is extended to its planned length when it comes in shorter.
+- `live place` and `live effect apply` make the target sequence active for every session while
+  they run, and put the old one back. Tell the owner first. Do not run them while another session
+  works on another sequence. `live place` goes through the switch on every real run, also when
+  every shot is in place already: when another sequence is active, it makes the target active and
+  puts the old one back. `live effect apply` switches only when an entry has something to apply.
+  `live keys set` and every dry run never switch. When the target is active already, nothing is
+  switched. After a stop or a recovery the active sequence
+  may stay switched: `left_switched` and the warnings name what to put back.
+- Effects: name them in render order: Gyroflow (when used), then ProcAmp, then Lumetri Color. A
+  new effect renders after every effect the clip holds. A request with Lumetri Color before
+  ProcAmp is refused (`bad_order`) unless you give `--any-order`. The order rule does not check
+  where Gyroflow stands. A warning says when a Lumetri Color that the clip holds already would
+  render before the new ProcAmp. A clip that holds an effect of that name is skipped
+  (`has_effect`); `--allow-second` applies a second one. Gyroflow gets its defaults only, because
+  a script cannot set its sliders, and its entry carries a warning. Load the shot's Gyroflow
+  project in the plugin by hand after the apply. Until then the clip is not stabilized. The output
+  gives the effect index of each effect, for `live effect set` and `live lut set`.
+- Nothing is saved. Tell the owner.
+- After an error with the code `recovery_required`, run `cli-anything-premiere recovery show` and
+  tell the owner what it shows. The CLI never confirms a recovery. After `unknown_outcome`, or
+  when `stored` is null or an entry says the write "may have landed" or that its outcome "is not
+  known", the write may have landed: look at the clip in Premiere before you repeat it.
+
+### Reading the output
+
+One line per entry with its status, then the counts. With `--json`: `results` (per entry: `entry`,
+`name`, `target`, `status`, `skip`, `reason_code`, `reason`, `now`, `error`, `warnings`), `counts`
+(`done`, `skipped`, `refused`, `failed`, `not_run`), `first_not_run`, `stored`, `rendered` and
+`warnings`. `stored` is true when the run succeeded, null when an entry's outcome is unknown, and
+false otherwise. `rendered` is always null: nothing here checks a picture.
+
+Other keys of the payload: `sequence` (all three commands), `left_switched` and `stopped`
+(`live place` and `live effect apply`), `marks` (`live place`: the item marks it set), and in a
+dry run `dry_run` (true) and `planned` (what each entry would get). A record also carries extras:
+`mode`, `moved` and `interpreted` (`live keys set`), `calls` and `marks` (`live place`), `effect`
+and `effect_index` (`live effect apply`).
+
+- `done`: written, and read back as planned.
+- `skipped` with `skip` set to `nothing_to_do`: success (`already_placed`, `has_effect`,
+  `no_change`). With `skip` set to `refused`: a check failed, and the entry is not success.
+- `failed`: the write did not give the planned result, or its outcome is unknown.
+- `not_run`: the run stopped before this entry.
+
+The exit status is 0 only when every entry is `done` or skipped for nothing to do. A real run with
+any other entry gives exit status 1, with the code `not_done` or the error that stopped the run. A
+refusal without `--skip-refused` stops the run before the first write (the code `refused`). A dry
+run exits 1 on a refusal unless `--skip-refused` is given. The codes are in "Codes of the plan
+commands" above.
+
+### What a re-run does
+
+- `live place`: a shot already in place is skipped (`already_placed`), a partial run is finished,
+  and a finished plan exits 0. It still goes through the switch step: when another sequence is
+  active, it makes the target active and puts the old one back.
+- `live effect apply`: a clip that holds the effect is skipped (`has_effect`), and a finished run
+  exits 0.
+- `live keys set`: the keys are written again and read back, and the entry is `done` again. A clip
+  whose keys already match is not skipped.
+
+The live results are in `PREMIERE.md` ("Live checks of Plan 3").

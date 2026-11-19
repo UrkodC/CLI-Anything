@@ -392,9 +392,19 @@ def live_effect_set(ctx: click.Context, plan_path: Path | None, dry_run: bool, p
     refused, because only numbers, strings and booleans can be written. A property whose value cannot be read
     is refused. A number that is not finite, or is 4294967296 or more in size, is refused.
 
+    A clip on an audio track is refused. A name that does not match the index is refused. An effect name that
+    occurs twice on the clip needs --effect-index. A property that does not hold the --expect-old value is
+    refused.
+
     A number counts as stored when the value read back is within 0.001 of the value wanted.
 
     A plan stops at the first write that is not stored. The entries after it do not run.
+
+    A long plan gives other sessions a turn between writes. Then every target is found again and every check
+    runs again on the entries not yet written, the --expect-old check too. The plan can stop midway with
+    target_moved or a refusal. The error says "Nothing more was written", and the results list the entries that
+    ran. The write script also reads the old value right before it writes: when it is not the --expect-old value,
+    it refuses with precondition and writes nothing.
 
     A number below zero gets two tries. Then the near value is tried (-2.496 for -2.6). When it lands, the
     output says so, and the entry is still not stored. When nothing landed and the property holds another value
@@ -524,8 +534,8 @@ def live_frame_export(ctx: click.Context, sequence_id: str, sequence_name: str |
 
     file check: each file exists and is not empty. It is not a check of the picture.
 
-    While the command runs, proxy display is off and the sequence is active for every session that works in
-    Premiere. Do not run it while another session works on another sequence.
+    While the command runs, the sequence is active for every session that works in Premiere, and proxy display
+    is off unless you give --proxies keep. Do not run it while another session works on another sequence.
 
     The first frame that fails stops the run. The output lists the frames that were written. After a failed
     export Premiere may open a recovery. Then nothing more is written: the proxy display and the active sequence
@@ -1018,6 +1028,9 @@ def live_keys_set(ctx: click.Context, sequence_id: str, sequence_name: str | Non
     Per clip: Scale first, then Rotation. An entry is done when both read back as written. A failed entry does not
     stop the others, except when a write was not sent or its outcome is unknown: then the run stops. The project is
     not saved.
+
+    Run --dry-run first: it reads and checks every clip, shows what would be written, and writes nothing. Read
+    every refusal. After a real run the exit status is 0 only when every entry is done or had nothing to do.
     """
     try:
         plan = keys.load_level_plan(plan_path)
@@ -1100,6 +1113,9 @@ def live_place(ctx: click.Context, sequence_id: str, sequence_name: str | None, 
     the end. While it runs, the sequence is active for every session that works in Premiere. The first failed
     step stops the run. At the end each shot is read back: start to the frame, in and out to the item frame. The
     project is not saved.
+
+    Run --dry-run first: it reads and checks every shot, shows the exact calls, and writes nothing. Read every
+    refusal. After a real run the exit status is 0 only when every entry is done or had nothing to do.
     """
     try:
         plan = place.load_shots(plan_path)
@@ -1201,6 +1217,9 @@ def live_effect_apply(ctx: click.Context, sequence_id: str, sequence_name: str |
     call stops the run. At the end each clip is read back: an entry is done when the clip holds one more effect of
     that name. The output gives the effect index of each effect, for `live effect set` and `live lut set`. The
     project is not saved.
+
+    Run --dry-run first: it reads and checks every entry, shows the exact calls, and writes nothing. Read every
+    refusal. After a real run the exit status is 0 only when every entry is done or had nothing to do.
     """
     if clips_text is not None and all_clips:
         raise click.UsageError("Name the clips with --clips or --all, not both.")

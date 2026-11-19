@@ -73,7 +73,9 @@ Things to know:
 
 The live commands talk to a running Premiere Pro 27 through its MCP Bridge panel. Some of them
 only look. The others change the project that is open in Premiere. No recipe below saves the
-project: save it in Premiere when you want to keep a change.
+project: save it in Premiere when you want to keep a change. The four commands that work on keys,
+placed shots and effect lists (`live keys get`, `live keys set`, `live place` and
+`live effect apply`) are in "Plan files" below.
 
 They need:
 - Premiere Pro 27.0.x, running. A write also needs a saved project that is open and active.
@@ -126,8 +128,9 @@ cli-anything-premiere live app activate --sequence ID
 After a failed export, the output says what is still switched. After the owner closes the
 recovery, run only the commands the output prints (`left_switched` and the warnings name them).
 
-While `live frame export` or `live lut set --prove` runs, proxy display is off and the target
-sequence is active for every session. Do not run it while another session works on another
+While `live lut set --prove` runs, and while `live frame export` runs without `--proxies keep`,
+proxy display is off and the target sequence is active for every session. With `--proxies keep`
+only the active sequence is switched. Do not run it while another session works on another
 sequence. Tell the owner first.
 
 A plan file for `live effect set --from` looks like this:
@@ -163,7 +166,7 @@ run `cli-anything-premiere recovery show`. The CLI never confirms a recovery.
 
 Limits of the live commands:
 - Tested on macOS with Premiere Pro 27.0.0, one small test project. The results are in
-  `PREMIERE.md` ("Gate tests" and "Live checks of Plan 2").
+  `PREMIERE.md` ("Gate tests", "Live checks of Plan 2" and "Live checks of Plan 3").
 - `live effect set` writes numbers, text and true or false, on video tracks only. It refuses
   keyframed properties, colours, arrays and Gyroflow.
 - Some failure paths ran only in unit tests, not on the real app: a failed negative write, a
@@ -172,6 +175,95 @@ Limits of the live commands:
 - In a project converted from Premiere 2026, Lumetri index 6 can read 0 while the LUT in the
   path slot still renders (measured by the film-edit session on 2026-11-17). `stored` follows
   index 4 only. The output shows index 6 as `menu_value` with a warning. Use `--prove` there.
+
+## Plan files
+
+Three live commands work on many clips in one call and give one result per entry:
+- `live keys set` writes Motion Rotation keys and one static Motion Scale per clip, from a level plan.
+- `live place` places the shots of a placement plan on a sequence, frame-exact.
+- `live effect apply` applies effects to the clips of one video track, in render order.
+
+`live keys get` only reads: it lists the keys of one property of one clip. Name the sequence by ID
+with `--sequence`. These commands follow the rules of "Live commands" above. No command saves the
+project: save it in Premiere when you want to keep the result.
+
+```bash
+# the keys of one clip (Motion Rotation unless you name another property)
+cli-anything-premiere live keys get --sequence ID --node-id 000f4276
+# keys: check the plan first, then write it
+cli-anything-premiere live keys set --sequence ID --from level_plan.json --dry-run
+cli-anything-premiere live keys set --sequence ID --from level_plan.json
+# place: check the plan first, then place the shots
+cli-anything-premiere live place --sequence ID --plan place_plan.json --dry-run
+cli-anything-premiere live place --sequence ID --plan place_plan.json
+# apply: ProcAmp, then Lumetri Color, on every clip of V1
+cli-anything-premiere live effect apply --sequence ID --track 0 --all --effect ProcAmp --effect "Lumetri Color" --dry-run
+cli-anything-premiere live effect apply --sequence ID --track 0 --all --effect ProcAmp --effect "Lumetri Color"
+# apply: Gyroflow, then ProcAmp, then Lumetri Color, on the first clip of V1
+cli-anything-premiere live effect apply --sequence ID --track 0 --clips 0 --effect Gyroflow --effect ProcAmp --effect "Lumetri Color" --dry-run
+```
+
+The plan files are the ones of the film planner scripts (`level_plan.py` and `place_plan.py`),
+unchanged. A level plan is a JSON array with one entry per clip. `src_in` and `src_out` must match
+what the clip shows now (within half a frame), or the entry is refused (`clip_changed`). Times in
+`keys` are seconds from the first visible frame of the clip:
+
+```json
+[{"node": "000f4276", "name": "S02", "src_in": 0.0, "src_out": 3.295, "scale": 104.4,
+  "keys": [{"time_seconds": 0.0, "value": 1.26}, {"time_seconds": 3.295, "value": 0.07}]}]
+```
+
+A placement plan names the frame rate and the shots. A shot names its project item, its source in
+point, its length, its start and its tracks:
+
+```json
+{"fps": "24000/1001", "shots": [
+  {"name": "S02", "item": "000f4242", "src_in_f": 0, "frames": 79, "start_f": 138, "track": 0, "audio_track": 1}]}
+```
+
+Use `--dry-run` first. It reads and checks every entry, prints what it would do and every refusal,
+and writes nothing. It does not switch the active sequence. Read every refusal before the real run.
+
+Each entry gets a status:
+- `done`: written, and read back as planned.
+- `skipped`: not run. There are two kinds. Nothing to do (`already_placed`, `has_effect`, or a
+  level entry with no change) counts as success. Refused (a check failed) does not.
+- `failed`: the write did not give the planned result, or its outcome is unknown (it may have landed).
+- `not_run`: the run stopped before this entry.
+
+A refusal stops the run before the first write: the error is `refused`, and nothing was written. With
+`--skip-refused` the other entries run, and the refused ones stay `skipped`. After a real run the
+exit status is 0 only when every entry is `done` or skipped for nothing to do. Otherwise it is 1. The
+code is `not_done`, or the error that stopped the run, and the output still lists every entry. A dry
+run exits 1 on a refusal unless `--skip-refused` is given.
+
+What a re-run does:
+- `live place` skips a shot that is already in place (`already_placed`). A re-run finishes a partial
+  run, and exits 0 when everything is in place. It still goes through the switch step: when another
+  sequence is active, it makes the target active and puts the old one back, though it places
+  nothing.
+- `live effect apply` skips a clip that holds the effect already (`has_effect`). `--allow-second`
+  applies a second one.
+- `live keys set` writes the keys again, and reads back the same keys. It does not skip a clip whose
+  keys already match.
+
+Things to know:
+- New keys replace the old Rotation keys of the clip. A key at the clip end, or less than half a
+  frame before it, moves to one frame before the end, and the output lists it.
+- Slow motion clips (an item interpreted to another frame rate) are written, with a warning.
+  Clips with a speed change or reversed are refused (`retimed`). Most slow motion in the films is a
+  speed change (2.5x or 5x slow), so those clips are refused today. How keys behave on them was not
+  measured (open measure `mspeed`: `premiere-pro-mcp` 1.25.0 has no speed setter).
+- Placing is overwrite only. The marks of the project item stay as set, and the output lists them.
+  A clip in the span of a shot is refused unless you give `--overwrite`.
+- `live place` and `live effect apply` make the target sequence active for every session while they
+  run, and put the old one back. Do not run them while another session works on another sequence.
+  Tell the owner first.
+- Name the effects in render order: Gyroflow (when used), then ProcAmp, then Lumetri Color. Gyroflow
+  gets its defaults only. Load the shot's Gyroflow project in the plugin by hand after the apply.
+  Until then the clip is not stabilized.
+
+The live results of these commands are in `PREMIERE.md` ("Live checks of Plan 3").
 
 ## Tests
 

@@ -80,9 +80,12 @@ File commands: `status`, `project info`, `project media`, `sequence list`, `sequ
 
 Live commands, on a running Premiere 27 through the MCP Bridge panel, all with `--json`:
 - Look only: `doctor` (thirteen checks), `recovery show`, `live state`, `live clip list`,
-  `live effect get`, `ui mode get`, `mcp list`, `mcp describe`.
+  `live effect get`, `live keys get`, `ui mode get`, `mcp list`, `mcp describe`.
 - Change the running app: `live effect set`, `live lut set`, `live frame export`,
-  `live app proxies on|off`, `live app activate`, `ui mode set`.
+  `live app proxies on|off`, `live app activate`, `ui mode set`, and the three plan commands
+  `live keys set`, `live place` and `live effect apply`. A plan command checks every entry, writes
+  many clips in one call and gives one result per entry. `live place` and `live effect apply` make
+  the target sequence active for every session while they run.
 - Run what the caller sends: `live run` (write checks only with `--write`), `mcp call`,
   `mcp batch` (no write checks of the CLI; the server applies its own rules).
 
@@ -91,10 +94,28 @@ No recipe saves the project. `mcp call`, `mcp batch` and `live run` can, because
 ## Not done, and why
 
 - Color Mode detection check and decoding. Both need one small project with an Adjust operation and a mask.
-- Milestone 2 of the design. It gets its own short design first, and it brings four recipes:
-  `live place` (a list of shots placed by in and out point), `live effect copy` (an ordered effect
-  chain from one clip to others), `live track disable-clips` (disables every clip of a track, the
-  fix for a track mute that does not hold) and `live sequence duplicate`.
+- Three recipes of milestone 2 are not built: `live effect copy` (an ordered effect chain from one
+  clip to others), `live track disable-clips` (disables every clip of a track, the fix for a track
+  mute that does not hold) and `live sequence duplicate`. The other four, `live keys get`,
+  `live keys set`, `live place` and `live effect apply`, exist: see "Live checks of Plan 3".
+- A re-run of `live keys set` writes the keys again. It reads back the same keys and exits 0, but it
+  is not a re-run that writes nothing (rehearsal: 23 done again in 9.8 s). A change that skips a clip
+  whose keys already match is planned.
+- A re-run of `live place` with every shot already placed still goes through the switch step: when
+  another sequence is active, it makes the target active and puts the old one back, though it
+  places nothing and sends no tool call. A change that switches only when a shot has a step to do
+  is planned. `live effect apply` already does this.
+- Retimed clips (a speed change, or reversed) are not supported: `live keys set` refuses them with
+  `retimed`. Most slow motion in the films is a speed change (2.5x or 5x slow), so those clips are
+  refused today. How keys behave on such a clip was not measured. `premiere-pro-mcp` 1.25.0 has no
+  tool that sets the speed (`speed_change` always refuses), so no test clip could be made. The
+  measure (`mspeed`) needs a clip whose speed the owner sets by hand in Premiere (Clip >
+  Speed/Duration).
+- Not built in milestone 2: key interpolation, keys on array properties (Position, Anchor Point),
+  audio keys, insert edits (placing is overwrite only), removing a clip (the only removal is the
+  picture of a sound-only shot), writing Gyroflow parameters (it gets its defaults only, and
+  scripted writes to its sliders are ignored, so the owner loads the shot's Gyroflow project in the
+  plugin by hand after the apply), and saving.
 
 ## Gate tests, 2026-11-18
 
@@ -188,3 +209,79 @@ Not shown by this run:
 - A change by another person during a `--prove` check.
 - A LUT in a converted project (where index 6 can read 0 while the LUT renders).
 - A clip with two Lumetri Color effects.
+
+## Live checks of Plan 3
+
+Plan 3 added `live keys get`, `live keys set`, `live place` and `live effect apply`. Every check ran on Premiere Pro 27.0.0 (build 88), panel 1.25.0, `premiere-pro-mcp` 1.25.0, on 2026-11-19. The measures came first, because they decide how the recipes write. The two live rounds came after the code was built. No run saved a project.
+
+### Key writing measures
+
+Setup: the test project `fixture27 Claude.prproj`, with the writes on a duplicate sequence (`M2 measures`) that the run deleted at its end, and a ditto copy of the v10 edit project of the film session (the copy's name holds the word Claude). Only the copy was open. Both projects were closed without saving. The SHA-1 of the v10 original is the same before and after, and the original was never opened. The raw replies are in the measures folder of the plan (local files, not in the repo).
+
+| Measure | Question | Result |
+|---|---|---|
+| mx | Does `isTimeVarying()` throw on a property that cannot be keyframed? | No call threw on Opacity Blend Mode (both), Motion Uniform Scale and Motion Rotation. `areKeyframesSupported` was true on all four and `isTimeVarying` false on all four. |
+| M1 | Does `setTimeVarying(true)` add a key by itself? | No. The count was 0 before and after. |
+| M2 | What does `addKey` do at a time that already holds a key? | It gives one key. `setValueAtKey` updates it (1, then 2). |
+| M3a | What does `removeKey` on every key leave? | 0 keys. `isTimeVarying` stays true and `getValue` reads 0. |
+| M3b | What does `setTimeVarying(false)` do with keys present? | It clears every key. `setTimeVarying(true)` after it adds none. So the write script clears the old keys with false, then turns keys on and adds the new ones. |
+| M4 | Are negative Rotation keys exact? | They are stored as 32-bit floats: -2.6 reads -2.59999990463257 and -0.07 reads -0.07000000029802, within 0.0001. A static `setValue(-2.6, true)` reads -2.59999990463257. |
+| route | Does the CLI's own write script store keys exactly on the fixture clip? | Yes. Keys at 0 s (1.26) and 1.247 s (-0.07), and a key planned at the clip end (6.006 s, value 0.33) moved to 5.964292 s, media ticks 1515025512000. Read back: exact ticks, values within 0.0001, and `live keys get` agrees. |
+| M5 | Does the script write the whole v10 level plan? | On the copy, 24 of 24 shots were mapped to clips (23 by the strict rule, one by item and in point, because that shot was trimmed after leveling and is left out of the write). 23 written: 23 done, 0 not exact, 0 failed. Against the plan: pass. Against the keys of v10 itself: no shared key at another tick, and the count differs on exactly the 6 shots where v10 lacks one planned key. The static values of 8 shots differ by 0.01 to 0.02 degrees, because v10 typed them rounded. The fallback (keys through the MCP tool `add_keyframe`) was not needed. |
+| M6 | Do keys land right on a clip interpreted to another frame rate (slow motion)? | Yes. The interpreted item reads a frame rate of 23.9760000013456, a native one 23.976023976024, and the project metadata reads "23.98 fps" against "23.976 fps". These were the only differences found, and the CLI tells an interpreted item by the frame rate (a difference above 0.000001 from the sequence rate). The own script and the MCP tool `add_keyframe` wrote keys at the same media ticks (762810048000 and 1270842048000 for 0 s and 2.0 s). Exported frames at 0.5, 1.0 and 2.0 s showed a small tilt, then about 10 degrees at 2.0 s, as expected. Slow motion is proven, so `live keys set` writes such clips and warns. |
+| mspeed | On which time base do keys sit on a retimed clip? | Not run. `premiere-pro-mcp` 1.25.0 has no tool that sets the speed (`speed_change` always refuses). The measure is open. `live keys set` refuses retimed clips until it is made. |
+
+One read after the M6 write timed out once with "a dialog may be open". `doctor` was clean, no recovery marker existed, no dialog was seen, and the retry passed.
+
+### Placing measures
+
+Setup: the same fixture, with the duplicate sequence `M2 measures` made active (the run deleted it at its end). The project was closed without saving, and the fixture file was unchanged.
+
+| Measure | Question | Result |
+|---|---|---|
+| Snapping | Where do the marks and the start land? | `set_item_in_out` floors a mark to the item's frame grid (in 1.0 s gave 0.959292 s, 23 frames; out 3.0 s gave 2.961292 s). `overwrite_clip` rounds the start to the sequence frame (9.0 s gave 9.009, 12.0 gave 12.012, 20.0 gave 20.02). The recipe compares to the frame. |
+| M7 | Can a placed clip be found by node ID between two MCP sessions? | Yes. After `set_item_in_out` and `overwrite_clip` onto V2 the new clip had a node ID that was unique in the sequence and the same on two reads, and `live effect get --node-id` found it twice. Placing a second clip changed no existing node ID. A node ID holds for one open of a project only (the V1 clips were `000f4248` and `000f4249` in one copy and `000f4249` and `000f424a` in another), so never reuse a node ID from an earlier open. |
+| M8 | Can the picture of a shot be removed and the sound kept? | Yes. `overwrite_clip` with `track_index` 2 and `audio_track_index` 1 put the picture on V3 and the sound on A2, linked, with the same start and the same in and out ticks. `remove_from_timeline` with `include_linked` false and `ripple` false removed the picture and kept the sound at the same start, in and out. The sound's `linked` list was empty after. `add_track` worked through its QE fallback (verified). |
+| M9 | How is a still told from a video item, and how long does it come in? | A still reads `isSequence` false and a frame rate of 29.97 (the default for stills; video items read their real rate). Its audio out point reads 0, and a video-only clip reads 0 there too, so no single read tells a still for sure. The recipe uses the media file extension (png, jpg, jpeg, tif, tiff, psd, gif, bmp, exr). `set_clip_duration` says `isStillImage` true in its own reply. A still placed with marks 0 to 4.96 s came in 4.9633 s long. `set_clip_duration` to 6.0 s gave 6.006 s (one frame more), kept the start and verified. A still's media in point reads about 3600 s after that change, so compare the length, not the in point. |
+
+### Round 1, 2026-11-19: live tests on the fixture
+
+Project `fixture27 Claude.prproj`. All writes went to a duplicate sequence (`E2E copy`), which the run deleted at its end. The project was closed without saving. Command: `PREMIERE_LIVE_E2E=1 python -m pytest cli_anything/premiere/tests/test_live_e2e.py -q -s`. Result: 50 passed in 191 s (the 39 tests of Plan 2 and 11 new ones). No recovery marker. At the end the fixture sequence was the only one left, the project file was unchanged and `doctor` was clean.
+
+| Check | Result |
+|---|---|
+| `live keys get` | The fixture clip reads two Rotation keys (1.5 at 0 s, 0.5 at 2.002 s). The same clip in the copy reads the same keys. |
+| `live keys set`, keys | The two keys were replaced by three: 1.26 at 0 s, -0.07 at 1.247 s and 0.33 at 5.964292 s. The key planned at the clip end moved to one frame before it. Read back by `live keys set` and by a later `live keys get`: exact ticks and the same values. Scale read 101.5. |
+| `live keys set`, static | One static Rotation (-1.49) replaced the keys. A second run wrote the same again and read the same. |
+| `clip_changed` | A plan that says the clip starts at 0.5 s, when it shows 0.0 s to 6.006 s, was refused with `clip_changed`. Nothing was written. |
+| `live place` | Two shots on a spare video track, placed in 3.4 s, each read back to the frame (start) and to the item frame (in and out). The output listed the item marks (in 2.961292 s, out 4.963292 s for the second shot). |
+| `live place` re-run | A shot already in place: `skipped`, `already_placed`, no call sent, exit 0. |
+| `live place`, sound only | `audio_only`: `set_item_in_out`, `overwrite_clip` and `remove_from_timeline` ran. The sound stayed (start 21.688333 s, in 1.001 s, out 3.003 s) and the picture was gone. |
+| `live effect apply` | ProcAmp then Lumetri Color on a V1 clip: both `done` in 3.0 s, at effect index 3 and 2. The render order ended with ProcAmp, Lumetri Color. A re-run skipped both (`has_effect`). |
+| Effect names | The requested names equal the display names Premiere reports (`ProcAmp`, `Lumetri Color`). The match names are `AE.ADBE ProcAmp` and `AE.ADBE Lumetri`. The effect list holds 152 effects, and Gyroflow is listed as `Gyroflow`. |
+| Three components | Gyroflow, ProcAmp and Lumetri Color applied in that order to one clip (9, 10 and 11 components before each). Each one landed at component index 2 and each one renders last. The record said `done` and the effect index 2 each time. No Gyroflow dialog opened. |
+| A still | A PNG imported as an item. `set_item_in_out` accepted an out mark of 6.0 s (applied 5.9726 s on the item's frame grid, verified). `live place` placed it 6.006 s long (144 frames) with the two calls `set_item_in_out` and `overwrite_clip`. The extend step was not needed here. |
+| Control through the MCP tool | `set_effect_property` on the same clip: ProcAmp Brightness 5 then -2.6, Lumetri Temperature 5 then -40. All four verified. |
+
+Residue of the live tests: the still test imports a PNG as a project item, and the place tests change the item marks of `testclip.mp4` and of that PNG. Nothing removes the PNG item or restores the marks, and the end check of the tests does not compare project items. They stay only in the unsaved project, which is closed without saving. A second run in the same Premiere session adds a second PNG item.
+
+### Round 2, 2026-11-19: rehearsal on a copy of the v10 project
+
+The copy was made fresh with `ditto`. Its name holds the word Claude. The SHA-1 of the file is the same before and after the run, and the original was never opened. Only the copy was open. A new empty sequence (`M2 rehearsal Claude`) was made from one clip, the seed clip and its sound were removed, and the sequence had 5 video and 8 audio tracks. The item IDs of the plan matched the copy's items by their camera files (S01 to S25). The copy was closed without saving, `doctor` was clean and no recovery marker existed.
+
+| Command | Dry run | Run | Re-run |
+|---|---|---|---|
+| `live place` (25 shots) | 25 planned, 50 calls, 0 refusals | 25 done in 12.2 s, exit 0, `stored` true | 25 skipped (`already_placed`), 0 calls, exit 0, 1.0 s |
+| `live keys set` (23 entries) | 0.6 s | 23 done in 9.8 s | 23 done in 9.8 s, exit 0: it writes the same keys again |
+| `live effect apply` (V1, `--all`, ProcAmp then Lumetri Color) | not run | 50 done in 11.9 s | 50 skipped (`has_effect`) in 0.6 s, exit 0 |
+
+The shot S25 is not in the 23 entries of `live keys set`: it was trimmed after leveling, so its plan no longer fits the clip. The re-run of `live keys set` is a rewrite, not a no-write run (see "Not done, and why").
+
+Not shown by these runs:
+
+- A stop by Ctrl-C during `live place` or `live effect apply`, and a failed put-back of the active sequence (`not_restored`). Neither ran on the real app.
+- `live place --overwrite` cutting clips, and a shot that covers the head transition of the first V1 clip. Neither ran on the real app.
+- The extend step for a still that comes in shorter than its shot. The placing measures ran `set_clip_duration` by hand, but the live still of round 1 needed no extend call.
+- A retimed clip (see "Not done, and why").
+- A run that holds the lease past the limit of 15 s (`MAX_HOLD_S`), so the breath between writes was not seen for these commands. The run that holds the lease longest is `live keys set` (23 entries in 9.8 s). `live place` took 12.2 s, but it does not hold the lease throughout.
+- A picture check of an applied effect. `live effect apply` checks the effect list that it reads back, and its `rendered` is always null.

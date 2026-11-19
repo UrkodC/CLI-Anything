@@ -645,8 +645,9 @@ def test_help_says_what_it_proves_and_switches():
     # N10.6: no fixed put-back commands; only those the output prints (A5 of the final fix)
     assert "live app proxies on" not in text and "live app activate" not in text
     assert "After the owner closes the recovery, run only the commands the output prints." in text
-    assert ("While the command runs, proxy display is off and the sequence is active for every session that works "
-            "in Premiere. Do not run it while another session works on another sequence.") in text
+    assert ("While the command runs, the sequence is active for every session that works in Premiere, and proxy "
+            "display is off unless you give --proxies keep. Do not run it while another session works on another "
+            "sequence.") in text
     assert "600" in text
     assert "\u2014" not in result.output
     for name in ("proxies", "activate"):

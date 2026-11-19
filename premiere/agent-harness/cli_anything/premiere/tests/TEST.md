@@ -127,18 +127,23 @@ for the script tests (they skip without it).
 
 | File | Tests | What it checks |
 |---|---|---|
-| `test_bridge.py` | 52 | The bridge client: folder checks, lease, heartbeat, command and reply, timeouts, recovery marker, signals. |
+| `test_bridge.py` | 54 | The bridge client: folder checks, lease, heartbeat, command and reply, timeouts, recovery marker, signals. |
 | `test_guard.py` | 99 | The version checks, the project guard, two projects, the recovery check. |
-| `test_jsx.py` | 69 | The script builder and the helper and state scripts, run in node with a stub `app`. |
+| `test_jsx.py` | 74 | The script builder and the helper and state scripts, run in node with a stub `app`. |
 | `test_session.py` | 21 | The write session: one lease, the checks before a write, the breath between writes. |
-| `test_live_cli.py` | 53 | `live state`, `live run`, the lazy command groups, the help texts, the output of any text. |
+| `test_live_cli.py` | 59 | `live state`, `live run`, the lazy command groups, the help texts (the plan commands too), the shell's command list, the output of any text. |
 | `test_mcp_client.py` | 74 | The MCP client and `mcp list`, `describe`, `call`, `batch`. |
 | `test_ui.py` | 53 | `ui mode get` and `set`. No test runs the real osascript, ps or sleep. |
 | `test_doctor.py` | 54 | `doctor` (its thirteen checks), `recovery show`, the `live` key of `status`. |
 | `test_recipes_clips.py` | 87 | `live clip list`. |
-| `test_recipes_effects.py` | 255 | `live effect get` and `live effect set`: refusals, plans, negative values, put-back. |
-| `test_recipes_frames.py` | 356 | `live frame export` and `live app`: switches, put-back, failed exports, stops. |
-| `test_recipes_lut.py` | 153 | `live lut set` and `--prove`. |
+| `test_recipes_effects.py` | 269 | `live effect get` and `live effect set`: refusals, plans, negative values, put-back. |
+| `test_recipes_frames.py` | 365 | `live frame export` and `live app`: switches, put-back, failed exports, stops. |
+| `test_recipes_lut.py` | 172 | `live lut set` and `--prove`. |
+| `test_active.py` | 12 | `ActiveRun`: the two-session pattern for tools that act on the active sequence (switch, confirm, put back, a stop, a recovery marker). |
+| `test_results.py` | 27 | The per-entry result records and their printers: statuses, counts, the exit rule. |
+| `test_recipes_keys.py` | 215 | `live keys get` and `live keys set`: the key math on the v10 level plan, the plan check, the scripts in node, refusals, re-runs, stops. |
+| `test_recipes_place.py` | 38 | `live place`: the shot math on the v10 placement plan, `place_read.jsx` in node, refusals, half-done shots, stills, sound-only shots, stops and put-back. |
+| `test_recipes_apply.py` | 28 | `live effect apply`: the order rule, refusals, the read after the run, a failed call, stops and put-back. |
 
 What the fakes cover (`fakes.py`, unless named):
 - `FakePanel`: a thread that plays the MCP Bridge panel in a private temp bridge folder. It writes
@@ -148,6 +153,20 @@ What the fakes cover (`fakes.py`, unless named):
   lease probe, and `export_frame`, which writes a small file and can fail on request).
 - `EffectModel` and `LutModel`, and `AppModel` in `test_recipes_frames.py`: small Premieres in
   Python that answer the recipe scripts (clips, effects, proxy display, the active sequence).
+- `KeysModel`: a small Premiere for `keys_get.jsx`, `keys_check.jsx` and `keys_write.jsx`, and for
+  the Scale writes of `live keys set`. It follows the measures of Plan 3: `setTimeVarying(false)`
+  clears every key, `setTimeVarying(true)` adds none, a second `addKey` at one time keeps one key,
+  and values are stored as 32-bit floats.
+- `TimelineModel`: a small timeline in a JSON file that the fake panel and the fake MCP server both
+  read and change. The panel side answers `place_read.jsx`, `clip_list.jsx`, `app_switch.jsx` and
+  `state.jsx`. The server side has `set_item_in_out`, `overwrite_clip`, `remove_from_timeline`,
+  `set_clip_duration` and `apply_effect`. A new component lands at index 2, as measured. An effect
+  name with `FAIL` makes the tool fail, and one with `APPEND` lands last, to steer the order checks.
+  `live place`, `live effect apply` and `ActiveRun` run against it.
+- The data files `tests/data/level_v10.json`, `shots_v10.json` and `place_v10.json` hold the plans of
+  the v10 build and the planner's own call list. The place math gives the same 50 calls, number
+  for number. `level_v10.json` has 11 keyed shots with 60 keys and 13 static ones. A test checks
+  that these files hold no drive path and no film name.
 - The picture check of `--prove` uses a stub. Only `test_frame_pixels_with_real_ffmpeg` needs
   ffmpeg, and it skips without it.
 - Most files have an autouse fixture that points `PREMIERE_TEMP_DIR` at a missing folder, so a
@@ -158,7 +177,7 @@ The fakes do not show how Premiere itself behaves. That is what the end-to-end t
 Last run of the whole unit suite (2026-11-19, macOS, Python 3.14.7, pytest 9.2.0):
 
 ```
-1364 passed, 1 skipped in 171.72s (0:02:51)
+1739 passed, 1 skipped in 203.32s (0:03:23)
 ```
 
 The one skip is `test_live_e2e.py`, which needs the variable below.
@@ -182,6 +201,12 @@ The write tests work on a duplicate of "Fixture seq" named "E2E copy". The run d
 end, makes "Fixture seq" active again and puts proxy display back. No test saves the project.
 Close the project without saving after the run.
 
+Residue of the live tests: the still test imports a PNG as a project item, and the place tests
+change the item marks of `testclip.mp4` and of that PNG. Nothing removes the PNG item or restores
+the marks, and the end check (`_end_check`) does not compare project items. They stay only in the
+unsaved project, which is closed without saving. A second run in the same Premiere session adds a
+second PNG item.
+
 Last real results (Premiere Pro 27.0.0 build 88, panel 1.25.0, `premiere-pro-mcp` 1.25.0; the
 details are in `PREMIERE.md`, "Live checks of Plan 2"):
 - Round 1, 2026-11-18 (write path, `live clip list`, `live effect get`, `live effect set`):
@@ -190,9 +215,27 @@ details are in `PREMIERE.md`, "Live checks of Plan 2"):
   (the 24 tests of round 1 and 15 new ones). No recovery marker. A first run of this round had 2
   failures from a wrong size floor in the tests, not from the CLI.
 
+Plan 3 added two more live rounds (details in `PREMIERE.md`, "Live checks of Plan 3"):
+- Round 3, 2026-11-19, the fixture: 50 passed in 191 s (the 39 tests of rounds 1 and 2, and 11 new
+  ones: `live keys get`, `live keys set` (keys, static, `clip_changed`), `live place` (a spare
+  track, a re-run, sound only), `live effect apply` and its names, three components after each
+  other, and a still). No recovery marker. Three measures are in the file: effect
+  names (QE against display), the effect index on a clip with three components, and an out mark
+  past the import length of a still. Results: the display names equal the requested names,
+  Gyroflow, ProcAmp and Lumetri Color each land at component index 2 and render last (Gyroflow
+  opened no dialog), and a still accepts an out mark of 6.0 s (applied 5.9726 s).
+- Round 4, 2026-11-19, a rehearsal on a fresh `ditto` copy of the v10 edit project, run by hand
+  with the commands and not part of the test file: `live place` 25 shots (25 done in 12.2 s, the
+  re-run 25 skipped, 0 calls, 1.0 s), `live keys set` 23 entries (23 done in 9.8 s, the re-run
+  rewrote the same keys), `live effect apply` on V1 (50 done in 11.9 s, the re-run 50 skipped in
+  0.6 s). The original project was never opened, and the copy was closed without saving.
+
 Not shown on the real app (they ran in unit tests only): a failed negative write, so the near
 value and the put-back; a plan long enough to pass the 15 s lease limit; a failed export that
 leaves proxy display or the active sequence switched; Ctrl-C during an export or a put-back; a
-LUT in a converted project; a clip with two Lumetri Color effects.
+LUT in a converted project; a clip with two Lumetri Color effects; a stop by Ctrl-C during
+`live place` or `live effect apply`; a failed put-back of the active sequence after them; a
+`live place --overwrite` that cuts clips; a retimed clip (the measure of key time on it is open,
+because `premiere-pro-mcp` 1.25.0 cannot set a speed).
 
 The five gate tests that came before the recipes are in `PREMIERE.md`, "Gate tests, 2026-11-18".
