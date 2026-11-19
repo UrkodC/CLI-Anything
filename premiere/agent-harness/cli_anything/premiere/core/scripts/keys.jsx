@@ -21,8 +21,14 @@
 //   speed at line 1926, the reverse state at line 1928, and the same readings of the state at lines 1935-1937);
 // - clip.inPoint, clip.start and clip.end ticks: __clipKeyframeBase (bridge/script-builder.js, lines 1938-1939);
 //   clip.outPoint ticks: tools/inspection.js, lines 339-354;
-// - component.properties.numItems and [i].displayName: __resolveProperty (bridge/script-builder.js, lines 724-745).
-// Nothing in this file changes Premiere. The write helpers of a later task go in this file, with their own citations.
+// - component.properties.numItems and [i].displayName: __resolveProperty (bridge/script-builder.js, lines 724-745);
+// - the name rule of __propertyNamed: __propertyNameMatches (bridge/script-builder.js, lines 694-699): "Scale" and
+//   "Scale Height" are one property while the component's Uniform Scale is on. Uniform Scale is read as
+//   __isUniformScale reads it (bridge/script-builder.js, lines 643-656): the property named "Uniform Scale" (or its
+//   es-ES label "Escala uniforme", __videoIntrinsicPropertyMatches, lines 679-692), prop.getValue() true or 1, a throw
+//   counts as off;
+// - the list of names in a refusal: __availablePropertyNames (bridge/script-builder.js, lines 701-722).
+// Nothing in this file changes Premiere. The writes are in keys_write.jsx, with their own citations.
 
 // A Premiere Time that holds ticks. ticks is a string of digits (or a number small enough to print as digits).
 function __keyTime(ticks) {
@@ -37,8 +43,63 @@ function __timeTicks(obj, key) {
   try { return __ticks(obj[key]); } catch (eTicks) { return null; }
 }
 
-// The one property of component whose display name is exactly name (no trimming). Returns {property, index}.
-// Two properties with the name are refused (Opacity has two named Blend Mode); pass the index to __property then.
+// True when the component's Uniform Scale is on (__isUniformScale, bridge/script-builder.js, lines 643-656).
+function __isUniformScale(component) {
+  if (!component || !component.properties) return false;
+  for (var i = 0; i < component.properties.numItems; i++) {
+    var prop = component.properties[i];
+    var shown = null;
+    try { shown = String(prop.displayName); } catch (eShown) {}
+    if (shown !== "Uniform Scale" && shown !== "Escala uniforme") continue;
+    try {
+      var value = prop.getValue();
+      return value === true || value === 1;
+    } catch (eUniform) {
+      return false;
+    }
+  }
+  return false;
+}
+
+// True when the display name actual is the property wanted: the exact name, or "Scale" and "Scale Height" while
+// Uniform Scale is on (__propertyNameMatches, bridge/script-builder.js, lines 694-699).
+function __propertyNameMatches(actual, wanted, component) {
+  actual = String(actual);
+  wanted = String(wanted);
+  if (actual === wanted) return true;
+  var aliased = (wanted === "Scale" && actual === "Scale Height") || (wanted === "Scale Height" && actual === "Scale");
+  return aliased && __isUniformScale(component);
+}
+
+// The display names of the component, for a refusal, joined by ", "; a name that two properties share gets
+// " (property_index N)"; at most 25 (__availablePropertyNames, bridge/script-builder.js, lines 701-722).
+function __availablePropertyNames(component) {
+  var names = [];
+  var counts = {};
+  var total = 0;
+  for (var i = 0; i < component.properties.numItems; i++) {
+    var name = "";
+    try { name = String(component.properties[i].displayName || ""); } catch (eName) {}
+    if (!name.replace(/\s/g, "")) continue;
+    total++;
+    names.push({name: name, index: i});
+    var key = "$" + name;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  var shown = [];
+  var limit = Math.min(names.length, 25);
+  for (var n = 0; n < limit; n++) {
+    var entry = names[n];
+    shown.push(counts["$" + entry.name] > 1 ? entry.name + " (property_index " + entry.index + ")" : entry.name);
+  }
+  var summary = shown.length ? shown.join(", ") : "none with a non-empty display name";
+  if (total > limit) summary += " (first " + limit + " of " + total + ")";
+  return summary;
+}
+
+// The one property of component whose display name is name (no trimming), by the rule of __propertyNameMatches.
+// Returns {property, index}. Two properties with the name are refused (Opacity has two named Blend Mode); pass the
+// index to __property then.
 function __propertyNamed(component, name) {
   var wanted = String(name);
   var effect = String(component.displayName);
@@ -47,12 +108,15 @@ function __propertyNamed(component, name) {
   for (var i = 0; i < component.properties.numItems; i++) {
     var shown = null;
     try { shown = String(component.properties[i].displayName); } catch (eName) {}
-    if (shown !== null && shown === wanted) {
+    if (shown !== null && __propertyNameMatches(shown, wanted, component)) {
       if (!found) found = {property: component.properties[i], index: i};
       count++;
     }
   }
-  if (count === 0) throw __precondition("no property named " + wanted + " in " + effect);
+  if (count === 0) {
+    throw __precondition("no property named " + wanted + " in " + effect + ". Available properties: " +
+                         __availablePropertyNames(component) + ".");
+  }
   if (count > 1) {
     throw __precondition("ambiguous_property: " + count + " properties of " + effect + " are named " + wanted +
                          "; pass property_index");

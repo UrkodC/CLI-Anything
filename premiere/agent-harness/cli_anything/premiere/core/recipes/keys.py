@@ -1,4 +1,4 @@
-"""`live keys get` and the key math that the keys commands share.
+"""`live keys get`, `live keys set` and the key math that the keys commands share.
 
 The math is plain Python on numbers, so a plan can be checked with no Premiere open:
 - key_ticks puts the keys of a plan on the clip's frame grid, in ticks, and finds keys that would clash;
@@ -7,19 +7,27 @@ The math is plain Python on numbers, so a plan can be checked with no Premiere o
 get_keys is a read: it takes the bridge lease, runs the read guards, sends core/scripts/keys_get.jsx and shapes
 its answer. The script returns the raw fields (tick values as strings); the seconds and the shape are made here.
 
+set_keys writes a level plan (one entry per clip: Rotation keys or one static Rotation, and one static Scale) in
+one WriteSession: keys_check.jsx reads every clip, every entry is checked, then each clip gets its Scale
+(effects.write_entry) and its Rotation (keys_write.jsx), each read back. See set_keys.
+
 Time of a key. Premiere stores a key in media time: the clip's in point plus the time from the clip start. A plan
 and the commands use clip-relative seconds (0 is the first visible frame). The media ticks of a key are
 `int(in_ticks) + ticks` of key_ticks (premiere-pro-mcp, bridge/script-builder.js, lines 1917-1943).
 """
 from __future__ import annotations
 
+import json
 import math
+import re
+from pathlib import Path
 
-from cli_anything.premiere.core import jsx
+from cli_anything.premiere.core import bridge, jsx
 from cli_anything.premiere.core.bridge import BridgeClient
-from cli_anything.premiere.core.recipes import effects
+from cli_anything.premiere.core.recipes import effects, results, stops
 from cli_anything.premiere.core.recipes.clips import TICKS_PER_SECOND, _seconds, _tick, _whole
-from cli_anything.premiere.core.session import DEFAULT_HARD_LIMIT_S, SOFT_TIMEOUT_S, guarded_state, run_script
+from cli_anything.premiere.core.session import (DEFAULT_HARD_LIMIT_S, SOFT_TIMEOUT_S, WriteSession, guarded_state,
+                                                run_script)
 from cli_anything.premiere.errors import CliError
 
 KEY_TOLERANCE = 0.0001      # a value read back from a key is the value written when it is this near (keyframes.js:437)
@@ -309,3 +317,588 @@ def get_keys(client: BridgeClient, target: dict, *, sequence_id: str, effect: st
             "property": {"name": effects._name(reply["property"].get("name")), "index": reply["property"]["index"]},
             "is_time_varying": varying, "value": None if varying else read.get("value"), "keys": found,
             "warnings": warnings}
+
+
+# =====================================================================================================
+# live keys set
+# =====================================================================================================
+# Keys on a clip whose item is interpreted to another frame rate (slow motion) land where they should: measure M6
+# of Plan 3, Task 3 (measures.md) wrote them and saw the frames. With False, such a clip is refused.
+SLOW_MOTION_PROVEN = True
+MOTION, SCALE, ROTATION = "Motion", (1, "Scale"), (4, "Rotation")
+# The keys of a level plan entry that this command reads. Others pass, and the warnings name them.
+LEVEL_KEYS = ("node", "src_in", "src_out", "name", "scale", "max_deg", "clamped", "keys", "spread_deg", "static",
+              "static_value")
+FPS_TOLERANCE = 1e-6        # an item frame rate this far from the sequence rate is an interpreted item (measure M6)
+NO_CHANGE = "level, no change"
+NOT_SENT = "Nothing was sent."
+STOPPED_SET = "Stopped by Ctrl-C or a stop signal. Check Premiere before another edit."
+_SCRIPT_TICKS = re.compile(r"[0-9]+")
+
+
+def _plan_fault(why: str) -> CliError:
+    return CliError("bad_plan", f"{why} {NOT_SENT}")
+
+
+def check_level_plan(plan: object) -> list[dict]:
+    """The level plan, checked. Sends nothing.
+
+    A plan is a JSON array with at least one entry. An entry has "node" (the node ID of the clip, a non-empty
+    string), "src_in" and "src_out" (finite seconds of the media, src_out after src_in), "keys" (a list of
+    {"time_seconds", "value"}, finite numbers, clip-relative seconds), "scale" (a finite number above 0, or null),
+    and "static" and "static_value" as entry_mode reads them. "name" is a text when it is given. Any other key
+    passes. Raises CliError("bad_plan") with "entry <n>: ..." and "Nothing was sent." Returns the entries.
+    """
+    if not isinstance(plan, list) or not plan:
+        raise _plan_fault("The level plan must be a JSON array with at least one entry.")
+    checked = []
+    for number, entry in enumerate(plan):
+        where = f"entry {number}: "
+        if not isinstance(entry, dict):
+            raise _plan_fault(where + "it must be a JSON object.")
+        node = entry.get("node")
+        if not isinstance(node, str) or not node.strip():
+            raise _plan_fault(where + '"node" must be a non-empty string: the node ID of the clip.')
+        name = entry.get("name")
+        if name is not None and not isinstance(name, str):
+            raise _plan_fault(where + '"name" must be a text when it is given.')
+        for key in ("src_in", "src_out"):
+            if not _finite(entry.get(key)):
+                raise _plan_fault(where + f'"{key}" must be a finite number of seconds.')
+        if not entry["src_out"] > entry["src_in"]:
+            raise _plan_fault(where + '"src_out" must be after "src_in".')
+        found = entry.get("keys")
+        if not isinstance(found, list):
+            raise _plan_fault(where + '"keys" must be a list. It may be empty.')
+        for index, key in enumerate(found):
+            if not isinstance(key, dict) or not _finite(key.get("time_seconds")) or not _finite(key.get("value")):
+                raise _plan_fault(where + f'key {index} must be {{"time_seconds": ..., "value": ...}} with finite '
+                                          "numbers.")
+        scale = entry.get("scale")
+        if scale is not None and not (_finite(scale) and scale > 0):
+            raise _plan_fault(where + f'"scale" must be a number above 0, or null, not {scale!r}.')
+        try:
+            entry_mode(entry)
+        except CliError as err:
+            raise _plan_fault(where + err.message) from None
+        checked.append(dict(entry))
+    return checked
+
+
+def _no_constant(text: str) -> object:
+    raise ValueError(f"{text} is not a JSON value")
+
+
+def load_level_plan(path) -> list[dict]:
+    """Read and check a level plan file. Raises CliError("bad_plan")."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _plan_fault(f"Cannot read the level plan {path}: {exc}.") from None
+    try:
+        plan = json.loads(text, parse_constant=_no_constant)
+    except (ValueError, RecursionError) as exc:
+        raise _plan_fault(f"The level plan is not valid JSON: {exc}.") from None
+    return check_level_plan(plan)
+
+
+def _who(number: int, entry: dict) -> str:
+    name = entry.get("name")
+    return f"entry {number}" + ("" if not name else f" ({name})")
+
+
+def _mode_text(mode: dict) -> str:
+    if mode["mode"] == "static":
+        return f"static at {mode['value']}"
+    return "keys" if mode["mode"] == "keys" else "no change"
+
+
+# ---------- the check ----------
+def _ticks_or_none(value: object) -> bool:
+    return value is None or (isinstance(value, str) and bool(_SCRIPT_TICKS.fullmatch(value)))
+
+
+def _check_record_ok(record: object) -> bool:
+    """One record of keys_check.jsx, with the types this recipe trusts."""
+    if not isinstance(record, dict) or not isinstance(record.get("found"), bool):
+        return False
+    if not record["found"]:
+        return isinstance(record.get("error"), str)
+    clip = record.get("clip")
+    if not isinstance(clip, dict) or not all(_ticks_or_none(clip.get(key))
+                                             for key in ("in_ticks", "out_ticks", "start_ticks", "end_ticks")):
+        return False
+    if clip.get("speed") is not None and not _finite(clip.get("speed")):
+        return False
+    if clip.get("reversed") is not None and not isinstance(clip.get("reversed"), bool):
+        return False
+    if clip.get("track_type") not in effects.TRACK_TYPES:
+        return False
+    if record.get("item_fps") is not None and not _finite(record.get("item_fps")):
+        return False
+    if record.get("interpreted") is not None and not isinstance(record.get("interpreted"), bool):
+        return False
+    motion = record.get("motion")
+    if motion is None:
+        return True
+    if not isinstance(motion, dict) or not _whole(motion.get("effect_index"), 0):
+        return False
+    scale, rotation = motion.get("scale"), motion.get("rotation")
+    if scale is not None and not (isinstance(scale, dict) and isinstance(scale.get("matches"), bool)
+                                  and effects._text_or_none(scale.get("name"))
+                                  and (scale.get("keyframed") is None or isinstance(scale.get("keyframed"), bool))):
+        return False
+    if rotation is not None and not (isinstance(rotation, dict) and effects._text_or_none(rotation.get("name"))
+                                     and (rotation.get("keys") is None or (isinstance(rotation.get("keys"), list)
+                                          and all(_key_ok(item) for item in rotation["keys"])))):
+        return False
+    return True
+
+
+def _check(session: WriteSession, entries: list[dict]) -> tuple[int, list[dict]]:
+    """keys_check.jsx for these entries, in one read. Returns (frame_ticks, records). Raises CliError("bad_reply")
+    for a reply of the wrong shape or a sequence that does not say its frame length."""
+    args = {"entries": [{"node_id": entry["node"]} for entry in entries]}
+    reply = session.read(jsx.load("keys_check"), args, include=SCRIPT_INCLUDES)
+    found = reply.get("entries") if isinstance(reply, dict) else None
+    if (not isinstance(found, list) or len(found) != len(entries) or not _ticks_or_none(reply.get("frame_ticks"))
+            or not all(_check_record_ok(record) for record in found)):
+        raise CliError("bad_reply", "The keys check script returned an answer in an unexpected shape. Nothing was "
+                                    "written by this check.")
+    frame = reply.get("frame_ticks")
+    if frame is None or int(frame) <= 0:
+        raise CliError("bad_reply", "Premiere did not report the frame length of the sequence (seq.timebase). "
+                                    "Nothing was written by this check.")
+    return int(frame), found
+
+
+def _rotation_now(rotation: dict | None, in_ticks: str | None) -> dict | None:
+    """What a Rotation read holds, as a record shows it: {"is_time_varying", "keys": [{"seconds", "media_ticks",
+    "value"}], "value"}."""
+    if not isinstance(rotation, dict):
+        return None
+    found = rotation.get("keys")
+    varying = rotation.get("is_time_varying")
+    if varying is None:
+        varying = rotation.get("keyframed")
+    keys_now = None
+    if isinstance(found, list):
+        keys_now = []
+        for item in found:
+            media = _tick(item.get("ticks"))
+            seconds = None if in_ticks is None or media is None else _seconds(str(int(media) - int(in_ticks)))
+            keys_now.append({"seconds": seconds, "media_ticks": media, "value": item.get("value")})
+    return {"is_time_varying": varying, "keys": keys_now, "value": rotation.get("value")}
+
+
+def _frames_apart(a: int, b: int, frame: int) -> bool:
+    """True when a and b are more than half a frame apart."""
+    return 2 * abs(a - b) > frame
+
+
+def _plan_entry(number: int, entry: dict, mode: dict, record: dict, frame: int, *, scale: bool) -> dict:
+    """The checks of one entry, in the order of the brief, and what would be written.
+
+    Returns {"refusal": None or (code, reason), "skip": None or NO_CHANGE, "interpreted", "warnings", "in_ticks",
+    "out_ticks", "keys" ([{"seconds", "ticks", "media_ticks", "value", "moved_from"}]), "moved", "value" (static),
+    "scale_name", "scale_now", "rotation_now", "write_scale"}."""
+    out = {"refusal": None, "skip": None, "interpreted": None, "warnings": [], "in_ticks": None, "out_ticks": None,
+           "keys": [], "moved": [], "value": mode["value"] if mode["mode"] == "static" else None, "scale_name": None,
+           "scale_now": None, "rotation_now": None, "write_scale": False, "mode": mode["mode"], "node_id": entry["node"]}
+    if not record["found"]:
+        out["refusal"] = ("no_clip", f"{record['error']}.")
+        return out
+    clip, motion = record["clip"], record.get("motion")
+    out["in_ticks"], out["out_ticks"] = clip.get("in_ticks"), clip.get("out_ticks")
+    if isinstance(motion, dict):
+        if isinstance(motion.get("scale"), dict):
+            out["scale_name"], out["scale_now"] = motion["scale"].get("name"), motion["scale"].get("value")
+        out["rotation_now"] = _rotation_now(motion.get("rotation"), out["in_ticks"])
+    if mode["mode"] == "none":
+        out["skip"] = NO_CHANGE
+        return out
+
+    def refuse(code: str, reason: str) -> dict:
+        out["refusal"] = (code, reason)
+        return out
+
+    in_ticks, out_ticks = clip.get("in_ticks"), clip.get("out_ticks")
+    if in_ticks is None or out_ticks is None:
+        return refuse("clip_changed", "Premiere did not report the in point or the out point of the clip.")
+    plan_in, plan_out = round(entry["src_in"] * TICKS_PER_SECOND), round(entry["src_out"] * TICKS_PER_SECOND)
+    if _frames_apart(int(in_ticks), plan_in, frame) or _frames_apart(int(out_ticks), plan_out, frame):
+        return refuse("clip_changed", f"the clip shows its media from {_seconds(in_ticks)} s to {_seconds(out_ticks)} "
+                                      f"s, and the plan says {entry['src_in']} s to {entry['src_out']} s, more than "
+                                      "half a frame apart. It was trimmed or slipped after the plan was made.")
+    speed, reversed_ = clip.get("speed"), clip.get("reversed")
+    if speed is None or reversed_ is None:
+        return refuse("retimed", "Premiere did not report the speed or the reverse state of the clip.")
+    if reversed_:
+        return refuse("retimed", "the clip is reversed. Keys are written on clips at normal speed only.")
+    if abs(speed - 1) >= SPEED_TOLERANCE:
+        return refuse("retimed", f"the clip has a speed change ({speed}). Keys are written on clips at normal "
+                                 "speed only.")
+    item_fps, sequence_fps = record.get("item_fps"), TICKS_PER_SECOND / frame
+    out["interpreted"] = record.get("interpreted")          # the M6 read of keys_check.jsx (FPS_TOLERANCE)
+    if out["interpreted"] is not False and not SLOW_MOTION_PROVEN:
+        what = ("Premiere did not report the frame rate of the clip's item" if item_fps is None else
+                f"the clip's item runs at {item_fps} fps, the sequence at {round(sequence_fps, 6)} fps")
+        return refuse("slow_motion_unproven", f"{what}. Keys on an interpreted (slow motion) clip are not proven.")
+    if out["interpreted"]:
+        out["warnings"].append(f"The clip's item is interpreted ({item_fps} fps; the sequence runs at "
+                               f"{round(sequence_fps, 6)} fps). Its keys are written in media time, as measure M6 "
+                               "proved for slow motion.")
+    elif out["interpreted"] is None:
+        out["warnings"].append("Premiere did not report the frame rate of the clip's item, so it is not known "
+                               "whether the item is interpreted.")
+    if not isinstance(motion, dict):
+        return refuse("motion_layout", f"{record.get('motion_error') or 'the clip has no Motion effect'}.")
+    scale_prop, rotation = motion.get("scale"), motion.get("rotation")
+    if not isinstance(scale_prop, dict) or not scale_prop["matches"]:
+        name = None if not isinstance(scale_prop, dict) else scale_prop.get("name")
+        return refuse("motion_layout", f"Motion index {SCALE[0]} is {name!r}, not {SCALE[1]!r}.")
+    if not isinstance(rotation, dict) or rotation.get("name") != ROTATION[1]:
+        name = None if not isinstance(rotation, dict) else rotation.get("name")
+        return refuse("motion_layout", f"Motion index {ROTATION[0]} is {name!r}, not {ROTATION[1]!r}.")
+    if scale and scale_prop.get("keyframed") is not False:
+        return refuse("keyed", "Motion Scale has keys, or Premiere would not say. This command writes one static "
+                               "Scale. Use --no-scale to leave Scale as it is.")
+    out["write_scale"] = scale
+    if mode["mode"] == "keys":
+        start, end = clip.get("start_ticks"), clip.get("end_ticks")
+        length = None if start is None or end is None else int(end) - int(start)
+        if length is None or length < frame or length % frame:
+            return refuse("bad_length", f"the clip is {length} ticks long in the sequence, which is not a whole "
+                                        f"number of frames ({frame} ticks each). Keys go on the frame grid, so they "
+                                        "cannot be placed.")
+        try:
+            placed = key_ticks(entry["keys"], length_ticks=length, frame_ticks=frame)
+        except KeyFault as fault:
+            return refuse(fault.code, fault.message)
+        for key in placed:
+            seconds = _seconds(str(key["ticks"]))
+            out["keys"].append({"seconds": seconds, "ticks": str(key["ticks"]),
+                                "media_ticks": str(int(in_ticks) + key["ticks"]), "value": key["value"],
+                                "moved_from": key["moved_from"]})
+            if key["moved_from"] is not None:
+                out["moved"].append({"from_seconds": key["moved_from"], "to_seconds": seconds})
+    return out
+
+
+def _scale_entry(entry: dict, plan: dict) -> dict:
+    """The Scale write of one entry, as effects.write_entry takes it. The name is the one Premiere shows at
+    index 1 (Scale, or Scale Height while Uniform Scale is on)."""
+    return {"node_id": entry["node"], "effect": MOTION, "index": SCALE[0], "name": plan["scale_name"],
+            "value": entry["scale"]}
+
+
+def _resolve(session: WriteSession, numbers: list[int], entries: list[dict], plans: list[dict]) -> dict[int, dict]:
+    """effects.resolve_entries for the Scale writes of these entries, in one read. Returns {entry number:
+    resolved record}, with "entry" set to the plan's number."""
+    if not numbers:
+        return {}
+    found = effects.resolve_entries(session, [_scale_entry(entries[n], plans[n]) for n in numbers])
+    out = {}
+    for number, record in zip(numbers, found):
+        record["entry"] = number
+        out[number] = record
+    return out
+
+
+# ---------- the write ----------
+def _write_reply_ok(reply: object) -> bool:
+    """The shape of a keys_write.jsx reply, with the types this recipe trusts."""
+    if not isinstance(reply, dict) or not isinstance(reply.get("before"), dict):
+        return False
+    errors = reply.get("set_errors")
+    if not isinstance(errors, list) or not all(isinstance(item, str) for item in errors):
+        return False
+    after = reply.get("after")
+    if after is None:
+        return True
+    if not isinstance(after, dict) or not isinstance(after.get("is_time_varying"), bool):
+        return False
+    found = after.get("keys")
+    return isinstance(found, list) and all(_key_ok(item) for item in found) and _value_ok(after.get("value"))
+
+
+def _write_rotation(session: WriteSession, entry: dict, check: dict) -> dict:
+    """Write the Rotation of one entry with keys_write.jsx (one session.write) and return its reply. check is
+    the entry's plan (_plan_entry): the in and out ticks the check read, the mode, the keys in media ticks, the
+    static value. Raises the CliError of session.write, or CliError("bad_reply") for a reply of the wrong shape
+    (the write may have landed then)."""
+    args = {"node_id": entry["node"], "expect_clip": {"in_ticks": check["in_ticks"], "out_ticks": check["out_ticks"]},
+            "mode": check["mode"],
+            "keys": ([{"ticks": key["media_ticks"], "value": key["value"]} for key in check["keys"]]
+                     if check["mode"] == "keys" else None),
+            "value": check["value"] if check["mode"] == "static" else None}
+    reply = session.write(jsx.load("keys_write"), args, include=SCRIPT_INCLUDES)
+    if not _write_reply_ok(reply):
+        raise CliError("bad_reply", "The keys write script returned an answer in an unexpected shape. Check this "
+                                    "clip in Premiere: the write may have landed.")
+    return reply
+
+
+def _rotation_error(check: dict, reply: dict) -> str | None:
+    """None when the read back holds what was written, else why not."""
+    after = reply["after"]
+    if check["mode"] == "keys":
+        if not after["is_time_varying"]:
+            return "Rotation has no keys after the write"
+        planned = check["keys"]
+        if len(after["keys"]) != len(planned):
+            return f"{len(planned)} keys were written and {len(after['keys'])} read back"
+        got = {item["ticks"]: item["value"] for item in after["keys"]}
+        for key in planned:
+            if key["media_ticks"] not in got:
+                return (f"no key at {key['media_ticks']} ticks after the write (read back at "
+                        f"{', '.join(item['ticks'] for item in after['keys'])} ticks)")
+            value = got[key["media_ticks"]]
+            if not _finite(value) or abs(value - key["value"]) > KEY_TOLERANCE:
+                return f"the key at {key['media_ticks']} ticks reads {value}, not {key['value']}"
+        return None
+    if after["is_time_varying"]:
+        return "Rotation still has keys after the static write"
+    value = after.get("value")
+    if not _finite(value) or abs(value - check["value"]) > KEY_TOLERANCE:
+        return f"Rotation reads {value}, not {check['value']}"
+    return None
+
+
+def _now(scale_now: object, rotation_now: dict | None) -> dict:
+    return {"scale": scale_now, "rotation": rotation_now}
+
+
+def _after_now(check: dict, reply: dict) -> dict | None:
+    after = reply["after"]
+    if after is None:
+        return None
+    return _rotation_now(after, check["in_ticks"])
+
+
+def _planned(number: int, entry: dict, check: dict, *, scale: bool) -> dict:
+    """One entry of a dry run: what would be written."""
+    refusal = check["refusal"]
+    return {"entry": number, "name": entry.get("name"), "node_id": entry["node"], "mode": check["mode"],
+            "keys": [dict(key) for key in check["keys"]], "static_value": check["value"],
+            "scale": {"now": check["scale_now"],
+                      "new": entry.get("scale") if scale and check["mode"] != "none" else None},
+            "refusal": None if refusal is None else {"code": refusal[0], "reason": refusal[1]},
+            "skip": check["skip"]}
+
+
+def set_keys(client: BridgeClient, plan: list[dict], *, sequence_id: str, sequence_name: str | None = None,
+             scale: bool = True, static_spread: float | None = None, skip_refused: bool = False,
+             dry_run: bool = False, project=None, any_project=False, allow_untested=False,
+             hard_limit_s=DEFAULT_HARD_LIMIT_S) -> dict:
+    """Write a level plan: for each entry, one static Scale and the Rotation (keys, or one static value) of one
+    clip in the sequence with sequence_id. The project is not saved.
+
+    Order, in one WriteSession: target the sequence; keys_check.jsx reads every clip; one effects.resolve_entries
+    for the Scale writes; every entry is checked (in this order: no_clip, clip_changed, retimed,
+    slow_motion_unproven, motion_layout, keyed, bad_length, negative_key, key_clash). An entry with no change is
+    skipped (nothing to do). A refusal stops the run before any write (results.refused_error) unless skip_refused.
+    dry_run stops here and returns the plan ("planned"). Then per entry, in plan order: the Scale with
+    effects.write_entry (unless scale is False or the mode is "none"), then the Rotation with keys_write.jsx.
+    Between entries the session breathes; when it gave Premiere back, the next entry is checked again, and a
+    refusal then skips it and stops the run unless skip_refused.
+
+    An entry is done when its Scale is stored and its Rotation reads back as written (the same ticks, values
+    within KEY_TOLERANCE). Else it failed, with what the read back holds in "now", and the run goes on. A send
+    error "precondition" fails this entry only (nothing of that send landed). Any other code of
+    stops.NOT_SENT_CODES ends the run: this entry and the rest stay not_run. Any other send error fails the entry
+    with an unknown outcome and ends the run.
+
+    Returns results.summary(records, warnings, sequence=...) (with dry_run, also "dry_run": True and "planned").
+    A record has the extras "mode", "moved" ([{"from_seconds", "to_seconds"}]) and "interpreted". Raises
+    CliError("bad_plan") before anything is sent, and after that a CliError that carries the payload
+    (results.refused_error, results.outcome_error, or the error that stopped the run).
+    """
+    entries = check_level_plan(plan)
+    if not (isinstance(sequence_id, str) and sequence_id):
+        raise CliError("bad_args", f"The sequence ID must be a non-empty string. {NOT_SENT}")
+    if static_spread is not None:
+        try:
+            _check_spread(static_spread)
+        except CliError as err:
+            raise CliError(err.code, f"{err.message} {NOT_SENT}") from None
+    warnings: list[str] = []
+    for number, entry in enumerate(entries):
+        unknown = [key for key in entry if key not in LEVEL_KEYS]
+        if unknown:
+            warnings.append(f"{_who(number, entry)}: this command does not read the key"
+                            f"{'s' if len(unknown) > 1 else ''} {', '.join(repr(k) for k in unknown)}.")
+    modes = []
+    for number, entry in enumerate(entries):
+        mode = entry_mode(entry, static_spread=static_spread)
+        if static_spread is not None:
+            from_file = entry_mode(entry)
+            if (from_file["mode"], from_file["value"]) != (mode["mode"], mode["value"]):
+                warnings.append(f"{_who(number, entry)}: --static-spread {static_spread} makes it "
+                                f"{_mode_text(mode)}; the plan file says {_mode_text(from_file)}.")
+        if scale and mode["mode"] != "none" and entry.get("scale") is None:
+            raise CliError("bad_plan", f'entry {number}: "scale" is null. Use --no-scale to leave Scale as it is. '
+                                       f"{NOT_SENT}")
+        modes.append(mode)
+    records = []
+    for number, entry in enumerate(entries):
+        record = results.new_record(number, {"node_id": entry["node"]}, name=entry.get("name"))
+        record.update(mode=modes[number]["mode"], moved=[], interpreted=None)
+        records.append(record)
+    sequence = {"id": sequence_id, "name": sequence_name}
+
+    def payload(**extra) -> dict:
+        return results.summary(records, warnings, sequence=sequence, **extra)
+
+    def apply(number: int, check: dict) -> None:
+        """Put the check of one entry on its record: interpreted, moved, warnings, and a skip."""
+        record = records[number]
+        record["interpreted"] = check["interpreted"]
+        record["moved"] = list(check["moved"])
+        record["warnings"] = list(check["warnings"])
+        if check["skip"] is not None:
+            results.mark_skipped(record, results.NOTHING_TO_DO, "no_change", check["skip"])
+        elif check["refusal"] is not None:
+            results.mark_skipped(record, results.REFUSED, check["refusal"][0], check["refusal"][1])
+
+    try:
+        with WriteSession(client, project=project, any_project=any_project, allow_untested=allow_untested,
+                          hard_limit_s=hard_limit_s) as session:
+            warnings += session.warnings
+            session.target(sequence_id, sequence_name)
+            frame, found = _check(session, entries)
+            checks = [_plan_entry(n, entry, modes[n], found[n], frame, scale=scale) for n, entry in enumerate(entries)]
+            for number, check in enumerate(checks):
+                apply(number, check)
+            resolved = _resolve(session, [n for n, c in enumerate(checks) if c["write_scale"] and c["refusal"] is None
+                                          and c["skip"] is None], entries, checks)
+            refused = any(c["refusal"] is not None and c["skip"] is None for c in checks)
+            if refused and not skip_refused:
+                raise results.refused_error(records, payload())
+            if dry_run:
+                return payload(dry_run=True, planned=[_planned(n, e, c, scale=scale)
+                                                      for n, (e, c) in enumerate(zip(entries, checks))])
+            _run(session, entries, checks, resolved, records, warnings, modes, scale=scale,
+                 skip_refused=skip_refused)
+    except CliError as err:
+        if getattr(err, "payload", None) is None:
+            err.payload = payload()
+        raise
+    except (KeyboardInterrupt, bridge.Interrupted):
+        err = CliError("interrupted", STOPPED_SET)
+        err.payload = payload()
+        raise err from None
+    done = payload()
+    error = results.outcome_error(records, done)
+    if error is not None:
+        raise error
+    return done
+
+
+def _run(session: WriteSession, entries: list[dict], checks: list[dict], resolved: dict[int, dict],
+         records: list[dict], warnings: list[str], modes: list[dict], *, scale: bool, skip_refused: bool) -> None:
+    """The writes of set_keys, in plan order. Marks the records; returns when the run ends. A stop is raised
+    after the record of the entry is marked."""
+    started = False
+    for number, entry in enumerate(entries):
+        record = records[number]
+        if record["status"] != "not_run":
+            continue
+        if started and session.breathe():
+            warnings += [w for w in session.warnings if w not in warnings]
+            frame, found = _check(session, [entry])
+            check = _plan_entry(number, entry, modes[number], found[0], frame, scale=scale)
+            checks[number] = check
+            record["interpreted"], record["moved"], record["warnings"] = (check["interpreted"], list(check["moved"]),
+                                                                          list(check["warnings"]))
+            if check["skip"] is not None:
+                results.mark_skipped(record, results.NOTHING_TO_DO, "no_change", check["skip"])
+                continue
+            if check["refusal"] is not None:
+                results.mark_skipped(record, results.REFUSED, check["refusal"][0], check["refusal"][1])
+                if skip_refused:
+                    continue
+                warnings.append(f"The run stopped at {_who(number, entry)}: it was checked again after Premiere was "
+                                "given back to other programs, and refused. The entries after it did not run.")
+                return
+            if check["write_scale"]:
+                resolved.update(_resolve(session, [number], entries, checks))
+        started = True
+        if not _write_entry(session, number, entry, checks[number], resolved.get(number), record, warnings):
+            return
+
+
+def _write_entry(session: WriteSession, number: int, entry: dict, check: dict, found: dict | None, record: dict,
+                 warnings: list[str]) -> bool:
+    """Scale, then Rotation, of one entry; marks its record. Returns False when the run ends here."""
+    scale_now, scale_written = check["scale_now"], False
+    where = _who(number, entry)
+    try:
+        if check["write_scale"]:
+            try:
+                result = effects.write_entry(session, _scale_entry(entry, check), found)
+            except CliError as err:
+                if getattr(err, "partial", None) is not None and not stops.is_stop(err):
+                    # An earlier send of this Scale landed (write_entry's put-back failed): what Scale holds is not
+                    # known, whatever the code of the failed send says.
+                    return _send_failed(CliError("unknown_outcome", err.message), "Scale", where, record, warnings,
+                                        check, scale_now, scale_written=True)
+                return _send_failed(err, "Scale", where, record, warnings, check, scale_now, scale_written=False)
+            scale_now, scale_written = result["now"], result["attempts"] > 0
+            if not result["stored"]:
+                results.mark_failed(record, f"Scale: {result['error']}. Rotation was not written.",
+                                    now=_now(scale_now, check["rotation_now"]))
+                return True
+        try:
+            reply = _write_rotation(session, entry, check)
+        except CliError as err:
+            return _send_failed(err, "Rotation", where, record, warnings, check, scale_now,
+                                scale_written=scale_written)
+    except (KeyboardInterrupt, bridge.Interrupted):
+        results.mark_failed(record, "Stopped by Ctrl-C or a stop signal during a write of this entry.", known=False)
+        raise
+    if reply["after"] is None:
+        results.mark_failed(record, "Rotation: the read back failed after the writes: "
+                                    + "; ".join(reply["set_errors"]), known=False)
+        warnings.append(f"The run stopped at {where}: Rotation was written but could not be read back, so what it "
+                        "holds is not known. Check this clip in Premiere. The entries after it did not run.")
+        return False
+    now = _now(scale_now, _after_now(check, reply))
+    error = _rotation_error(check, reply)
+    if error is None:
+        results.mark_done(record, now)
+        if reply["set_errors"]:
+            record["warnings"].append("Premiere gave errors that did not change the result: "
+                                      + "; ".join(reply["set_errors"]))
+    else:
+        detail = f" Errors: {'; '.join(reply['set_errors'])}." if reply["set_errors"] else ""
+        results.mark_failed(record, f"Rotation: {error}.{detail}", now=now)
+    return True
+
+
+def _send_failed(err: CliError, what: str, where: str, record: dict, warnings: list[str], check: dict,
+                 scale_now: object, *, scale_written: bool) -> bool:
+    """A send of this entry failed with err. Marks the record and says whether the run goes on."""
+    text = f"{what}: {err.code}: {err.message}"
+    written = (f"Scale was written ({scale_now}) before the {what} write failed; it stays written."
+               if scale_written and what == "Rotation" else None)
+    if stops.is_stop(err):
+        if written:
+            record["warnings"].append(written)
+            record["now"] = _now(scale_now, check["rotation_now"])
+        raise err
+    if err.code == "precondition":
+        results.mark_failed(record, f"{text} Nothing of this {what} write was changed.",
+                            now=_now(scale_now, check["rotation_now"]))
+        return True
+    if err.code in stops.NOT_SENT_CODES:
+        if written:
+            record["warnings"].append(written)
+            record["now"] = _now(scale_now, check["rotation_now"])
+        warnings.append(f"The run stopped at {where}: the {what} write was not sent ({err.code}: {err.message}). "
+                        "This entry and the ones after it did not run.")
+        return False
+    results.mark_failed(record, text, known=False)
+    warnings.append(f"The run stopped at {where}: the outcome of the {what} write is not known ({err.code}). Check "
+                    "this clip in Premiere. The entries after it did not run.")
+    return False

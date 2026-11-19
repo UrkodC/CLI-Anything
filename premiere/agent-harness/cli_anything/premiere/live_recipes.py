@@ -1,5 +1,5 @@
 """The recipe commands of the `live` group: `live clip list`, `live effect get`, `live effect set`, `live frame
-export`, `live app`, `live lut set`, `live keys get`, and the commands that later tasks add.
+export`, `live app`, `live lut set`, `live keys get`, `live keys set`, and the commands that later tasks add.
 
 live_cli.py imports this module as its last line, so the `live` group exists when the commands attach.
 The logic of each command is in core/recipes; this file holds only the click side.
@@ -872,7 +872,7 @@ def _entries_failure(ctx: click.Context, err: CliError) -> None:
 # ---------- live keys ----------
 @live.group("keys")
 def live_keys() -> None:
-    """Look at the keyframes of a clip in the running Premiere."""
+    """Look at the keyframes of a clip in the running Premiere, or write them from a level plan."""
 
 
 def _keys_text(payload: dict) -> str:
@@ -946,3 +946,87 @@ def live_keys_get(ctx: click.Context, sequence_id: str, track: int | None, clip:
         _fail(ctx, err)
         return
     _emit(ctx, payload, _keys_text(payload))
+
+
+def _planned_line(item: dict) -> str:
+    """One line of a dry run: what one entry would get."""
+    head = f"  {item['entry']} " + ("" if item.get("name") is None else f"{item['name']} ")
+    if item.get("refusal"):
+        return head + f"refused | {item['refusal']['code']}: {item['refusal']['reason']}"
+    if item.get("skip"):
+        return head + f"nothing to do | {item['skip']}"
+    if item["mode"] == "keys":
+        moved = sum(key["moved_from"] is not None for key in item["keys"])
+        what = f"keys | {len(item['keys'])} key" + ("" if len(item["keys"]) == 1 else "s")
+        what += f", {moved} moved to the last frame" if moved else ""
+    else:
+        what = f"static | Rotation {_set_value_text(item['static_value'])}"
+    scale = item.get("scale") or {}
+    if scale.get("new") is not None:
+        what += f"; Scale {_set_value_text(scale.get('now'))} -> {_set_value_text(scale['new'])}"
+    return head + what
+
+
+def _keys_set_text(payload: dict) -> str:
+    if payload.get("dry_run"):
+        lines = [_planned_line(item) for item in payload["planned"]]
+        lines.append("Dry run: nothing was written.")
+    else:
+        lines = _entry_lines(payload)
+    return "\n".join(lines + _warning_lines(payload.get("warnings") or []))
+
+
+@live_keys.command("set")
+@click.option("--sequence", "sequence_id", required=True, metavar="ID",
+              help="ID of the sequence that holds the clips (see `live state`).")
+@click.option("--sequence-name", "sequence_name", metavar="NAME",
+              help="The name the sequence must have. Nothing is written when it is named otherwise.")
+@click.option("--from", "plan_path", required=True, type=click.Path(path_type=Path), metavar="LEVEL.json",
+              help="The level plan: a JSON array with one entry per clip (node, src_in, src_out, scale, keys, "
+                   "static, static_value).")
+@click.option("--no-scale", "no_scale", is_flag=True, help="Leave Scale as it is. Only Rotation is written.")
+@click.option("--static-spread", "static_spread", type=float, metavar="DEG",
+              help="Decide static or keys with this spread instead of the plan's own static flag: an entry whose "
+                   "keys span no more than DEG degrees gets one static Rotation (the midpoint).")
+@click.option("--skip-refused", "skip_refused", is_flag=True,
+              help="Write the other entries when one is refused. Without it, one refusal stops the run before "
+                   "any write.")
+@click.option("--dry-run", "dry_run", is_flag=True, help="Read and check every clip, show what would be written, "
+                                                         "and write nothing.")
+@click.option("--project", help="Path of the project that must be the active one.")
+@click.option("--any-project", is_flag=True,
+              help="Allow a write to a project that is not a Claude working copy. Needs --project.")
+@live_options
+@json_option
+@click.pass_context
+@stops_cleanly(STOPPED_RUN)
+def live_keys_set(ctx: click.Context, sequence_id: str, sequence_name: str | None, plan_path: Path, no_scale: bool,
+                  static_spread: float | None, skip_refused: bool, dry_run: bool, project: str | None,
+                  any_project: bool, lease_wait: float, timeout: float, allow_untested: bool) -> None:
+    """Write Motion Rotation keys and one static Motion Scale per clip, from a level plan, and read each back.
+
+    Each entry names its clip by node ID in --sequence. The clip must show the media from src_in to src_out (within
+    half a frame), run at normal speed and not be reversed, and have Motion with Scale at index 1 and Rotation at
+    index 4. Scale must have no keys (unless --no-scale). Every entry is checked before the first write; one
+    refusal stops the run unless --skip-refused.
+
+    The new keys replace the old ones: Rotation keys that the clip had are removed. A key time is seconds from the
+    clip start. A key at the clip end, or less than half a frame before it, moves to one frame before the clip end.
+    The interpolation of a key is the default of addKey. An entry with "static": true gets one Rotation value and no
+    keys. An entry with no keys and "static": false is left alone (level, no change).
+
+    Per clip: Scale first, then Rotation. An entry is done when both read back as written. A failed entry does not
+    stop the others, except when a write was not sent or its outcome is unknown: then the run stops. The project is
+    not saved.
+    """
+    try:
+        plan = keys.load_level_plan(plan_path)
+        client = _client(lease_wait)
+        payload = keys.set_keys(client, plan, sequence_id=sequence_id, sequence_name=sequence_name,
+                                scale=not no_scale, static_spread=static_spread, skip_refused=skip_refused,
+                                dry_run=dry_run, project=project, any_project=any_project,
+                                allow_untested=allow_untested, hard_limit_s=timeout)
+    except CliError as err:
+        _entries_failure(ctx, err)
+        return
+    _emit(ctx, payload, _keys_set_text(payload))

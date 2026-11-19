@@ -751,37 +751,68 @@ class LutModel(EffectModel):
         return reply
 
 
-# ---------- keys: the Motion keyframes of clips (live keys get) ----------
+# ---------- keys: the Motion keyframes of clips (live keys get, live keys set) ----------
 KEYS_TPS = 254016000000
 KEYS_FRAME_TICKS = 10594584000        # one frame at 23.976 fps (seq.timebase)
 KEYS_CLIP_TICKS = 79 * KEYS_FRAME_TICKS
+NATIVE_FPS = 23.976023976024          # getFootageInterpretation().frameRate of a native 23.976 item (measures M6)
+INTERPRETED_FPS = 23.9760000013456    # the same read on the item interpreted to 23.976 (S01, measures M6)
+
+
+def float32(value: float) -> float:
+    """value as Premiere stores a key or a static value: a 32-bit float (measures M4: -2.6 reads -2.59999990463257)."""
+    import struct
+    return struct.unpack("<f", struct.pack("<f", value))[0]
 
 
 class KeysModel:
-    """A small Premiere for `keys_get.jsx` (and, in later tasks, `keys_check.jsx` and `keys_write.jsx`), played in
-    Python by the fake panel.
+    """A small Premiere for `keys_get.jsx`, `keys_check.jsx`, `keys_write.jsx`, and for `effect_resolve.jsx` and
+    `effect_write.jsx` on the Motion Scale of its clips, played in Python by the fake panel.
 
-    It reads the ARGS of the script text it gets and answers as the real script does: the same reply shapes and
+    It reads the ARGS of the script text it gets and answers as the real scripts do: the same reply shapes and
     the same "precondition:" texts for the faults the tests use. Values stay between calls. Sequence s1 "Main"
-    is the only one.
+    is the one keys_get looks in; `sequences` maps every sequence ID to its name (add one to put clips in it).
 
         model = KeysModel()
         model.add_clip("000f4276", name="S02 C2246", rotation=[(0, 1.26), (316757952000, 1.01)])   # keys
         model.add_clip("000f4277", name="S03 C2248", rotation=0.67, scale=104.4)                    # static values
         panel = FakePanel(bridge_dir, handler=recipe_handler(model.replies()))
 
-    clips maps a node ID to {"name", "track_type", "track", "clip", "in_ticks", "out_ticks", "start_ticks",
-    "end_ticks" (ints, sequence ticks for start and end, media ticks for in and out), "speed", "reversed", "effects"}.
-    effects is the component list of Premiere: Opacity (Opacity, Blend Mode twice) and Motion (Position, Scale,
-    Scale Width, Uniform Scale, Rotation, Anchor Point). A property is {"name", "value", "keys"}: keys is None for
-    a property with no keys, else a list of (media ticks, value). add_clip takes `rotation` and `scale` as a
-    number (static) or a list of (ticks, value) (keys). `calls` lists the ARGS of every keys_get script.
+    clips maps a node ID to {"name", "sequence_id" (None: the sequence in `sequence`), "track_type", "track", "clip",
+    "in_ticks", "out_ticks", "start_ticks", "end_ticks" (ints, sequence ticks for start and end, media ticks for in
+    and out), "speed", "reversed", "item_fps", "effects"}. effects is the component list of Premiere: Opacity (Opacity, Blend Mode
+    twice) and Motion (Position, Scale, Scale Width, Uniform Scale, Rotation, Anchor Point). A property is
+    {"name", "value", "keys"}: keys is None for a property with no keys, else a list of (media ticks, value).
+    add_clip takes `rotation` and `scale` as a number (static) or a list of (ticks, value) (keys).
+
+    The writes follow the measures of Plan 3, Task 3: setTimeVarying(false) clears every key (M3b),
+    setTimeVarying(true) adds none (M1), a second addKey at the same time keeps one key (M2), and values are
+    stored as 32-bit floats (M4).
+
+    Records: `calls` lists the ARGS of every keys_get script, `checks` counts the keys_check scripts, `writes`
+    lists every write in order as ("scale", node ID, value) or ("rotation", node ID, mode).
+    Hooks: `on_check` maps a keys_check number (1 is the first) to a function run before it answers;
+    `before_write` maps a node ID to a function run (once) before keys_write for that clip answers;
+    `add_key_throws` maps a node ID to the set of tick strings whose addKey throws; `drift` maps a node ID to a
+    number of ticks that its first key is stored off by; a node ID in `unreadable` gets a keys_write reply whose read
+    back failed (after null), with its writes done; `scale_lands` maps a node ID to the value its next Scale write
+    stores instead of the one asked for (once).
     """
 
     def __init__(self) -> None:
         self.sequence = {"id": "s1", "name": "Main"}
+        self.sequences: dict[str, str] = {"s1": "Main"}
+        self.frame_ticks = KEYS_FRAME_TICKS
         self.clips: dict[str, dict] = {}
         self.calls: list[dict] = []
+        self.checks = 0
+        self.writes: list[tuple] = []
+        self.on_check: dict[int, Callable[[], None]] = {}
+        self.before_write: dict[str, Callable[[], None]] = {}
+        self.add_key_throws: dict[str, set] = {}
+        self.drift: dict[str, int] = {}
+        self.unreadable: set = set()
+        self.scale_lands: dict[str, float] = {}
 
     @staticmethod
     def _prop(name: str, value) -> dict:
@@ -792,13 +823,14 @@ class KeysModel:
     def add_clip(self, node_id: str, *, name: str, track: int = 0, track_type: str = "video", in_ticks: int = 0,
                  out_ticks: int | None = None, start_ticks: int = 0, end_ticks: int | None = None,
                  length_ticks: int = KEYS_CLIP_TICKS, speed: float = 1, reversed_: bool = False,
-                 rotation=0.0, scale=100.0) -> dict:
-        number = sum(1 for clip in self.clips.values() if (clip["track_type"], clip["track"]) == (track_type, track))
+                 rotation=0.0, scale=100.0, sequence_id: str | None = None, item_fps: float = NATIVE_FPS) -> dict:
+        number = sum(1 for clip in self.clips.values()
+                     if (clip["sequence_id"], clip["track_type"], clip["track"]) == (sequence_id, track_type, track))
         self.clips[node_id] = {
-            "name": name, "track_type": track_type, "track": track, "clip": number,
+            "name": name, "sequence_id": sequence_id, "track_type": track_type, "track": track, "clip": number,
             "in_ticks": in_ticks, "out_ticks": in_ticks + length_ticks if out_ticks is None else out_ticks,
             "start_ticks": start_ticks, "end_ticks": start_ticks + length_ticks if end_ticks is None else end_ticks,
-            "speed": speed, "reversed": reversed_,
+            "speed": speed, "reversed": reversed_, "item_fps": item_fps,
             "effects": [
                 {"name": "Opacity", "match_name": "AE.ADBE Opacity", "properties": [
                     self._prop("Opacity", 100.0), self._prop("Blend Mode", 0), self._prop("Blend Mode", 0)]},
@@ -809,23 +841,50 @@ class KeysModel:
         return self.clips[node_id]
 
     def replies(self) -> dict:
-        return {"recipe: keys_get": self.keys_get}
+        return {"recipe: keys_get": self.keys_get, "recipe: keys_check": self.keys_check,
+                "recipe: keys_write": self.keys_write, "recipe: effect_resolve": self.effect_resolve,
+                "recipe: effect_write": self.effect_write}
 
     def prop(self, node_id: str, effect: str, name: str, nth: int = 0) -> dict:
         """The nth property of that name in that effect of the clip (the model's own record)."""
         component = next(e for e in self.clips[node_id]["effects"] if e["name"] == effect)
         return [p for p in component["properties"] if p["name"] == name][nth]
 
+    def rotation(self, node_id: str) -> dict:
+        """The Motion Rotation of the clip (index 4)."""
+        return next(e for e in self.clips[node_id]["effects"] if e["name"] == "Motion")["properties"][4]
+
+    def scale(self, node_id: str) -> dict:
+        """The Motion Scale of the clip (index 1)."""
+        return next(e for e in self.clips[node_id]["effects"] if e["name"] == "Motion")["properties"][1]
+
     # ---------- the finders, with the texts of find.jsx and keys.jsx ----------
-    def _find_clip(self, target: dict) -> tuple[str, dict]:
+    def _expect(self, args: dict) -> tuple[str, str]:
+        """__expect of find.jsx: the sequence the session expects. Returns (ID, name)."""
+        expect = args.get("expect") or {}
+        wanted = expect.get("sequence_id")
+        if wanted is None:
+            raise _Refused("the script got no sequence ID")
+        if wanted not in self.sequences:
+            raise _Refused(f"no sequence has the ID {wanted}")
+        name = expect.get("sequence_name")
+        if name is not None and name != self.sequences[wanted]:
+            raise _Refused(f"sequence {wanted} is named {self.sequences[wanted]}, not {name}")
+        return wanted, self.sequences[wanted]
+
+    def _find_clip(self, target: dict, sequence_id: str | None = None) -> tuple[str, dict]:
+        sequence_id = self.sequence["id"] if sequence_id is None else sequence_id
+        name = self.sequences.get(sequence_id, self.sequence["name"])
+        here = {node: clip for node, clip in self.clips.items()
+                if (clip["sequence_id"] or self.sequence["id"]) == sequence_id}
         if target.get("node_id") is not None:
-            if target["node_id"] in self.clips:
-                return target["node_id"], self.clips[target["node_id"]]
-            raise _Refused(f"no clip has the node ID {target['node_id']} in sequence {self.sequence['name']}")
+            if target["node_id"] in here:
+                return target["node_id"], here[target["node_id"]]
+            raise _Refused(f"no clip has the node ID {target['node_id']} in sequence {name}")
         kind, track, number = target.get("track_type") or "video", target["track"], target["clip"]
-        if not any((c["track_type"], c["track"]) == (kind, track) for c in self.clips.values()):
+        if not any((c["track_type"], c["track"]) == (kind, track) for c in here.values()):
             raise _Refused(f"the sequence has no {kind} track {track}")
-        for node_id, clip in self.clips.items():
+        for node_id, clip in here.items():
             if (clip["track_type"], clip["track"], clip["clip"]) == (kind, track, number):
                 return node_id, clip
         raise _Refused(f"{kind} track {track} has no clip {number}")
@@ -840,7 +899,34 @@ class KeysModel:
         return found[0]
 
     @staticmethod
-    def _find_property(effect: dict, name: str, index) -> int:
+    def _uniform(effect: dict) -> bool:
+        """__isUniformScale of keys.jsx: the effect has a Uniform Scale that holds true or 1."""
+        for prop in effect["properties"]:
+            if prop["name"] in ("Uniform Scale", "Escala uniforme"):
+                return prop["value"] is True or prop["value"] == 1
+        return False
+
+    @classmethod
+    def _name_matches(cls, actual: str, wanted: str, effect: dict) -> bool:
+        """__propertyNameMatches of keys.jsx: the exact name, or Scale and Scale Height while Uniform Scale is on."""
+        if actual == wanted:
+            return True
+        aliased = (wanted, actual) in (("Scale", "Scale Height"), ("Scale Height", "Scale"))
+        return aliased and cls._uniform(effect)
+
+    @staticmethod
+    def _available(effect: dict) -> str:
+        """__availablePropertyNames of keys.jsx."""
+        names = [(i, p["name"]) for i, p in enumerate(effect["properties"]) if p["name"].strip()]
+        counts: dict[str, int] = {}
+        for _, name in names:
+            counts[name] = counts.get(name, 0) + 1
+        shown = [name + (f" (property_index {i})" if counts[name] > 1 else "") for i, name in names[:25]]
+        summary = ", ".join(shown) if shown else "none with a non-empty display name"
+        return summary + (f" (first 25 of {len(names)})" if len(names) > 25 else "")
+
+    @classmethod
+    def _find_property(cls, effect: dict, name: str, index) -> int:
         props = effect["properties"]
         if index is not None:
             if index >= len(props):
@@ -848,15 +934,32 @@ class KeysModel:
             if props[index]["name"] != name:
                 raise _Refused(f"property {index} of {effect['name']} is named {props[index]['name']}, not {name}")
             return index
-        found = [i for i, p in enumerate(props) if p["name"] == name]
+        found = [i for i, p in enumerate(props) if cls._name_matches(p["name"], name, effect)]
         if not found:
-            raise _Refused(f"no property named {name} in {effect['name']}")
+            raise _Refused(f"no property named {name} in {effect['name']}. Available properties: "
+                           f"{cls._available(effect)}.")
         if len(found) > 1:
             raise _Refused(f"ambiguous_property: {len(found)} properties of {effect['name']} are named {name}; "
                            "pass property_index")
         return found[0]
 
-    # ---------- the script ----------
+    @staticmethod
+    def _read(prop: dict) -> dict:
+        """__readKeys of keys.jsx."""
+        if prop["keys"] is None:
+            return {"is_time_varying": False, "keys": [], "value": prop["value"]}
+        return {"is_time_varying": True, "keys": [{"ticks": str(t), "value": v} for t, v in sorted(prop["keys"])],
+                "value": None}
+
+    @staticmethod
+    def _facts(node_id: str, clip: dict) -> dict:
+        return {"in_ticks": str(clip["in_ticks"]), "out_ticks": str(clip["out_ticks"]),
+                "start_ticks": str(clip["start_ticks"]), "end_ticks": str(clip["end_ticks"]),
+                "speed": clip["speed"], "reversed": clip["reversed"], "node_id": node_id,
+                "name": clip["name"], "track_type": clip["track_type"], "track": clip["track"],
+                "clip": clip["clip"]}
+
+    # ---------- keys_get ----------
     def keys_get(self, script: str) -> object:
         args = script_args(script)
         self.calls.append(args)
@@ -872,17 +975,157 @@ class KeysModel:
         except _Refused as exc:
             return exc.error()
         prop = effect["properties"][index]
-        if prop["keys"] is None:
-            read = {"is_time_varying": False, "keys": [], "value": prop["value"]}
-        else:
-            read = {"is_time_varying": True, "keys": [{"ticks": str(t), "value": v} for t, v in prop["keys"]],
-                    "value": None}
-        return {"sequence": dict(self.sequence),
-                "clip": {"in_ticks": str(clip["in_ticks"]), "out_ticks": str(clip["out_ticks"]),
-                         "start_ticks": str(clip["start_ticks"]), "end_ticks": str(clip["end_ticks"]),
-                         "speed": clip["speed"], "reversed": clip["reversed"], "node_id": node_id,
-                         "name": clip["name"], "track_type": clip["track_type"], "track": clip["track"],
-                         "clip": clip["clip"]},
+        return {"sequence": dict(self.sequence), "clip": self._facts(node_id, clip),
                 "effect": {"name": effect["name"], "effect_index": effect_index},
                 "property": {"name": prop["name"], "index": index},
-                "read": read}
+                "read": self._read(prop)}
+
+    # ---------- keys_check ----------
+    def _motion(self, clip: dict) -> tuple[dict | None, str | None]:
+        try:
+            effect_index = self._find_effect(clip, "Motion")
+        except _Refused as exc:
+            return None, str(exc)
+        effect = clip["effects"][effect_index]
+        props = effect["properties"]
+        scale = rotation = None
+        if len(props) > 1:
+            prop = props[1]
+            scale = {"index": 1, "name": prop["name"], "matches": self._name_matches(prop["name"], "Scale", effect),
+                     "value": prop["value"], "keyframed": prop["keys"] is not None}
+        if len(props) > 4:
+            prop = props[4]
+            read = self._read(prop)
+            rotation = {"index": 4, "name": prop["name"], "keyframed": prop["keys"] is not None,
+                        "keys": read["keys"], "value": read["value"]}
+        return {"effect_index": effect_index, "uniform": self._uniform(effect), "scale": scale,
+                "rotation": rotation}, None
+
+    def keys_check(self, script: str) -> object:
+        args = script_args(script)
+        self.checks += 1
+        hook = self.on_check.get(self.checks)
+        if hook is not None:
+            hook()
+        try:
+            sequence_id, _name = self._expect(args)
+        except _Refused as exc:
+            return exc.error()
+        entries = []
+        for item in args["entries"]:
+            node_id = item["node_id"]
+            try:
+                _, clip = self._find_clip({"node_id": node_id}, sequence_id)
+            except _Refused as exc:
+                entries.append({"found": False, "node_id": node_id, "error": str(exc), "clip": None,
+                                "interpreted": None, "item_fps": None, "motion": None, "motion_error": None})
+                continue
+            motion, motion_error = self._motion(clip)
+            fps = clip["item_fps"]
+            interpreted = None if fps is None else abs(fps - KEYS_TPS / self.frame_ticks) > 0.000001
+            entries.append({"found": True, "node_id": node_id, "error": None, "clip": self._facts(node_id, clip),
+                            "interpreted": interpreted, "item_fps": fps, "motion": motion,
+                            "motion_error": motion_error})
+        return {"frame_ticks": str(self.frame_ticks), "entries": entries}
+
+    # ---------- keys_write ----------
+    def keys_write(self, script: str) -> object:
+        args = script_args(script)
+        hook = self.before_write.pop(args.get("node_id"), None)
+        if hook is not None:
+            hook()
+        try:
+            sequence_id, _name = self._expect(args)
+            node_id, clip = self._find_clip({"node_id": args["node_id"]}, sequence_id)
+            if clip["track_type"] != "video":
+                raise _Refused("this clip is on an audio track; Motion Rotation is a video property")
+            expect = args["expect_clip"]
+            if str(clip["in_ticks"]) != expect["in_ticks"]:
+                raise _Refused(f"the in point of the clip is {clip['in_ticks']} ticks, not {expect['in_ticks']} "
+                               "as the plan expects")
+            if str(clip["out_ticks"]) != expect["out_ticks"]:
+                raise _Refused(f"the out point of the clip is {clip['out_ticks']} ticks, not {expect['out_ticks']} "
+                               "as the plan expects")
+            if abs(clip["speed"] - 1) >= 0.0001:
+                raise _Refused(f"the clip has a speed of {clip['speed']}; keys are written at speed 1 only")
+            if clip["reversed"]:
+                raise _Refused("the clip is reversed; keys are written on a clip that is not reversed only")
+            effect = clip["effects"][self._find_effect(clip, "Motion")]
+            if len(effect["properties"]) <= 4:
+                raise _Refused("Motion has no property 4")
+            if effect["properties"][4]["name"] != "Rotation":
+                raise _Refused(f"property 4 of Motion is named {effect['properties'][4]['name']}, not Rotation")
+        except _Refused as exc:
+            return exc.error()
+        prop = effect["properties"][4]
+        before = {"is_time_varying": prop["keys"] is not None, "count": len(prop["keys"] or [])}
+        errors: list[str] = []
+        self.writes.append(("rotation", node_id, args["mode"]))
+        if prop["keys"] is not None:
+            prop["keys"] = None                               # setTimeVarying(false) clears every key (M3b)
+        if args["mode"] == "keys":
+            prop["keys"] = []                                 # setTimeVarying(true) adds none (M1)
+            for number, key in enumerate(args["keys"]):
+                if key["ticks"] in self.add_key_throws.get(node_id, set()):
+                    errors.append(f"key {number} at {key['ticks']} ticks: addKey: Error: addKey failed")
+                    continue
+                ticks = int(key["ticks"]) + (self.drift.get(node_id, 0) if number == 0 else 0)
+                prop["keys"] = [(t, v) for t, v in prop["keys"] if t != ticks]     # one key per time (M2)
+                prop["keys"].append((ticks, float32(key["value"])))
+            prop["keys"].sort()
+        else:
+            prop["value"] = float32(args["value"])
+        if node_id in self.unreadable:
+            errors.append("read back: Error: precondition: the key list could not be read")
+            return {"before": before, "set_errors": errors, "after": None}
+        return {"before": before, "set_errors": errors, "after": self._read(prop)}
+
+    # ---------- effect_resolve and effect_write, for Motion Scale ----------
+    def _effect_target(self, args: dict, target: dict, effect_name: str, index: int, name: str):
+        sequence_id, _ = self._expect(args)
+        node_id, clip = self._find_clip(target, sequence_id)
+        effect_index = self._find_effect(clip, effect_name)
+        effect = clip["effects"][effect_index]
+        props = effect["properties"]
+        if index >= len(props):
+            raise _Refused(f"{effect['name']} has no property {index}")
+        if props[index]["name"] != name:
+            raise _Refused(f"property {index} of {effect['name']} is named {props[index]['name']}, not {name}")
+        return node_id, clip, effect_index, effect, props[index]
+
+    def effect_resolve(self, script: str) -> object:
+        args = script_args(script)
+        records = []
+        for number, entry in enumerate(args["entries"]):
+            try:
+                node_id, clip, effect_index, effect, prop = self._effect_target(
+                    args, entry["target"], entry["effect"], entry["index"], entry["name"])
+            except _Refused as exc:
+                return exc.error(f"entry {number}: ")
+            records.append({"clip": {"node_id": node_id, "name": clip["name"], "track_type": clip["track_type"],
+                                     "track": clip["track"], "clip": clip["clip"],
+                                     "start_ticks": str(clip["start_ticks"]), "end_ticks": str(clip["end_ticks"])},
+                            "effect": {"effect_index": effect_index, "name": effect["name"],
+                                       "match_name": effect["match_name"]},
+                            "property": {"index": entry["index"], "name": prop["name"], "value": prop["value"],
+                                         "kind": "number", "keyframed": prop["keys"] is not None}})
+        sequence_id = (args.get("expect") or {}).get("sequence_id")
+        return {"sequence": {"id": sequence_id, "name": self.sequences.get(sequence_id)}, "entries": records}
+
+    def effect_write(self, script: str) -> object:
+        args = script_args(script)
+        try:
+            node_id, clip, effect_index, effect, prop = self._effect_target(
+                args, args["target"], args["effect"], args["index"], args["name"])
+            if node_id != args["node_id"]:
+                raise _Refused("the clip at this place changed")
+            if effect_index != args["found_effect_index"]:
+                raise _Refused("the effect at this place changed")
+            if prop["keys"] is not None:
+                raise _Refused("property is keyframed")
+        except _Refused as exc:
+            return exc.error()
+        before = prop["value"]
+        self.writes.append(("scale", node_id, args["value"]))
+        prop["value"] = float32(self.scale_lands.pop(node_id, args["value"]))
+        return {"before": before, "zero_first": False, "set_error": None, "value": prop["value"], "read_error": None}

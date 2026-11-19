@@ -393,7 +393,8 @@ def test_keys_get_audio_track_is_asked_for_as_audio(live, capsys):
 
 @pytest.mark.parametrize("argv, text", [
     (["--effect", "Opacity", "--property", "Blend Mode"], "ambiguous_property: 2 properties of Opacity are named Blend Mode"),
-    (["--property", "Nope"], "no property named Nope in Motion"),
+    (["--property", "Nope"], "no property named Nope in Motion. Available properties: Position, Scale, Scale Width, "
+                             "Uniform Scale, Rotation, Anchor Point."),
     (["--property", "Scale", "--property-index", "4"], "property 4 of Motion is named Rotation, not Scale"),
     (["--property-index", "99"], "Motion has no property 99"),
     (["--effect", "Lumetri Color"], "no effect named Lumetri Color on this clip"),
@@ -717,7 +718,7 @@ def test_keys_get_script_finds_the_property_by_name_and_by_index():
     reply, _ = get_script(property_index=3)
     assert refused(reply) == "Motion has no property 3"
     reply, _ = get_script(property="Nope")
-    assert refused(reply) == "no property named Nope in Motion"
+    assert refused(reply) == "no property named Nope in Motion. Available properties: Position, Scale, Rotation."
 
 
 @needs_node
@@ -853,6 +854,10 @@ def test_keys_get_script_matches_the_shape_of_keys_model():
         node_reply, _ = get_script(**over)
         said = modelled(over)
         assert isinstance(said, Exception) and node_reply["success"] is False, over
+        if over == {"property": "Nope"}:          # the model's Motion has more properties, so its list is longer
+            head = "Error: precondition: no property named Nope in Motion. Available properties: Position, Scale, "
+            assert str(said).startswith(head) and node_reply["error"].startswith(head)
+            continue
         assert str(said) == node_reply["error"], over
 
 
@@ -866,7 +871,8 @@ def test_keys_helpers_in_node():
     body = ("var found = __propertyNamed(__clip(__sequenceById('S-A'), {node_id: 'N1'}).clip.components[1], ARGS.name);\n"
             "return __ok([found.index, found.property.displayName]);")
     assert run_script(body, {"name": "Scale"}, KEYS_PRELUDE)[0]["data"] == [1, "Scale"]
-    assert refused(run_script(body, {"name": ""}, KEYS_PRELUDE)[0]) == "no property named  in Motion"
+    assert refused(run_script(body, {"name": ""}, KEYS_PRELUDE)[0]) == ("no property named  in Motion. Available "
+                                                                        "properties: Position, Scale, Rotation.")
 
 
 @needs_node
@@ -940,3 +946,829 @@ def test_level_v10_holds_24_entries_in_the_planner_format():
         assert {"node", "src_in", "src_out", "name", "scale", "max_deg", "clamped", "keys"} <= set(entry)
         assert all(set(key) == {"time_seconds", "value"} for key in entry["keys"])
         assert all(math.isfinite(key["time_seconds"]) and key["time_seconds"] >= 0 for key in entry["keys"])
+
+
+# =====================================================================================================
+# Task 4: live keys set
+# =====================================================================================================
+from cli_anything.premiere.core import bridge  # noqa: E402
+from cli_anything.premiere.core.recipes import results  # noqa: E402
+from cli_anything.premiere.core.session import WriteSession  # noqa: E402
+from cli_anything.premiere.tests.fakes import INTERPRETED_FPS, float32  # noqa: E402
+
+RECORD_KEYS = {"entry", "name", "target", "status", "skip", "reason_code", "reason", "now", "error", "warnings",
+               "mode", "moved", "interpreted"}
+CHECK_MARK, WRITE_MARK = "recipe: keys_check", "recipe: keys_write"
+RESOLVE_MARK, EFFECT_WRITE_MARK = "recipe: effect_resolve", "recipe: effect_write"
+
+
+def test_key_ticks_half_frame_line_to_the_tick():
+    # Ruling 3: the line is the end minus half a frame, 831674844000 ticks for this clip.
+    assert LENGTH - FRAME // 2 == 831674844000
+    below = kt((831674843999 / TICKS_PER_SECOND, 0.5))[0]
+    assert below["moved_from"] is None and below["ticks"] == 831674843999
+    on = kt((831674844000 / TICKS_PER_SECOND, 0.5))[0]
+    assert on["moved_from"] == 831674844000 / TICKS_PER_SECOND and on["ticks"] == LENGTH - FRAME
+
+
+def frames_of(entry: dict) -> int:
+    return round((entry["src_out"] - entry["src_in"]) / (FRAME / TPS))
+
+
+def level_model(data: list[dict] | None = None) -> KeysModel:
+    """A model with one clip per plan entry, in plan order on V1, in and out where the plan says."""
+    model = KeysModel()
+    start = 0
+    for entry in level() if data is None else data:
+        length = frames_of(entry) * FRAME
+        model.add_clip(entry["node"], name=entry["name"], in_ticks=round(entry["src_in"] * TPS), start_ticks=start,
+                       length_ticks=length)
+        start += length
+    return model
+
+
+def plan_file(tmp_path, data) -> str:
+    path = tmp_path / "level.json"
+    path.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
+    return str(path)
+
+
+def keys_set(live, capsys, tmp_path, model, data=None, *argv, state=None):  # noqa: F811
+    """Run `live keys set --sequence s1 --from <plan>` against a panel played by `model`; returns (code,
+    payload, panel)."""
+    path = plan_file(tmp_path, level() if data is None else data)
+    with panel_on(live, handler=recipe_handler(model.replies(), state=state)) as panel:
+        code, out = run_json(capsys, ["live", "keys", "set", "--sequence", "s1", "--from", path, *argv])
+    return code, out, panel
+
+
+def seen(panel, mark: str) -> list[dict]:
+    return [script_args(text) for text in panel.seen if mark in text]
+
+
+def rotation_keys(model, node: str) -> list | None:
+    return model.rotation(node)["keys"]
+
+
+def by_name(out: dict, prefix: str) -> dict:
+    return next(r for r in out["results"] if r["name"].startswith(prefix))
+
+
+def test_set_constants_and_names():
+    assert keys.SLOW_MOTION_PROVEN is True                         # measures.md, M6
+    assert (keys.MOTION, keys.SCALE, keys.ROTATION) == ("Motion", (1, "Scale"), (4, "Rotation"))
+    assert keys.LEVEL_KEYS == ("node", "src_in", "src_out", "name", "scale", "max_deg", "clamped", "keys",
+                               "spread_deg", "static", "static_value")
+
+
+def test_level_v10_dry_run(live, capsys, tmp_path, sends):
+    model = level_model()
+    code, out, panel = keys_set(live, capsys, tmp_path, model, None, "--dry-run")
+    assert code == 0 and out["ok"] is True and out["dry_run"] is True
+    assert model.writes == [] and not any(sends)
+    planned = out["planned"]
+    assert len(planned) == 24
+    assert [p["mode"] for p in planned].count("keys") == 11 and [p["mode"] for p in planned].count("static") == 13
+    s02 = planned[0]
+    assert s02["mode"] == "keys" and len(s02["keys"]) == 4
+    end = s02["keys"][-1]
+    assert end["moved_from"] == 3.295 and end["seconds"] == 3.25325
+    assert end["ticks"] == str(LENGTH - FRAME) and end["media_ticks"] == str(LENGTH - FRAME)  # S02 starts at 0
+    assert s02["scale"] == {"now": 100.0, "new": 104.4}
+    s11 = by_name({"results": planned}, "S11")
+    assert s11["mode"] == "static" and s11["static_value"] == -2.15 and s11["keys"] == []
+    assert all(r["status"] == "not_run" for r in out["results"])
+    assert seen(panel, WRITE_MARK) == [] and seen(panel, EFFECT_WRITE_MARK) == []
+
+
+def test_level_v10_run(live, capsys, tmp_path):
+    model = level_model()
+    code, out, panel = keys_set(live, capsys, tmp_path, model)
+    assert code == 0 and out["ok"] is True and out["stored"] is True and out["rendered"] is None
+    assert out["counts"] == {"done": 24, "skipped": 0, "refused": 0, "failed": 0, "not_run": 0}
+    assert out["first_not_run"] is None
+    data = level()
+    written = 0
+    for entry, record in zip(data, out["results"]):
+        assert set(record) == RECORD_KEYS, record
+        assert record["status"] == "done" and record["interpreted"] is False
+        assert model.scale(entry["node"])["value"] == float32(entry["scale"])
+        assert record["now"]["scale"] == float32(entry["scale"])
+        stored = rotation_keys(model, entry["node"])
+        if entry["static"]:
+            assert stored is None and record["mode"] == "static"
+            assert record["now"]["rotation"]["is_time_varying"] is False
+        else:
+            assert len(stored) == len(entry["keys"]) and record["mode"] == "keys"
+            written += len(stored)
+            assert len(record["moved"]) == 1
+    assert written == 60
+    s11 = by_name(out, "S11")
+    assert s11["now"]["rotation"]["value"] == float32(-2.15)
+    assert abs(model.rotation(s11["target"]["node_id"])["value"] - (-2.15)) <= keys.KEY_TOLERANCE
+    s02 = by_name(out, "S02")
+    assert s02["moved"] == [{"from_seconds": 3.295, "to_seconds": 3.25325}]
+    assert [k["seconds"] for k in s02["now"]["rotation"]["keys"]][-1] == 3.25325
+
+
+def test_rerun_is_safe(live, capsys, tmp_path):
+    model = level_model()
+    code, first, _ = keys_set(live, capsys, tmp_path, model)
+    assert code == 0
+    snapshot = {node: (list(c["effects"][1]["properties"][4]["keys"] or []), c["effects"][1]["properties"][4]["value"])
+                for node, c in model.clips.items()}
+    code, out, _ = keys_set(live, capsys, tmp_path, model)
+    assert code == 0 and out["counts"]["done"] == 24 and out["stored"] is True
+    again = {node: (list(c["effects"][1]["properties"][4]["keys"] or []), c["effects"][1]["properties"][4]["value"])
+             for node, c in model.clips.items()}
+    assert again == snapshot
+
+
+def test_scale_before_rotation(live, capsys, tmp_path):
+    data = level()[:3]
+    model = level_model(data)
+    code, out, panel = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 0
+    order = [(kind, node) for kind, node, _ in model.writes]
+    expected = []
+    for entry in data:
+        expected += [("scale", entry["node"]), ("rotation", entry["node"])]
+    assert order == expected
+    assert len(seen(panel, RESOLVE_MARK)) == 1 and len(seen(panel, CHECK_MARK)) == 1
+
+
+def test_no_scale(live, capsys, tmp_path):
+    data = level()[:3]
+    model = level_model(data)
+    code, out, panel = keys_set(live, capsys, tmp_path, model, data, "--no-scale")
+    assert code == 0 and out["counts"]["done"] == 3
+    assert [w[0] for w in model.writes] == ["rotation"] * 3
+    assert seen(panel, EFFECT_WRITE_MARK) == [] and seen(panel, RESOLVE_MARK) == []
+    assert model.scale(data[0]["node"])["value"] == 100.0 and out["results"][0]["now"]["scale"] == 100.0
+
+
+def test_clip_changed_is_refused(live, capsys, tmp_path):
+    data = level()[:4]
+    model = level_model(data)
+    clip = model.clips[data[2]["node"]]
+    clip["in_ticks"] += FRAME
+    clip["out_ticks"] += FRAME
+    code, out, panel = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["ok"] is False and out["code"] == "refused"
+    assert "entry 2" in out["error"] and "clip_changed" in out["error"] and "Nothing was written" in out["error"]
+    record = out["results"][2]
+    assert (record["status"], record["skip"], record["reason_code"]) == ("skipped", "refused", "clip_changed")
+    assert model.writes == [] and seen(panel, WRITE_MARK) == []
+    assert out["stored"] is False and out["counts"]["not_run"] == 3
+
+
+def test_skip_refused_runs_the_rest(live, capsys, tmp_path):
+    data = level()[:4]
+    model = level_model(data)
+    model.clips[data[2]["node"]]["in_ticks"] += FRAME
+    code, out, panel = keys_set(live, capsys, tmp_path, model, data, "--skip-refused")
+    assert code == 1 and out["code"] == "not_done"
+    assert [r["status"] for r in out["results"]] == ["done", "done", "skipped", "done"]
+    assert out["results"][2]["reason_code"] == "clip_changed"
+    assert data[2]["node"] not in {w[1] for w in model.writes}
+    assert out["counts"] == {"done": 3, "skipped": 1, "refused": 1, "failed": 0, "not_run": 0}
+
+
+def test_node_in_another_sequence(live, capsys, tmp_path):
+    data = level()[:2]
+    model = level_model(data)
+    model.sequences["s2"] = "Other"
+    model.clips[data[1]["node"]]["sequence_id"] = "s2"
+    code, out, panel = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "refused"
+    assert out["results"][1]["reason_code"] == "no_clip" and "Main" in out["results"][1]["reason"]
+    assert model.writes == []
+
+
+def test_retimed_and_slow_motion(live, capsys, tmp_path, monkeypatch):
+    data = level()[:3]
+    model = level_model(data)
+    model.clips[data[0]["node"]]["speed"] = 2.0
+    model.clips[data[1]["node"]]["reversed"] = True
+    model.clips[data[2]["node"]]["item_fps"] = INTERPRETED_FPS
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data, "--skip-refused")
+    assert [r["reason_code"] for r in out["results"][:2]] == ["retimed", "retimed"]
+    third = out["results"][2]
+    assert third["status"] == "done" and third["interpreted"] is True                  # SLOW_MOTION_PROVEN
+    assert any("interpreted" in w for w in third["warnings"])
+    monkeypatch.setattr(keys, "SLOW_MOTION_PROVEN", False)
+    model = level_model(data)
+    model.clips[data[2]["node"]]["item_fps"] = INTERPRETED_FPS
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "refused"
+    assert out["results"][2]["reason_code"] == "slow_motion_unproven" and out["results"][2]["interpreted"] is True
+    assert model.writes == []
+
+
+def test_scale_keyed_is_refused(live, capsys, tmp_path):
+    data = level()[:2]
+    model = level_model(data)
+    model.scale(data[1]["node"])["keys"] = [(0, 100.0), (FRAME, 110.0)]
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["results"][1]["reason_code"] == "keyed" and model.writes == []
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data, "--no-scale")
+    assert code == 0 and out["counts"]["done"] == 2
+
+
+def test_motion_layout_is_refused(live, capsys, tmp_path):
+    data = level()[:2]
+    model = level_model(data)
+    model.rotation(data[1]["node"])["name"] = "Anchor Point"
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["results"][1]["reason_code"] == "motion_layout" and model.writes == []
+
+
+def test_scale_height_with_uniform_scale_on_is_the_scale(live, capsys, tmp_path):
+    # Ruling 1: Premiere renames Scale to Scale Height; while Uniform Scale is on it is the same scale.
+    data = level()[:1]
+    model = level_model(data)
+    model.scale(data[0]["node"])["name"] = "Scale Height"
+    code, out, panel = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 0 and model.scale(data[0]["node"])["value"] == float32(data[0]["scale"])
+    assert seen(panel, RESOLVE_MARK)[0]["entries"][0]["name"] == "Scale Height"
+    model = level_model(data)
+    model.scale(data[0]["node"])["name"] = "Scale Height"
+    model.prop(data[0]["node"], "Motion", "Uniform Scale")["value"] = False
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["results"][0]["reason_code"] == "motion_layout"
+
+
+def test_keys_get_finds_scale_height_by_the_name_scale(live, capsys):
+    model = model_with(THREE_KEYS)
+    model.prop("000f4276", "Motion", "Scale")["name"] = "Scale Height"
+    code, out, _ = keys_get(live, capsys, model, *NODE_ARGS, "--property", "Scale")
+    assert code == 0 and out["property"] == {"name": "Scale Height", "index": 1}
+    model.prop("000f4276", "Motion", "Uniform Scale")["value"] = False
+    code, out, _ = keys_get(live, capsys, model, *NODE_ARGS, "--property", "Scale")
+    assert code == 1 and "Available properties: Position, Scale Height, Scale Width" in out["error"]
+
+
+def test_a_length_that_is_not_whole_frames_is_refused(live, capsys, tmp_path):
+    # Ruling 2: a keyed entry whose clip length (end minus start) is not a whole number of frames.
+    data = level()[:2]
+    model = level_model(data)
+    model.clips[data[0]["node"]]["end_ticks"] += 1
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "refused"
+    record = out["results"][0]
+    assert record["reason_code"] == "bad_length" and "frame" in record["reason"] and model.writes == []
+
+
+def test_negative_key_and_key_clash(live, capsys, tmp_path):
+    data = level()[:2]
+    data[0]["keys"][1]["time_seconds"] = -0.5
+    data[1]["keys"].append({"time_seconds": data[1]["keys"][-1]["time_seconds"] + 0.001, "value": 0.1})
+    model = level_model(data)
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data, "--skip-refused")
+    assert [r["reason_code"] for r in out["results"]] == ["negative_key", "key_clash"]
+    assert model.writes == []
+
+
+def test_level_no_change_is_skipped(live, capsys, tmp_path):
+    data = level()[:2]
+    data[1]["keys"], data[1]["static"] = [], False
+    model = level_model(data)
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 0 and out["stored"] is True
+    record = out["results"][1]
+    assert (record["status"], record["skip"], record["reason"]) == ("skipped", "nothing_to_do", "level, no change")
+    assert record["mode"] == "none" and data[1]["node"] not in {w[1] for w in model.writes}
+
+
+def test_in_script_refusal_after_the_check(live, capsys, tmp_path):
+    data = level()[:3]
+    model = level_model(data)
+    node = data[1]["node"]
+    old = rotation_keys(model, node), model.rotation(node)["value"]
+
+    def trim():
+        model.clips[node]["in_ticks"] += FRAME
+    model.before_write[node] = trim
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "not_done"
+    record = out["results"][1]
+    assert record["status"] == "failed" and results.UNKNOWN not in record and "in point" in record["error"]
+    assert (rotation_keys(model, node), model.rotation(node)["value"]) == old            # Rotation unchanged
+    assert record["now"]["scale"] == float32(data[1]["scale"])                         # the new Scale stays
+    assert out["results"][2]["status"] == "done" and out["stored"] is False
+
+
+def test_readback_mismatch_is_failed(live, capsys, tmp_path):
+    data = level()[:3]
+    model = level_model(data)
+    model.drift[data[0]["node"]] = 1
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1
+    record = out["results"][0]
+    assert record["status"] == "failed" and results.UNKNOWN not in record
+    assert record["now"]["rotation"]["is_time_varying"] is True and "ticks" in record["error"]
+    assert [r["status"] for r in out["results"][1:]] == ["done", "done"]
+
+
+def fail_keys_write(monkeypatch, node: str, error: CliError) -> None:
+    original = WriteSession.write
+
+    def write(self, body, args=None, **kw):
+        if WRITE_MARK in body and (args or {}).get("node_id") == node:
+            raise error
+        return original(self, body, args, **kw)
+    monkeypatch.setattr(WriteSession, "write", write)
+
+
+def test_not_applied_ends_the_run(live, capsys, tmp_path, monkeypatch):
+    data = level()[:6]
+    model = level_model(data)
+    fail_keys_write(monkeypatch, data[3]["node"], CliError("not_applied", "Premiere did not pick up the command."))
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "not_done"
+    assert [r["status"] for r in out["results"]] == ["done"] * 3 + ["not_run"] * 3
+    assert out["first_not_run"] == 3 and out["stored"] is False
+    assert any("Scale" in w for w in out["results"][3]["warnings"])                   # Scale of entry 3 was written
+    assert ("scale", data[3]["node"], data[3]["scale"]) in model.writes
+    assert data[4]["node"] not in {w[1] for w in model.writes}
+
+
+def test_unknown_outcome_stops(live, capsys, tmp_path, monkeypatch):
+    data = level()[:4]
+    model = level_model(data)
+    fail_keys_write(monkeypatch, data[1]["node"], CliError("unknown_outcome", "The panel did not answer in time."))
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["stored"] is None
+    record = out["results"][1]
+    assert record["status"] == "failed" and record[results.UNKNOWN] is True and record["now"] is None
+    assert set(record) == RECORD_KEYS | {results.UNKNOWN}
+    assert [r["status"] for r in out["results"][2:]] == ["not_run", "not_run"] and out["first_not_run"] == 2
+
+
+def test_unreadable_read_back_is_unknown(live, capsys, tmp_path):
+    data = level()[:3]
+    model = level_model(data)
+    model.unreadable.add(data[1]["node"])
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["stored"] is None
+    record = out["results"][1]
+    assert record["status"] == "failed" and record[results.UNKNOWN] is True and "read back" in record["error"]
+    assert out["results"][2]["status"] == "not_run" and out["first_not_run"] == 2
+
+
+def test_interrupted_rotation_write_ends_the_run(live, capsys, tmp_path, monkeypatch):
+    data = level()[:3]
+    model = level_model(data)
+    fail_keys_write(monkeypatch, data[1]["node"], CliError("interrupted", "Stopped before Premiere picked it up."))
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "interrupted" and "results" in out
+    assert [r["status"] for r in out["results"]] == ["done", "not_run", "not_run"]
+    assert any("Scale was written" in w for w in out["results"][1]["warnings"])
+    assert out["results"][1]["now"]["scale"] == float32(data[1]["scale"])
+
+
+def test_a_stop_during_a_write_is_an_unknown_outcome(live, capsys, tmp_path, monkeypatch):
+    data = level()[:3]
+    model = level_model(data)
+    fail_keys_write(monkeypatch, data[1]["node"], KeyboardInterrupt())
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "interrupted" and out["stored"] is None
+    record = out["results"][1]
+    assert record["status"] == "failed" and record[results.UNKNOWN] is True
+    assert out["results"][2]["status"] == "not_run"
+
+
+def test_scale_not_stored_fails_the_entry_and_skips_its_rotation(live, capsys, tmp_path):
+    data = level()[:3]
+    model = level_model(data)
+    model.scale_lands[data[0]["node"]] = 50.0
+    code, out, panel = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["stored"] is False
+    record = out["results"][0]
+    assert record["status"] == "failed" and results.UNKNOWN not in record and record["error"].startswith("Scale")
+    assert record["now"]["scale"] == 100.0                                             # put back
+    assert data[0]["node"] not in [args["node_id"] for args in seen(panel, WRITE_MARK)]
+    assert [r["status"] for r in out["results"][1:]] == ["done", "done"]
+
+
+def test_precondition_of_the_scale_write_is_this_entry_only(live, capsys, tmp_path, monkeypatch):
+    data = level()[:3]
+    model = level_model(data)
+    original = WriteSession.write
+
+    def write(self, body, args=None, **kw):
+        if EFFECT_WRITE_MARK in body and (args or {}).get("node_id") == data[0]["node"]:
+            raise CliError("precondition", "the clip at this place changed")
+        return original(self, body, args, **kw)
+    monkeypatch.setattr(WriteSession, "write", write)
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert [r["status"] for r in out["results"]] == ["failed", "done", "done"]
+    assert results.UNKNOWN not in out["results"][0] and code == 1
+    assert ("rotation", data[0]["node"], "keys") not in model.writes
+
+
+def test_breathe_then_check_again(live, capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_HOLD_S", 0.0)
+    data = level()[:5]
+    model = level_model(data)
+
+    def trim():
+        model.clips[data[2]["node"]]["in_ticks"] += FRAME
+    model.on_check[3] = trim               # check 1 is for all; 2 before entry 1; 3 before entry 2
+    code, out, panel = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "not_done"
+    assert [r["status"] for r in out["results"]] == ["done", "done", "skipped", "not_run", "not_run"]
+    assert out["results"][2]["reason_code"] == "clip_changed" and out["first_not_run"] == 3
+    assert data[2]["node"] not in {w[1] for w in model.writes}
+    code, out, _ = keys_set(live, capsys, tmp_path, level_model(data), data)
+    assert code == 0                                                     # breathing alone changes nothing
+
+
+def test_breathe_then_refused_goes_on_with_skip_refused(live, capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_HOLD_S", 0.0)
+    data = level()[:4]
+    model = level_model(data)
+
+    def trim():
+        model.clips[data[2]["node"]]["in_ticks"] += FRAME
+    model.on_check[3] = trim
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data, "--skip-refused")
+    assert [r["status"] for r in out["results"]] == ["done", "done", "skipped", "done"]
+
+
+def test_static_spread_override_warns(live, capsys, tmp_path):
+    model = level_model()
+    code, out, _ = keys_set(live, capsys, tmp_path, model, None, "--static-spread", "0.9")
+    assert code == 0
+    s07 = by_name(out, "S07")
+    assert s07["mode"] == "static" and rotation_keys(model, s07["target"]["node_id"]) is None
+    assert model.rotation(s07["target"]["node_id"])["value"] == float32(-3.32)
+    assert any("S07" in w and "0.9" in w for w in out["warnings"])
+
+
+@pytest.mark.parametrize("text, where", [
+    ("not json", "not valid JSON"),
+    ('{"node": "x"}', "array"),
+    ("[]", "at least one"),
+    ('[{"src_in": 0, "src_out": 1, "scale": 100, "keys": []}]', "entry 0"),
+    ('[{"node": "x", "src_in": 0, "src_out": 1, "scale": 100, "keys": [{"time_seconds": "1", "value": 0}]}]', "entry 0"),
+    ('[{"node": "x", "src_in": 1, "src_out": 1, "scale": 100, "keys": []}]', "src_out"),
+    ('[{"node": "x", "src_in": 0, "src_out": 1, "scale": 0, "keys": []}]', "scale"),
+    ('[{"node": "x", "src_in": 0, "src_out": 1, "scale": 100, "keys": [], "static": true}]', "static_value"),
+    ('[{"node": "x", "src_in": 0, "src_out": NaN, "scale": 100, "keys": []}]', "not valid JSON"),
+])
+def test_plan_file_faults(live, capsys, tmp_path, sends, text, where):
+    code, out, panel = keys_set(live, capsys, tmp_path, KeysModel(), text)
+    assert code == 1 and out["code"] == "bad_plan" and where in out["error"] and "Nothing was sent" in out["error"]
+    assert sends == [] and panel.seen == []
+
+
+def test_null_scale_needs_no_scale(live, capsys, tmp_path, sends):
+    data = level()[:1]
+    data[0]["scale"] = None
+    code, out, _ = keys_set(live, capsys, tmp_path, level_model(data), data)
+    assert code == 1 and out["code"] == "bad_plan" and "--no-scale" in out["error"] and sends == []
+    code, out, _ = keys_set(live, capsys, tmp_path, level_model(data), data, "--no-scale")
+    assert code == 0
+
+
+def test_check_level_plan_and_load_level_plan(tmp_path):
+    data = level()
+    assert keys.check_level_plan(data) == data
+    assert keys.load_level_plan(plan_file(tmp_path, data)) == data
+    with pytest.raises(CliError) as err:
+        keys.load_level_plan(tmp_path / "missing.json")
+    assert err.value.code == "bad_plan"
+
+
+def test_unknown_keys_pass_with_a_warning(live, capsys, tmp_path):
+    data = level()[:2]
+    data[1]["note"] = "handheld"
+    code, out, _ = keys_set(live, capsys, tmp_path, level_model(data), data)
+    assert code == 0 and any("note" in w and "entry 1" in w for w in out["warnings"])
+
+
+def test_own_film_is_refused(live, capsys, tmp_path):
+    data = level()[:2]
+    model = level_model(data)
+    code, out, panel = keys_set(live, capsys, tmp_path, model, data, state=STATE_OWN)
+    assert code == 1 and out["code"] == "project_guard" and model.writes == []
+    assert len(panel.seen) == 1 and "playhead_ticks: playhead" in panel.seen[0]
+
+
+def test_the_sequence_name_is_checked(live, capsys, tmp_path):
+    data = level()[:1]
+    code, out, panel = keys_set(live, capsys, tmp_path, level_model(data), data, "--sequence-name", "Other")
+    assert code == 1 and out["code"] == "precondition" and "named Main, not Other" in out["error"]
+
+
+def test_the_write_arguments(live, capsys, tmp_path):
+    data = level()[:2]
+    data[1]["static"] = True
+    model = level_model(data)
+    code, out, panel = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 0
+    first, second = seen(panel, WRITE_MARK)
+    clip = model.clips[data[0]["node"]]
+    assert first["node_id"] == data[0]["node"] and first["mode"] == "keys"
+    assert first["expect_clip"] == {"in_ticks": str(clip["in_ticks"]), "out_ticks": str(clip["out_ticks"])}
+    assert all(isinstance(k["ticks"], str) for k in first["keys"])
+    assert first["keys"][0]["ticks"] == str(clip["in_ticks"])
+    assert second["mode"] == "static" and second["value"] == data[1]["static_value"]
+    assert first["expect"]["sequence_id"] == "s1"
+
+
+def human_set(live, capsys, tmp_path, model, data, *argv):  # noqa: F811
+    path = plan_file(tmp_path, data)
+    with panel_on(live, handler=recipe_handler(model.replies())):
+        code = dispatch(["live", "keys", "set", "--sequence", "s1", "--from", path, *argv])
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_human_output_of_keys_set(live, capsys, tmp_path):
+    data = level()[:2]
+    code, out, err = human_set(live, capsys, tmp_path, level_model(data), data)
+    assert code == 0 and "S02 C2246 done" in out and "2 done, 0 skipped, 0 failed, 0 not run." in out
+    code, out, err = human_set(live, capsys, tmp_path, level_model(data), data, "--dry-run")
+    assert code == 0 and "S02 C2246" in out and "keys" in out
+
+
+def test_keys_set_help(capsys):
+    assert dispatch(["live", "keys", "set", "--help"]) == 0
+    text = " ".join(capsys.readouterr().out.split())
+    for word in ("--sequence", "--sequence-name", "--from", "--no-scale", "--static-spread", "--skip-refused",
+                 "--dry-run", "--project", "--any-project", "--lease-wait", "--timeout", "--allow-untested"):
+        assert word in text, word
+    lowered = text.lower()
+    assert "replace the old" in lowered and "one frame before the clip end" in lowered
+    assert "addkey" in lowered and "not saved" in lowered
+
+
+# ---------- the two new scripts, in node ----------
+WRITE_IN = 5 * TPS
+WRITE_PRELUDE = STUB_HELPERS + """
+var writes = 0;
+function Time() { this.ticks = "0"; }
+function mkProp(name, value) {
+  var p = {displayName: name, value: value};
+  p.isTimeVarying = function () { return false; };
+  p.getValue = function () { return p.value; };
+  p.getKeys = function () { return undefined; };
+  p.setValue = p.setValueAtKey = p.addKey = p.removeKey = p.setTimeVarying = function () { writes++; };
+  return p;
+}
+// A Rotation that behaves as measured on Premiere 27: M1 (true adds no key), M2 (one key per time),
+// M3b (false clears every key), M4 (values stored as 32-bit floats).
+function mkLive(name, keys, value) {
+  var p = {displayName: name, keys: keys, value: value, log: [], addThrows: {}};
+  var find = function (ticks) {
+    for (var i = 0; i < p.keys.length; i++) if (p.keys[i][0] === String(ticks)) return i;
+    return -1;
+  };
+  p.isTimeVarying = function () { return p.keys !== null; };
+  p.setTimeVarying = function (on) { writes++; p.log.push("tv " + on); if (!on) p.keys = null; else if (p.keys === null) p.keys = []; };
+  p.addKey = function (t) {
+    writes++; p.log.push("add " + t.ticks);
+    if (p.addThrows[String(t.ticks)]) throw new Error("addKey failed");
+    if (find(t.ticks) < 0) p.keys.push([String(t.ticks), 0]);
+    p.keys.sort(function (a, b) { return parseFloat(a[0]) - parseFloat(b[0]); });
+  };
+  p.setValueAtKey = function (t, v) { writes++; p.log.push("set " + t.ticks); var i = find(t.ticks); if (i >= 0) p.keys[i][1] = Math.fround(v); };
+  p.setValue = function (v) { writes++; p.log.push("value " + v); p.value = Math.fround(v); };
+  p.getValue = function () { return p.value; };
+  p.getKeys = function () {
+    if (p.keys === null) return undefined;
+    var out = [];
+    for (var i = 0; i < p.keys.length; i++) { var t = new Time(); t.ticks = p.keys[i][0]; out.push(t); }
+    return out;
+  };
+  p.getValueAtKey = function (t) { var i = find(t.ticks); return i < 0 ? null : p.keys[i][1]; };
+  return p;
+}
+function mkComp(display, match, props) { return {displayName: display, matchName: match, properties: coll("numItems", props)}; }
+var rot = mkLive("Rotation", [["%(old)s", 3.0]], 0);
+var scaleProp = mkProp("Scale", 100);
+var motion = mkComp("Motion", "AE.ADBE Motion", [mkProp("Position", [0.5, 0.5]), scaleProp, mkProp("Scale Width", 100),
+                                                 mkProp("Uniform Scale", true), rot, mkProp("Anchor Point", [0.5, 0.5])]);
+var item = {nodeId: "I1", name: "C2246.MP4", getFootageInterpretation: function () { return {frameRate: 23.976023976024}; }};
+var w1 = {nodeId: "W1", name: "S02 C2246", inPoint: {ticks: "%(in)s"}, outPoint: {ticks: "%(out)s"}, start: {ticks: "0"},
+          end: {ticks: "%(len)s"}, projectItem: item, components: coll("numItems", [mkComp("Opacity", "AE.ADBE Opacity", []), motion])};
+w1.getSpeed = function () { return 1; };
+w1.isSpeedReversed = function () { return false; };
+var a1 = {nodeId: "A1", name: "Sound", inPoint: {ticks: "0"}, outPoint: {ticks: "10"}, start: {ticks: "0"}, end: {ticks: "10"},
+          components: coll("numItems", [mkComp("Volume", "AE.ADBE Volume", [])])};
+a1.getSpeed = function () { return 1; };
+a1.isSpeedReversed = function () { return false; };
+var seqA = {sequenceID: "S-A", name: "Cut A", timebase: "%(frame)s", videoTracks: coll("numTracks", [track([w1])]),
+            audioTracks: coll("numTracks", [track([a1])])};
+var app = {project: {path: "/p/X Claude.prproj", sequences: coll("numSequences", [seqA]), activeSequence: null}};
+""" % {"old": str(WRITE_IN + 5 * FRAME), "in": str(WRITE_IN), "out": str(WRITE_IN + LENGTH), "len": str(LENGTH),
+       "frame": str(FRAME)}
+EXPECT = {"project_path": "/p/X Claude.prproj", "sequence_id": "S-A", "sequence_name": None}
+KEY_1 = str(WRITE_IN + 316757952000)
+
+
+def write_args(**over) -> dict:
+    args = {"node_id": "W1", "expect_clip": {"in_ticks": str(WRITE_IN), "out_ticks": str(WRITE_IN + LENGTH)},
+            "mode": "keys", "keys": [{"ticks": str(WRITE_IN), "value": 1.26}, {"ticks": KEY_1, "value": -0.07}],
+            "value": None, "expect": EXPECT}
+    args.update(over)
+    return args
+
+
+def write_script(prelude_patch: str = "", **over) -> tuple[dict, int]:
+    body = jsx.load("keys_write") + "\n"
+    return run_script(body, write_args(**over), WRITE_PRELUDE + prelude_patch)
+
+
+def log_script(prelude_patch: str = "", **over) -> list:
+    body = jsx.load("keys_write")
+    script = jsx.build(body, write_args(**over), include=INCLUDES)
+    code = (WRITE_PRELUDE + prelude_patch + "\nvar __out = " + script
+            + ";\nprocess.stdout.write(JSON.stringify(rot.log));")
+    return json.loads(subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=30, check=True).stdout)
+
+
+@needs_node
+def test_keys_write_in_node():
+    reply, writes = write_script()
+    assert reply["success"] is True, reply
+    data = reply["data"]
+    assert data["before"] == {"is_time_varying": True, "count": 1} and data["set_errors"] == []
+    assert data["after"]["is_time_varying"] is True
+    assert [k["ticks"] for k in data["after"]["keys"]] == [str(WRITE_IN), KEY_1]       # the old key is gone
+    assert [k["value"] for k in data["after"]["keys"]] == [float32(1.26), float32(-0.07)]
+    assert log_script() == ["tv false", "tv true", "add " + str(WRITE_IN), "set " + str(WRITE_IN), "add " + KEY_1,
+                            "set " + KEY_1]
+    # static: false clears the keys, then the value
+    reply, _ = write_script(mode="static", keys=None, value=-2.6)
+    assert reply["data"]["after"] == {"is_time_varying": False, "keys": [], "value": float32(-2.6)}
+    assert log_script(mode="static", keys=None, value=-2.6) == ["tv false", "value -2.6"]
+    # a property with no keys: no false first
+    assert log_script("rot.keys = null;")[0] == "tv true"
+    # a throwing addKey: the error is in set_errors, the rest is written and read back
+    reply, _ = write_script('rot.addThrows["%s"] = true;' % KEY_1)
+    assert reply["success"] is True and len(reply["data"]["set_errors"]) == 1
+    assert KEY_1 in reply["data"]["set_errors"][0] and "addKey failed" in reply["data"]["set_errors"][0]
+    assert [k["ticks"] for k in reply["data"]["after"]["keys"]] == [str(WRITE_IN)]
+    # a read back that throws after the writes: no precondition, after is null
+    reply, _ = write_script("rot.getKeys = function () { throw new Error('gone'); };")
+    assert reply["success"] is True and reply["data"]["after"] is None
+    assert any("read back" in e for e in reply["data"]["set_errors"])
+
+
+WRITE_REFUSALS = [
+    ({"expect_clip": {"in_ticks": str(WRITE_IN + 1), "out_ticks": str(WRITE_IN + LENGTH)}}, "",
+     "the in point of the clip is %d ticks, not %d as the plan expects" % (WRITE_IN, WRITE_IN + 1)),
+    ({"expect_clip": {"in_ticks": str(WRITE_IN), "out_ticks": "1"}}, "",
+     "the out point of the clip is %d ticks, not 1 as the plan expects" % (WRITE_IN + LENGTH)),
+    ({}, "w1.getSpeed = function () { return 2; };", "the clip has a speed of 2; keys are written at speed 1 only"),
+    ({}, "w1.isSpeedReversed = function () { return true; };",
+     "the clip is reversed; keys are written on a clip that is not reversed only"),
+    ({}, 'rot.displayName = "Anchor";', "property 4 of Motion is named Anchor, not Rotation"),
+    ({"node_id": "W9"}, "", "no clip has the node ID W9 in sequence Cut A"),
+    ({"node_id": "A1"}, "", "this clip is on an audio track; Motion Rotation is a video property"),
+    ({"expect": {**EXPECT, "sequence_name": "Cut B"}}, "", "sequence S-A is named Cut A, not Cut B"),
+]
+
+
+@needs_node
+@pytest.mark.parametrize("over, patch, text", WRITE_REFUSALS)
+def test_keys_write_refuses_before_its_first_write(over, patch, text):
+    reply, writes = write_script(patch, **over)
+    assert refused(reply) == text and writes == 0
+
+
+@needs_node
+@pytest.mark.parametrize("over", [{"mode": "loop"}, {"keys": []}, {"keys": [{"ticks": 5, "value": 1}]},
+                                  {"keys": [{"ticks": "5", "value": "1"}]},
+                                  {"keys": [{"ticks": "5", "value": 1}, {"ticks": "5", "value": 2}]},
+                                  {"mode": "static", "keys": None, "value": None}, {"node_id": ""},
+                                  {"expect_clip": {"in_ticks": 1, "out_ticks": "2"}}])
+def test_keys_write_refuses_bad_arguments(over):
+    reply, writes = write_script(**over)
+    assert reply["success"] is False and "precondition: " in reply["error"] and writes == 0
+
+
+def write_model() -> KeysModel:
+    model = KeysModel()
+    model.sequences = {"S-A": "Cut A"}
+    model.add_clip("W1", name="S02 C2246", in_ticks=WRITE_IN, length_ticks=LENGTH, sequence_id="S-A",
+                   rotation=[(WRITE_IN + 5 * FRAME, 3.0)])
+    model.add_clip("A1", name="Sound", track_type="audio", sequence_id="S-A")
+    return model
+
+
+MODEL_PATCHES = {"": lambda m: None,
+                 "w1.getSpeed = function () { return 2; };": lambda m: m.clips["W1"].update(speed=2),
+                 "w1.isSpeedReversed = function () { return true; };": lambda m: m.clips["W1"].update(reversed=True),
+                 'rot.displayName = "Anchor";': lambda m: m.rotation("W1").update(name="Anchor")}
+
+
+@needs_node
+def test_keys_write_matches_keys_model():
+    model = write_model()
+    node_reply, _ = write_script()
+    said = model.keys_write(jsx.build(jsx.load("keys_write"), write_args(), include=INCLUDES))
+    assert said == node_reply["data"]
+    for over, patch, text in WRITE_REFUSALS:
+        model = write_model()
+        MODEL_PATCHES[patch](model)
+        said = model.keys_write(jsx.build(jsx.load("keys_write"), write_args(**over), include=INCLUDES))
+        node_reply, _ = write_script(patch, **over)
+        assert isinstance(said, Exception) and str(said) == node_reply["error"], over
+
+
+@needs_node
+def test_keys_check_in_node():
+    args = {"entries": [{"node_id": "W1"}, {"node_id": "NOPE"}, {"node_id": "A1"}], "expect": EXPECT}
+    reply, writes = run_script(jsx.load("keys_check"), args, WRITE_PRELUDE)
+    assert reply["success"] is True and writes == 0
+    data = reply["data"]
+    assert data["frame_ticks"] == str(FRAME)
+    first, missing, audio = data["entries"]
+    assert first["found"] is True and first["item_fps"] == 23.976023976024 and first["error"] is None
+    assert first["interpreted"] is False
+    assert first["clip"]["in_ticks"] == str(WRITE_IN) and first["clip"]["node_id"] == "W1"
+    assert first["clip"]["track_type"] == "video" and first["clip"]["speed"] == 1
+    assert first["motion"]["scale"] == {"index": 1, "name": "Scale", "matches": True, "value": 100, "keyframed": False}
+    assert first["motion"]["rotation"]["name"] == "Rotation" and first["motion"]["rotation"]["keyframed"] is True
+    assert first["motion"]["uniform"] is True
+    assert missing == {"found": False, "node_id": "NOPE", "error": "no clip has the node ID NOPE in sequence Cut A",
+                       "clip": None, "interpreted": None, "item_fps": None, "motion": None, "motion_error": None}
+    assert audio["found"] is True and audio["motion"] is None
+    assert audio["motion_error"] == "no effect named Motion on this clip"
+    reply, _ = run_script(jsx.load("keys_check"), args,
+                          WRITE_PRELUDE + "item.getFootageInterpretation = function () { throw new Error('no'); };")
+    assert reply["data"]["entries"][0]["item_fps"] is None and reply["data"]["entries"][0]["interpreted"] is None
+    patch = "item.getFootageInterpretation = function () { return {frameRate: %r}; };" % INTERPRETED_FPS
+    reply, _ = run_script(jsx.load("keys_check"), args, WRITE_PRELUDE + patch)
+    assert reply["data"]["entries"][0]["interpreted"] is True                          # the M6 read
+    reply, _ = run_script(jsx.load("keys_check"), args, WRITE_PRELUDE + 'seqA.timebase = "x";')
+    assert reply["data"]["frame_ticks"] is None and reply["data"]["entries"][0]["interpreted"] is None
+    reply, _ = run_script(jsx.load("keys_check"), {**args, "expect": {**EXPECT, "sequence_id": "S-Z"}}, WRITE_PRELUDE)
+    assert refused(reply) == "no sequence has the ID S-Z"
+    # shape parity with KeysModel
+    model = KeysModel()
+    model.sequences = {"S-A": "Cut A"}
+    model.add_clip("W1", name="S02 C2246", in_ticks=WRITE_IN, length_ticks=LENGTH, sequence_id="S-A",
+                   rotation=[(WRITE_IN + 5 * FRAME, 3.0)])
+    model.add_clip("A1", name="Sound", track_type="audio", sequence_id="S-A")
+    model.clips["A1"]["effects"] = [{"name": "Volume", "match_name": "AE.ADBE Volume", "properties": []}]
+    said = model.keys_check(jsx.build(jsx.load("keys_check"), {**args}, include=INCLUDES))
+    node_reply, _ = run_script(jsx.load("keys_check"), args, WRITE_PRELUDE)
+    assert shape(said) == shape(node_reply["data"])
+
+
+@needs_node
+def test_property_named_scale_follows_uniform_scale_in_node():
+    body = ("var found = __propertyNamed(__clip(__sequenceById('S-A'), {node_id: 'W1'}).clip.components[1], ARGS.name);\n"
+            "return __ok([found.index, String(found.property.displayName)]);")
+    assert run_script(body, {"name": "Scale"}, WRITE_PRELUDE)[0]["data"] == [1, "Scale"]
+    renamed = WRITE_PRELUDE + 'scaleProp.displayName = "Scale Height";'
+    assert run_script(body, {"name": "Scale"}, renamed)[0]["data"] == [1, "Scale Height"]
+    assert run_script(body, {"name": "Scale Height"}, WRITE_PRELUDE)[0]["data"] == [1, "Scale"]
+    off = renamed + "motion.properties[3].value = false;"
+    assert refused(run_script(body, {"name": "Scale"}, off)[0]) == (
+        "no property named Scale in Motion. Available properties: Position, Scale Height, Scale Width, Uniform Scale, "
+        "Rotation, Anchor Point.")
+
+
+def test_new_keys_scripts_start_with_their_markers():
+    for name in ("keys_check", "keys_write"):
+        assert jsx.load(name).split("\n")[0] == f"// recipe: {name}"
+    for name in ("keys", "keys_get", "keys_check", "keys_write", "find", "values"):
+        text = jsx.load(name)
+        for other in ("keys_get", "keys_check", "keys_write", "effect_resolve", "effect_write"):
+            if other != name:
+                assert f"recipe: {other}" not in text, (name, other)
+
+
+def test_new_keys_scripts_are_es3():
+    for name in ("keys_check", "keys_write"):
+        text = jsx.load(name)
+        for pattern in BANNED + [r"\.indexOf\(", r"\bObject\.(?!prototype\.toString\.call)", r"\.reduce\(",
+                                 r"\.some\(", r"\.every\("]:
+            assert not re.search(pattern, text), f"{name}.jsx: {pattern}"
+
+
+def test_keys_check_calls_no_writer_of_premiere():
+    text = jsx.load("keys_check")
+    for writer in (r"\.addKey\(", r"\.setValue\(", r"\.setValueAtKey\(", r"\.removeKey\(", r"\.setTimeVarying\(",
+                   r"__keyTime\("):
+        assert not re.search(writer, text), f"keys_check.jsx: {writer}"
+
+
+def test_every_host_call_in_the_new_keys_scripts_is_cited():
+    head = head_comment("keys_write")
+    for call in ("setTimeVarying", "addKey", "setValueAtKey", "setValue", "isTimeVarying", "getKeys", "new Time",
+                 "clipboard.js, lines 253-258", "keyframes.js, line 220", "find.jsx", "keys.jsx", "ARGS", "Reply"):
+        assert call in head, f"keys_write.jsx: {call}"
+    head = head_comment("keys_check")
+    for call in ("getFootageInterpretation", "frameRate", "timebase", "sequence.js, lines 485-486", "projectItem",
+                 "isTimeVarying", "find.jsx", "keys.jsx", "ARGS", "Reply"):
+        assert call in head, f"keys_check.jsx: {call}"
+    head = head_comment("keys")
+    for call in ("__isUniformScale", "script-builder.js, lines 694-699", "lines 701-722"):
+        assert call in head, f"keys.jsx: {call}"
