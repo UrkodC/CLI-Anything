@@ -98,13 +98,19 @@ No recipe saves the project. `mcp call`, `mcp batch` and `live run` can, because
   clip to others), `live track disable-clips` (disables every clip of a track, the fix for a track
   mute that does not hold) and `live sequence duplicate`. The other four, `live keys get`,
   `live keys set`, `live place` and `live effect apply`, exist: see "Live checks of Plan 3".
-- A re-run of `live keys set` writes the keys again. It reads back the same keys and exits 0, but it
-  is not a re-run that writes nothing (rehearsal: 23 done again in 9.8 s). A change that skips a clip
-  whose keys already match is planned.
-- A re-run of `live place` with every shot already placed still goes through the switch step: when
-  another sequence is active, it makes the target active and puts the old one back, though it
-  places nothing and sends no tool call. A change that switches only when a shot has a step to do
-  is planned. `live effect apply` already does this.
+- A re-run of `live keys set` now skips a clip that already holds the plan: its Rotation keys (the
+  same media ticks, values within 0.0001) or its static Rotation, and its Scale unless `--no-scale`.
+  The entry is skipped as nothing to do (`keys_match`) and nothing is written. The rehearsal below
+  ran before this change and saw 23 entries done again in 9.8 s. The no-write re-run is unit-tested
+  only; no live run has shown it yet.
+- A re-run of `live place` with every shot already placed no longer goes through the switch step:
+  the active sequence is switched only when some shot has a step to do, as `live effect apply`
+  does. The rehearsal below ran before this change. The no-switch re-run is unit-tested only.
+- `live place`: `place_read.jsx` sees a clip of the same item only when it overlaps the span by more than
+  half a frame. A 1-frame clip of that item that only touches the span edge (one frame before or
+  after the start) is not seen, and `overwrite_clip` may then stop the run with a server error
+  ("no verifiable new placement"). The run stops at that step and the read after judges the shot.
+  Nothing is corrupted.
 - Retimed clips (a speed change, or reversed) are not supported: `live keys set` refuses them with
   `retimed`. Most slow motion in the films is a speed change (2.5x or 5x slow), so those clips are
   refused today. How keys behave on such a clip was not measured. `premiere-pro-mcp` 1.25.0 has no
@@ -252,7 +258,7 @@ Project `fixture27 Claude.prproj`. All writes went to a duplicate sequence (`E2E
 |---|---|
 | `live keys get` | The fixture clip reads two Rotation keys (1.5 at 0 s, 0.5 at 2.002 s). The same clip in the copy reads the same keys. |
 | `live keys set`, keys | The two keys were replaced by three: 1.26 at 0 s, -0.07 at 1.247 s and 0.33 at 5.964292 s. The key planned at the clip end moved to one frame before it. Read back by `live keys set` and by a later `live keys get`: exact ticks and the same values. Scale read 101.5. |
-| `live keys set`, static | One static Rotation (-1.49) replaced the keys. A second run wrote the same again and read the same. |
+| `live keys set`, static | One static Rotation (-1.49) replaced the keys. A second run wrote the same again and read the same. (Measured before the `keys_match` skip; a second run now writes nothing, unit-tested only.) |
 | `clip_changed` | A plan that says the clip starts at 0.5 s, when it shows 0.0 s to 6.006 s, was refused with `clip_changed`. Nothing was written. |
 | `live place` | Two shots on a spare video track, placed in 3.4 s, each read back to the frame (start) and to the item frame (in and out). The output listed the item marks (in 2.961292 s, out 4.963292 s for the second shot). |
 | `live place` re-run | A shot already in place: `skipped`, `already_placed`, no call sent, exit 0. |
@@ -272,10 +278,10 @@ The copy was made fresh with `ditto`. Its name holds the word Claude. The SHA-1 
 | Command | Dry run | Run | Re-run |
 |---|---|---|---|
 | `live place` (25 shots) | 25 planned, 50 calls, 0 refusals | 25 done in 12.2 s, exit 0, `stored` true | 25 skipped (`already_placed`), 0 calls, exit 0, 1.0 s |
-| `live keys set` (23 entries) | 0.6 s | 23 done in 9.8 s | 23 done in 9.8 s, exit 0: it writes the same keys again |
+| `live keys set` (23 entries) | 0.6 s | 23 done in 9.8 s | 23 done in 9.8 s, exit 0: it writes the same keys again (before the `keys_match` skip) |
 | `live effect apply` (V1, `--all`, ProcAmp then Lumetri Color) | not run | 50 done in 11.9 s | 50 skipped (`has_effect`) in 0.6 s, exit 0 |
 
-The shot S25 is not in the 23 entries of `live keys set`: it was trimmed after leveling, so its plan no longer fits the clip. The re-run of `live keys set` is a rewrite, not a no-write run (see "Not done, and why").
+The shot S25 is not in the 23 entries of `live keys set`: it was trimmed after leveling, so its plan no longer fits the clip. The re-run of `live keys set` was a rewrite, not a no-write run. The build now skips a clip that holds the plan already (`keys_match`); that change came after this rehearsal and is unit-tested only (see "Not done, and why").
 
 Not shown by these runs:
 
@@ -283,5 +289,7 @@ Not shown by these runs:
 - `live place --overwrite` cutting clips, and a shot that covers the head transition of the first V1 clip. Neither ran on the real app.
 - The extend step for a still that comes in shorter than its shot. The placing measures ran `set_clip_duration` by hand, but the live still of round 1 needed no extend call.
 - A retimed clip (see "Not done, and why").
+- A `live keys set` re-run that writes nothing (`keys_match`), and a `live place` re-run that does
+  not switch the active sequence. Both came after these runs and are unit-tested only.
 - A run that holds the lease past the limit of 15 s (`MAX_HOLD_S`), so the breath between writes was not seen for these commands. The run that holds the lease longest is `live keys set` (23 entries in 9.8 s). `live place` took 12.2 s, but it does not hold the lease throughout.
 - A picture check of an applied effect. `live effect apply` checks the effect list that it reads back, and its `rendered` is always null.

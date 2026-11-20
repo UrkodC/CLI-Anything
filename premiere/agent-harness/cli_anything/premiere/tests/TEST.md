@@ -141,8 +141,8 @@ for the script tests (they skip without it).
 | `test_recipes_lut.py` | 172 | `live lut set` and `--prove`. |
 | `test_active.py` | 12 | `ActiveRun`: the two-session pattern for tools that act on the active sequence (switch, confirm, put back, a stop, a recovery marker). |
 | `test_results.py` | 27 | The per-entry result records and their printers: statuses, counts, the exit rule. |
-| `test_recipes_keys.py` | 215 | `live keys get` and `live keys set`: the key math on the v10 level plan, the plan check, the scripts in node, refusals, re-runs, stops. |
-| `test_recipes_place.py` | 38 | `live place`: the shot math on the v10 placement plan, `place_read.jsx` in node, refusals, half-done shots, stills, sound-only shots, stops and put-back. |
+| `test_recipes_keys.py` | 241 | `live keys get` and `live keys set`: the key math on the v10 level plan, the plan check, the scripts in node, refusals, re-runs, stops. |
+| `test_recipes_place.py` | 47 | `live place`: the shot math on the v10 placement plan, `place_read.jsx` in node, refusals, half-done shots, stills, sound-only shots, stops and put-back. |
 | `test_recipes_apply.py` | 28 | `live effect apply`: the order rule, refusals, the read after the run, a failed call, stops and put-back. |
 
 What the fakes cover (`fakes.py`, unless named):
@@ -177,7 +177,7 @@ The fakes do not show how Premiere itself behaves. That is what the end-to-end t
 Last run of the whole unit suite (2026-11-19, macOS, Python 3.14.7, pytest 9.2.0):
 
 ```
-1739 passed, 1 skipped in 203.32s (0:03:23)
+1774 passed, 1 skipped in 206.29s (0:03:26)
 ```
 
 The one skip is `test_live_e2e.py`, which needs the variable below.
@@ -229,6 +229,10 @@ Plan 3 added two more live rounds (details in `PREMIERE.md`, "Live checks of Pla
   re-run 25 skipped, 0 calls, 1.0 s), `live keys set` 23 entries (23 done in 9.8 s, the re-run
   rewrote the same keys), `live effect apply` on V1 (50 done in 11.9 s, the re-run 50 skipped in
   0.6 s). The original project was never opened, and the copy was closed without saving.
+- After these rounds, a `live keys set` re-run skips a clip that holds the plan already
+  (`keys_match`) and writes nothing, and a `live place` re-run with nothing to do no longer
+  switches the active sequence. Both are unit-tested only. The live test of the static re-run now
+  expects `keys_match`; it has not been run since that change.
 
 Not shown on the real app (they ran in unit tests only): a failed negative write, so the near
 value and the put-back; a plan long enough to pass the 15 s lease limit; a failed export that

@@ -335,6 +335,19 @@ def _own(clips, node_id: str, start: int, frame: int) -> list[dict]:
             and _near(int(c["start_ticks"]), start, frame)]
 
 
+def _near_misses(span: dict, node_id: str, start: int, frame: int) -> list[str]:
+    """The clips of the item on the shot's tracks that start more than half a frame and up to one frame from
+    `start`. overwrite_clip's own check (__isPlacedOn, tools/advanced.js lines 1082-1093) counts such a clip as the
+    item placed already, so the placement would not verify."""
+    found = []
+    for side in ("video", "audio"):
+        for c in span.get(side) or []:
+            if c.get("item") == node_id and c.get("start_ticks") is not None \
+                    and frame < 2 * abs(int(c["start_ticks"]) - start) <= 2 * frame:
+                found.append(f"{c.get('node_id')} at {_seconds(c['start_ticks'])} s")
+    return found
+
+
 def _marks_match(clip: dict, row: dict, F: float) -> bool:
     """The clip shows the media from src_in to src_in + frames / F, each within half an item frame."""
     if clip.get("in_ticks") is None or clip.get("out_ticks") is None:
@@ -437,6 +450,11 @@ def _judge(row: dict, item: dict | None, span: dict, frame: int, F: float, overw
             out["warnings"].append("The shot is there with only part of its streams, so it is placed again.")
         out["steps"] = [PLACE]
 
+    near = _near_misses(span, node, start, frame) if PLACE in out["steps"] else []
+    if near:
+        return refuse("placed_differently", f"a clip of item {node} starts within one frame of the planned start, "
+                      f"but not on it ({'; '.join(near)}). overwrite_clip would count the item as placed already. "
+                      "--overwrite does not cut it.")
     own = {id(c) for c in pictures + sounds}
     foreign = []
     if has_video or row["audio_only"]:
@@ -569,6 +587,8 @@ def _done(row: dict, plan: dict, span: dict, frame: int, F: float, item: dict) -
     if row["audio_only"]:
         if sound is None:
             return False, now, "the sound clip is not on the audio track at the start"
+        if not _marks_match(sound, row, F):
+            return False, now, "the sound clip's in and out points are not the planned ones"
         if any(c.get("item") == node for c in span["video"] or []):
             return False, now, "the picture clip of the item is still on the track"
         return True, now, None
@@ -596,12 +616,14 @@ def place_shots(client, make_session, plan: dict, *, sequence_id: str, sequence_
 
     Order:
     1. The plan is checked (resolve_shots): CliError("bad_plan") before any contact.
-    2. Session A (ActiveRun.prepare, switch=not dry_run): place_read reads the sequence, every item the plan
-       names, and the clips in each shot's span. The plan's fps must match the sequence (fps_mismatch). Per shot:
-       no_item, ambiguous_item, no_track, plan_overlap, no_sound, placed_differently refuse; "already placed" is
-       nothing to do; span_not_empty refuses unless overwrite (then a warning lists the clips that will be cut). A
-       half-done shot gets only its missing step. A refusal stops the run here unless skip_refused. dry_run returns
-       here with "planned".
+    2. Session A (ActiveRun.prepare; it switches the active sequence only when it is not a dry run and some shot
+       has a step to do, so a re-run with nothing to do writes nothing): place_read reads the sequence, every
+       item the plan names, and the clips in each shot's span. The plan's fps must match the sequence
+       (fps_mismatch). Per shot: no_item, ambiguous_item, no_track, plan_overlap, no_sound, placed_differently
+       (also a clip of the item that starts more than half a frame and up to one frame from the planned start,
+       whatever overwrite says) refuse; "already placed" is nothing to do; span_not_empty refuses unless
+       overwrite (then a warning lists the clips that will be cut). A half-done shot gets only its missing step.
+       A refusal stops the run here unless skip_refused. dry_run returns here with "planned".
     3. MCP session 1 (no lease): per shot set_item_in_out, then overwrite_clip, with the resolved node ID and the
        guard args. The first failure stops it (is_error, or data.verified not true).
     4. When a shot needs a second step (remove the picture of a sound-only shot, extend a still): unless the first
@@ -611,8 +633,10 @@ def place_shots(client, make_session, plan: dict, *, sequence_id: str, sequence_
     5. Session B (ActiveRun.finish) puts the active sequence back, then a read pass checks every shot that ran.
 
     Returns results.summary(records, warnings, sequence=..., marks=..., left_switched=..., stopped=...) and, with
-    dry_run, "dry_run": True and "planned". A record has the extras "calls" ([{"tool", "ok"}]) and "marks"
-    ({"in_seconds", "out_seconds"} that set_item_in_out applied, or None). Raises a CliError that carries this
+    dry_run, "dry_run": True and "planned". A record has the extras "calls" ([{"tool", "ok"}]), "marks"
+    ({"in_seconds", "out_seconds"} that set_item_in_out applied, or None) and "removed_picture" (the node ID of
+    the picture clip that remove_from_timeline was sent for, on a sound-only shot that the read after shows done,
+    else None; the sound clip kept is in "now"). Raises a CliError that carries this
     payload: refused, fps_mismatch, the error that stopped the run, not_done, or not_restored.
     """
     F, rows = resolve_shots(plan)
@@ -632,7 +656,7 @@ def place_shots(client, make_session, plan: dict, *, sequence_id: str, sequence_
                                                    "start_seconds": round(row["start_f"] / F, 6),
                                                    "frames": row["frames"], "src_in": row["src_in"]},
                                     name=row["name"])
-        record.update(calls=[], marks=None)
+        record.update(calls=[], marks=None, removed_picture=None)
         records.append(record)
     marks: dict[str, dict] = {}
     run = ActiveRun(client, make_session, sequence_id=sequence_id, sequence_name=sequence_name, project=project,
@@ -673,7 +697,10 @@ def place_shots(client, make_session, plan: dict, *, sequence_id: str, sequence_
         return plans
 
     try:
-        plans = run.prepare(check, switch=not dry_run)
+        # D2: switch only when some shot has a step to do (the same test as _work's todo list; _judge sets
+        # steps before some refusals, so the refusal and the skip are checked too).
+        plans = run.prepare(check, switch=lambda found: not dry_run and any(
+            p["refusal"] is None and p["skip"] is None and p["steps"] for p in found))
     except BaseException as exc:
         error = _run_error(exc)
         fault = run.finish()
@@ -748,8 +775,8 @@ def _work(run: ActiveRun, rows, plans, records, marks, F, body, queries, info, w
     """MCP session 1, the read between the sessions, MCP session 2. Fills work["error"] and the progress of each
     shot (work["progress"]); the records are judged after session B."""
     todo = [k for k, record in enumerate(records) if record["status"] == "not_run" and plans[k]["steps"]]
-    progress = work["progress"] = {k: {"fault": None, "flight": None, "placed": False, "second": None}
-                                   for k in todo}
+    progress = work["progress"] = {k: {"fault": None, "flight": None, "placed": False, "second": None,
+                                       "removed": None} for k in todo}
     work["attempted"] = []
     first = [k for k in todo if PLACE in plans[k]["steps"]]
     stopped_at = None
@@ -816,6 +843,8 @@ def _work(run: ActiveRun, rows, plans, records, marks, F, body, queries, info, w
             progress[k]["second"] = target
         elif target is not None:
             calls.append((k, target))
+            if target["tool"] == "remove_from_timeline":
+                progress[k]["removed"] = target["args"]["node_id"]     # named in the record when the shot is done
     if not calls:
         return
 
@@ -872,6 +901,7 @@ def _check_after(run: ActiveRun, rows, plans, records, F, body, queries, work) -
         fault = _fault_text(progress[k])
         if ok:
             results.mark_done(records[k], now)
+            records[k]["removed_picture"] = (progress.get(k) or {}).get("removed")
             if fault is not None:
                 records[k]["warnings"].append(f"A step reported a fault, but the read after shows the shot as "
                                               f"planned: {fault}")

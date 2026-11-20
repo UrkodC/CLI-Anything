@@ -166,7 +166,7 @@ def apply_effects(client, make_session, *, sequence_id: str, sequence_name=None,
         info = _shape(session.read(body, _read_args(run.sequence["id"], track)), run.sequence["id"])
         if info["total"] > CLIP_LIMIT:
             raise CliError("too_many_clips", f"Track V{track + 1} holds {info['total']} clips; this command reads "
-                                             f"at most {CLIP_LIMIT}. {NOT_SENT}")
+                                             f"at most {CLIP_LIMIT}. Nothing was written.")
         on_track = info["clips"]
         numbers = list(range(len(on_track))) if clips is None else list(clips)
         if not numbers:

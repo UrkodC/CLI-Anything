@@ -6,12 +6,12 @@ A record says what happened to one entry of the plan:
      "skip": None | "nothing_to_do" | "refused", "reason_code": str | None, "reason": str | None,
      "now": <what the read-back holds> | None, "error": str | None, "warnings": [str]}
 
-A recipe adds its own keys to a record (keys set: mode, moved; place: calls, marks, clips; apply: effect,
-effect_index). It starts every entry with new_record (status "not_run"), then marks it done, skipped or failed.
+A recipe adds its own keys to a record (keys set: mode, moved, interpreted; place: calls, marks, removed_picture;
+apply: effect, effect_index). It starts every entry with new_record (status "not_run"), then marks it done, skipped or failed.
 The mark functions change the record they get and return it. A later mark replaces the earlier outcome.
 
 Two kinds of "skipped":
-- NOTHING_TO_DO ("already placed", "has effect", "level, no change") counts as success;
+- NOTHING_TO_DO ("already placed", "has effect", "level, no change", keys that match the plan) counts as success;
 - REFUSED (a check failed, and --skip-refused let the run go on) does not.
 
 The exit rule is succeeded(): exit status 0 only when every entry is done, or skipped for nothing to do. So a

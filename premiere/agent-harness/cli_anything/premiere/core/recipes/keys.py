@@ -331,6 +331,9 @@ LEVEL_KEYS = ("node", "src_in", "src_out", "name", "scale", "max_deg", "clamped"
               "static_value")
 FPS_TOLERANCE = 1e-6        # an item frame rate this far from the sequence rate is an interpreted item (measure M6)
 NO_CHANGE = "level, no change"
+MATCH_TEXT = "Rotation and Scale already hold the plan's values"
+MATCH_TEXT_NO_SCALE = "Rotation already holds the plan's values"
+MAX_PLAN_SECONDS = 86400.0   # a time or a source mark of a plan is at most one day from 0 (no clip is longer)
 NOT_SENT = "Nothing was sent."
 STOPPED_SET = "Stopped by Ctrl-C or a stop signal. Check Premiere before another edit."
 _SCRIPT_TICKS = re.compile(r"[0-9]+")
@@ -347,7 +350,8 @@ def check_level_plan(plan: object) -> list[dict]:
     string), "src_in" and "src_out" (finite seconds of the media, src_out after src_in), "keys" (a list of
     {"time_seconds", "value"}, finite numbers, clip-relative seconds), "scale" (a finite number above 0, or null),
     and "static" and "static_value" as entry_mode reads them. "name" is a text when it is given. Any other key
-    passes. Raises CliError("bad_plan") with "entry <n>: ..." and "Nothing was sent." Returns the entries.
+    passes. A time or a source mark is at most MAX_PLAN_SECONDS from 0, so the tick math cannot overflow. Raises
+    CliError("bad_plan") with "entry <n>: ..." and "Nothing was sent." Returns the entries.
     """
     if not isinstance(plan, list) or not plan:
         raise _plan_fault("The level plan must be a JSON array with at least one entry.")
@@ -363,8 +367,9 @@ def check_level_plan(plan: object) -> list[dict]:
         if name is not None and not isinstance(name, str):
             raise _plan_fault(where + '"name" must be a text when it is given.')
         for key in ("src_in", "src_out"):
-            if not _finite(entry.get(key)):
-                raise _plan_fault(where + f'"{key}" must be a finite number of seconds.')
+            if not _finite(entry.get(key)) or abs(entry[key]) > MAX_PLAN_SECONDS:
+                raise _plan_fault(where + f'"{key}" must be a finite number of seconds, at most {MAX_PLAN_SECONDS:g} '
+                                          "from 0.")
         if not entry["src_out"] > entry["src_in"]:
             raise _plan_fault(where + '"src_out" must be after "src_in".')
         found = entry.get("keys")
@@ -374,6 +379,8 @@ def check_level_plan(plan: object) -> list[dict]:
             if not isinstance(key, dict) or not _finite(key.get("time_seconds")) or not _finite(key.get("value")):
                 raise _plan_fault(where + f'key {index} must be {{"time_seconds": ..., "value": ...}} with finite '
                                           "numbers.")
+            if abs(key["time_seconds"]) > MAX_PLAN_SECONDS:
+                raise _plan_fault(where + f"key {index}: time_seconds must be at most {MAX_PLAN_SECONDS:g} from 0.")
         scale = entry.get("scale")
         if scale is not None and not (_finite(scale) and scale > 0):
             raise _plan_fault(where + f'"scale" must be a number above 0, or null, not {scale!r}.')
@@ -499,7 +506,8 @@ def _frames_apart(a: int, b: int, frame: int) -> bool:
 def _plan_entry(number: int, entry: dict, mode: dict, record: dict, frame: int, *, scale: bool) -> dict:
     """The checks of one entry, in the order of the brief, and what would be written.
 
-    Returns {"refusal": None or (code, reason), "skip": None or NO_CHANGE, "interpreted", "warnings", "in_ticks",
+    Returns {"refusal": None or (code, reason), "skip": None or (code, reason) ("no_change" with NO_CHANGE, or
+    "keys_match" when the clip holds the plan already: see _matches), "interpreted", "warnings", "in_ticks",
     "out_ticks", "keys" ([{"seconds", "ticks", "media_ticks", "value", "moved_from"}]), "moved", "value" (static),
     "scale_name", "scale_now", "rotation_now", "write_scale"}."""
     out = {"refusal": None, "skip": None, "interpreted": None, "warnings": [], "in_ticks": None, "out_ticks": None,
@@ -515,7 +523,7 @@ def _plan_entry(number: int, entry: dict, mode: dict, record: dict, frame: int, 
             out["scale_name"], out["scale_now"] = motion["scale"].get("name"), motion["scale"].get("value")
         out["rotation_now"] = _rotation_now(motion.get("rotation"), out["in_ticks"])
     if mode["mode"] == "none":
-        out["skip"] = NO_CHANGE
+        out["skip"] = ("no_change", NO_CHANGE)
         return out
 
     def refuse(code: str, reason: str) -> dict:
@@ -545,9 +553,9 @@ def _plan_entry(number: int, entry: dict, mode: dict, record: dict, frame: int, 
                 f"the clip's item runs at {item_fps} fps, the sequence at {round(sequence_fps, 6)} fps")
         return refuse("slow_motion_unproven", f"{what}. Keys on an interpreted (slow motion) clip are not proven.")
     if out["interpreted"]:
-        out["warnings"].append(f"The clip's item is interpreted ({item_fps} fps; the sequence runs at "
-                               f"{round(sequence_fps, 6)} fps). Its keys are written in media time, as measure M6 "
-                               "proved for slow motion.")
+        out["warnings"].append(f"The clip's item runs at {item_fps} fps, not the sequence rate "
+                               f"({round(sequence_fps, 6)} fps). Its keys are written in media time, as measure M6 "
+                               "proved for an item interpreted for slow motion.")
     elif out["interpreted"] is None:
         out["warnings"].append("Premiere did not report the frame rate of the clip's item, so it is not known "
                                "whether the item is interpreted.")
@@ -582,7 +590,34 @@ def _plan_entry(number: int, entry: dict, mode: dict, record: dict, frame: int, 
                                 "moved_from": key["moved_from"]})
             if key["moved_from"] is not None:
                 out["moved"].append({"from_seconds": key["moved_from"], "to_seconds": seconds})
+    if _matches(out, entry, rotation, scale_prop, scale=scale):
+        out["skip"] = ("keys_match", MATCH_TEXT if scale else MATCH_TEXT_NO_SCALE)
+        out["write_scale"] = False
     return out
+
+
+def _matches(out: dict, entry: dict, rotation: dict, scale_prop: dict, *, scale: bool) -> bool:
+    """True when the clip holds what this entry would write (D1): then nothing is written.
+
+    Keys: Rotation is time-varying, and its keys are the planned ones (the same media ticks as strings, the values
+    within KEY_TOLERANCE; reads are 32-bit floats). Static: Rotation is not time-varying, and its value is within
+    KEY_TOLERANCE. With scale, Scale reads the plan's value too (effects.same_value). A null keyframed or keys, or a
+    Scale that cannot be read, is no match."""
+    if scale and not effects.same_value(scale_prop.get("value"), entry.get("scale")):
+        return False
+    varying = rotation.get("keyframed")
+    if out["mode"] == "static":
+        value = rotation.get("value")
+        return varying is False and _finite(value) and abs(value - out["value"]) <= KEY_TOLERANCE
+    found = rotation.get("keys")
+    if varying is not True or not isinstance(found, list) or len(found) != len(out["keys"]):
+        return False
+    read = {_tick(item.get("ticks")): item.get("value") for item in found}     # by ticks, as _rotation_error
+    for planned in out["keys"]:
+        value = read.get(planned["media_ticks"])
+        if planned["media_ticks"] not in read or not _finite(value) or abs(value - planned["value"]) > KEY_TOLERANCE:
+            return False
+    return len(read) == len(out["keys"])
 
 
 def _scale_entry(entry: dict, plan: dict) -> dict:
@@ -682,9 +717,9 @@ def _planned(number: int, entry: dict, check: dict, *, scale: bool) -> dict:
     return {"entry": number, "name": entry.get("name"), "node_id": entry["node"], "mode": check["mode"],
             "keys": [dict(key) for key in check["keys"]], "static_value": check["value"],
             "scale": {"now": check["scale_now"],
-                      "new": entry.get("scale") if scale and check["mode"] != "none" else None},
+                      "new": entry.get("scale") if scale and check["skip"] is None else None},
             "refusal": None if refusal is None else {"code": refusal[0], "reason": refusal[1]},
-            "skip": check["skip"]}
+            "skip": None if check["skip"] is None else check["skip"][1]}
 
 
 def set_keys(client: BridgeClient, plan: list[dict], *, sequence_id: str, sequence_name: str | None = None,
@@ -696,23 +731,29 @@ def set_keys(client: BridgeClient, plan: list[dict], *, sequence_id: str, sequen
 
     Order, in one WriteSession: target the sequence; keys_check.jsx reads every clip; one effects.resolve_entries
     for the Scale writes; every entry is checked (in this order: no_clip, clip_changed, retimed,
-    slow_motion_unproven, motion_layout, keyed, bad_length, negative_key, key_clash). An entry with no change is
-    skipped (nothing to do). A refusal stops the run before any write (results.refused_error) unless skip_refused.
-    dry_run stops here and returns the plan ("planned"). Then per entry, in plan order: the Scale with
+    slow_motion_unproven, motion_layout, keyed, bad_length, negative_key, key_clash). An entry with no change
+    ("no_change") or whose clip holds the plan already ("keys_match", see _matches) is skipped (nothing to do). A
+    refusal stops the run before any write (results.refused_error, with "dry_run" and "planned" when dry_run)
+    unless skip_refused. dry_run stops here and returns the plan ("planned"). Then per entry, in plan order: the
+    Scale with
     effects.write_entry (unless scale is False or the mode is "none"), then the Rotation with keys_write.jsx.
     Between entries the session breathes; when it gave Premiere back, the next entry is checked again, and a
     refusal then skips it and stops the run unless skip_refused.
 
     An entry is done when its Scale is stored and its Rotation reads back as written (the same ticks, values
     within KEY_TOLERANCE). Else it failed, with what the read back holds in "now", and the run goes on. A send
-    error "precondition" fails this entry only (nothing of that send landed). Any other code of
-    stops.NOT_SENT_CODES ends the run: this entry and the rest stay not_run. Any other send error fails the entry
-    with an unknown outcome and ends the run.
+    error "precondition" fails this entry only (nothing of that send landed; a Scale written before a refused
+    Rotation stays written, and the entry's warnings say so). Any other code of stops.NOT_SENT_CODES ends the run:
+    this entry and the rest stay not_run. Any other send error fails the entry with an unknown outcome and ends
+    the run. The error that ended the run is the error raised (with the payload); a run that ended without one
+    (a read back that failed, a refusal after a breathe) or that went on to the end raises
+    results.outcome_error when not every entry succeeded.
 
     Returns results.summary(records, warnings, sequence=...) (with dry_run, also "dry_run": True and "planned").
     A record has the extras "mode", "moved" ([{"from_seconds", "to_seconds"}]) and "interpreted". Raises
     CliError("bad_plan") before anything is sent, and after that a CliError that carries the payload
-    (results.refused_error, results.outcome_error, or the error that stopped the run).
+    (results.refused_error, the error that stopped the run, "interrupted", "recipe_error" for an Exception that is
+    neither, or results.outcome_error).
     """
     entries = check_level_plan(plan)
     if not (isinstance(sequence_id, str) and sequence_id):
@@ -746,9 +787,13 @@ def set_keys(client: BridgeClient, plan: list[dict], *, sequence_id: str, sequen
         record.update(mode=modes[number]["mode"], moved=[], interpreted=None)
         records.append(record)
     sequence = {"id": sequence_id, "name": sequence_name}
+    state: dict = {"planned": None}
 
     def payload(**extra) -> dict:
         return results.summary(records, warnings, sequence=sequence, **extra)
+
+    def dry_extra() -> dict:
+        return {"dry_run": True, "planned": state["planned"]} if dry_run and state["planned"] is not None else {}
 
     def apply(number: int, check: dict) -> None:
         """Put the check of one entry on its record: interpreted, moved, warnings, and a skip."""
@@ -757,7 +802,7 @@ def set_keys(client: BridgeClient, plan: list[dict], *, sequence_id: str, sequen
         record["moved"] = list(check["moved"])
         record["warnings"] = list(check["warnings"])
         if check["skip"] is not None:
-            results.mark_skipped(record, results.NOTHING_TO_DO, "no_change", check["skip"])
+            results.mark_skipped(record, results.NOTHING_TO_DO, *check["skip"])
         elif check["refusal"] is not None:
             results.mark_skipped(record, results.REFUSED, check["refusal"][0], check["refusal"][1])
 
@@ -772,33 +817,40 @@ def set_keys(client: BridgeClient, plan: list[dict], *, sequence_id: str, sequen
                 apply(number, check)
             resolved = _resolve(session, [n for n, c in enumerate(checks) if c["write_scale"] and c["refusal"] is None
                                           and c["skip"] is None], entries, checks)
+            state["planned"] = [_planned(n, e, c, scale=scale) for n, (e, c) in enumerate(zip(entries, checks))]
             refused = any(c["refusal"] is not None and c["skip"] is None for c in checks)
             if refused and not skip_refused:
-                raise results.refused_error(records, payload())
+                raise results.refused_error(records, payload(**dry_extra()))
             if dry_run:
-                return payload(dry_run=True, planned=[_planned(n, e, c, scale=scale)
-                                                      for n, (e, c) in enumerate(zip(entries, checks))])
-            _run(session, entries, checks, resolved, records, warnings, modes, scale=scale,
-                 skip_refused=skip_refused)
+                return payload(**dry_extra())
+            ended = _run(session, entries, checks, resolved, records, warnings, modes, scale=scale,
+                         skip_refused=skip_refused)
     except CliError as err:
         if getattr(err, "payload", None) is None:
-            err.payload = payload()
+            err.payload = payload(**dry_extra())
         raise
     except (KeyboardInterrupt, bridge.Interrupted):
         err = CliError("interrupted", STOPPED_SET)
-        err.payload = payload()
+        err.payload = payload(**dry_extra())
+        raise err from None
+    except Exception as exc:          # noqa: BLE001 - a fault in this code still reports every entry
+        err = CliError("recipe_error", f"{type(exc).__name__}: {exc}")
+        err.payload = payload(**dry_extra())
         raise err from None
     done = payload()
-    error = results.outcome_error(records, done)
+    error = ended or results.outcome_error(records, done)
     if error is not None:
+        error.payload = done
         raise error
     return done
 
 
 def _run(session: WriteSession, entries: list[dict], checks: list[dict], resolved: dict[int, dict],
-         records: list[dict], warnings: list[str], modes: list[dict], *, scale: bool, skip_refused: bool) -> None:
-    """The writes of set_keys, in plan order. Marks the records; returns when the run ends. A stop is raised
-    after the record of the entry is marked."""
+         records: list[dict], warnings: list[str], modes: list[dict], *, scale: bool,
+         skip_refused: bool) -> CliError | None:
+    """The writes of set_keys, in plan order. Marks the records. Returns the CliError that ended the run, or None
+    when the run went to the end or ended without one. A stop is raised, not returned: a stop in a write marks its
+    entry first, a stop elsewhere leaves the entry as it was."""
     started = False
     for number, entry in enumerate(entries):
         record = records[number]
@@ -812,7 +864,7 @@ def _run(session: WriteSession, entries: list[dict], checks: list[dict], resolve
             record["interpreted"], record["moved"], record["warnings"] = (check["interpreted"], list(check["moved"]),
                                                                           list(check["warnings"]))
             if check["skip"] is not None:
-                results.mark_skipped(record, results.NOTHING_TO_DO, "no_change", check["skip"])
+                results.mark_skipped(record, results.NOTHING_TO_DO, *check["skip"])
                 continue
             if check["refusal"] is not None:
                 results.mark_skipped(record, results.REFUSED, check["refusal"][0], check["refusal"][1])
@@ -820,17 +872,20 @@ def _run(session: WriteSession, entries: list[dict], checks: list[dict], resolve
                     continue
                 warnings.append(f"The run stopped at {_who(number, entry)}: it was checked again after Premiere was "
                                 "given back to other programs, and refused. The entries after it did not run.")
-                return
+                return None
             if check["write_scale"]:
                 resolved.update(_resolve(session, [number], entries, checks))
         started = True
-        if not _write_entry(session, number, entry, checks[number], resolved.get(number), record, warnings):
-            return
+        go_on, error = _write_entry(session, number, entry, checks[number], resolved.get(number), record, warnings)
+        if not go_on:
+            return error
+    return None
 
 
 def _write_entry(session: WriteSession, number: int, entry: dict, check: dict, found: dict | None, record: dict,
-                 warnings: list[str]) -> bool:
-    """Scale, then Rotation, of one entry; marks its record. Returns False when the run ends here."""
+                 warnings: list[str]) -> tuple[bool, CliError | None]:
+    """Scale, then Rotation, of one entry; marks its record. Returns (go on, the CliError that ended the run or
+    None)."""
     scale_now, scale_written = check["scale_now"], False
     where = _who(number, entry)
     try:
@@ -839,8 +894,10 @@ def _write_entry(session: WriteSession, number: int, entry: dict, check: dict, f
                 result = effects.write_entry(session, _scale_entry(entry, check), found)
             except CliError as err:
                 if getattr(err, "partial", None) is not None and not stops.is_stop(err):
-                    # An earlier send of this Scale landed (write_entry's put-back failed): what Scale holds is not
-                    # known, whatever the code of the failed send says.
+                    # write_entry sets partial when the outcome of this Scale is not known: a send after an
+                    # earlier one failed (a later attempt, or the put-back), or the first send failed with a code
+                    # outside stops.NOT_SENT_CODES (unknown_outcome, bad_reply). What Scale holds is not known,
+                    # whatever the code of the failed send says.
                     return _send_failed(CliError("unknown_outcome", err.message), "Scale", where, record, warnings,
                                         check, scale_now, scale_written=True)
                 return _send_failed(err, "Scale", where, record, warnings, check, scale_now, scale_written=False)
@@ -848,7 +905,7 @@ def _write_entry(session: WriteSession, number: int, entry: dict, check: dict, f
             if not result["stored"]:
                 results.mark_failed(record, f"Scale: {result['error']}. Rotation was not written.",
                                     now=_now(scale_now, check["rotation_now"]))
-                return True
+                return True, None
         try:
             reply = _write_rotation(session, entry, check)
         except CliError as err:
@@ -862,7 +919,7 @@ def _write_entry(session: WriteSession, number: int, entry: dict, check: dict, f
                                     + "; ".join(reply["set_errors"]), known=False)
         warnings.append(f"The run stopped at {where}: Rotation was written but could not be read back, so what it "
                         "holds is not known. Check this clip in Premiere. The entries after it did not run.")
-        return False
+        return False, None
     now = _now(scale_now, _after_now(check, reply))
     error = _rotation_error(check, reply)
     if error is None:
@@ -873,12 +930,13 @@ def _write_entry(session: WriteSession, number: int, entry: dict, check: dict, f
     else:
         detail = f" Errors: {'; '.join(reply['set_errors'])}." if reply["set_errors"] else ""
         results.mark_failed(record, f"Rotation: {error}.{detail}", now=now)
-    return True
+    return True, None
 
 
 def _send_failed(err: CliError, what: str, where: str, record: dict, warnings: list[str], check: dict,
-                 scale_now: object, *, scale_written: bool) -> bool:
-    """A send of this entry failed with err. Marks the record and says whether the run goes on."""
+                 scale_now: object, *, scale_written: bool) -> tuple[bool, CliError | None]:
+    """A send of this entry failed with err. Marks the record. Returns (go on, err when it ends the run). A stop
+    is raised."""
     text = f"{what}: {err.code}: {err.message}"
     written = (f"Scale was written ({scale_now}) before the {what} write failed; it stays written."
                if scale_written and what == "Rotation" else None)
@@ -890,15 +948,17 @@ def _send_failed(err: CliError, what: str, where: str, record: dict, warnings: l
     if err.code == "precondition":
         results.mark_failed(record, f"{text} Nothing of this {what} write was changed.",
                             now=_now(scale_now, check["rotation_now"]))
-        return True
+        if written:
+            record["warnings"].append(written)
+        return True, None
     if err.code in stops.NOT_SENT_CODES:
         if written:
             record["warnings"].append(written)
             record["now"] = _now(scale_now, check["rotation_now"])
         warnings.append(f"The run stopped at {where}: the {what} write was not sent ({err.code}: {err.message}). "
                         "This entry and the ones after it did not run.")
-        return False
+        return False, err
     results.mark_failed(record, text, known=False)
     warnings.append(f"The run stopped at {where}: the outcome of the {what} write is not known ({err.code}). Check "
                     "this clip in Premiere. The entries after it did not run.")
-    return False
+    return False, err

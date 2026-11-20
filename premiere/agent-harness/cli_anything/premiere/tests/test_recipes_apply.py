@@ -290,7 +290,7 @@ def test_too_many_clips(live, bridge_dir, capsys, tmp_path, model):  # noqa: F81
     model.change(add)
     code, out = run_apply(capsys, bridge_dir, model, "--track", "1", "--all", "--effect", "ProcAmp")
     assert code == 1 and out["code"] == "too_many_clips", out
-    assert "Nothing was sent." in out["error"]
+    assert "Nothing was written." in out["error"] and "Nothing was sent." not in out["error"]   # the track was read
     assert mcp_calls(tmp_path) == [] and model.writes == [] and live.sessions == 0
 
 

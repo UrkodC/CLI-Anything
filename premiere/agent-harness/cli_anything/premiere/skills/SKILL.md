@@ -306,14 +306,19 @@ entry:
 - `key_clash` (`live keys set`): two keys fall on the same frame of the clip. A key at the end
   moves to the last frame, so two end keys clash.
 - `no_change` (nothing to do, `live keys set`): the entry has no keys and is not `"static": true`.
+- `keys_match` (nothing to do, `live keys set`): the clip holds the plan already, so nothing is
+  written: its Rotation keys (the same media ticks, values within 0.0001) or its static Rotation,
+  and its Scale unless `--no-scale`. Interpolation is not compared; a key set to Bezier by hand is kept on a re-run.
 - `no_item`, `ambiguous_item` (`live place`): no project item has that node ID or name, or more
   than one has that name. Name the item by its node ID.
 - `no_track` (`live place`): the sequence has fewer video or audio tracks than the shot names.
 - `plan_overlap` (`live place`): the shot overlaps another shot of the plan on one track.
 - `no_sound` (`live place`): the shot is sound only (`audio_only`), and the item has no sound.
 - `placed_differently` (`live place`): the item is already at that start, but not as planned: with
-  other in and out points, as a picture without the sound of a sound-only shot, or as a still that
-  is longer than planned. `--overwrite` cannot place the same item at the same start.
+  other in and out points, as a picture without the sound of a sound-only shot, as a still that is
+  longer than planned, or as a clip that starts within one frame of the start but not on it
+  (`overwrite_clip` would count it as placed and fail). `--overwrite` cannot place the same item at
+  the same start.
 - `span_not_empty` (`live place`): clips lie in the span of the shot. Give `--overwrite` to cut
   them. A sound-only shot needs an empty picture span on its video track, also with `--overwrite`:
   name a spare track.
@@ -365,9 +370,14 @@ The three writers also take `--project PATH`, `--any-project`, `--lease-wait`, `
   `"static": true` gets one Rotation value and no keys. `--static-spread DEG` decides static or
   keys by the spread of the keys instead of the plan's flag, and a warning says when that changes
   an entry.
+- The Rotation write script checks the clip's in and out points again before it writes; the Scale
+  write does not. When the clip was trimmed after the check, Scale is written, Rotation is refused
+  (`precondition`), that entry fails and the run goes on. Its warnings say Scale was written: tell
+  the owner.
 - Slow motion: measure M6 proved the time base of keys on a clip whose item is interpreted to
-  another frame rate (`SLOW_MOTION_PROVEN` is true). Such a clip is written, with a warning that
-  its keys are in media time. A retimed clip (speed not 1, or reversed) is refused (`retimed`).
+  another frame rate (`SLOW_MOTION_PROVEN` is true). A clip whose item runs at another rate than
+  the sequence is written, with a warning that names the item's rate and says its keys are in
+  media time. A retimed clip (speed not 1, or reversed) is refused (`retimed`).
   Do not work round that. Most slow motion in the films is a speed change (2.5x or 5x slow), and
   those clips are refused today. How keys behave on them was not measured (open measure `mspeed`:
   `premiere-pro-mcp` 1.25.0 has no speed setter).
@@ -378,12 +388,16 @@ The three writers also take `--project PATH`, `--any-project`, `--lease-wait`, `
   (`audio_only`) puts its picture on its video track first and removes it again, so that track
   must be empty in the span, also with `--overwrite`: name a spare track. A still is told by its
   file extension, and it is extended to its planned length when it comes in shorter.
+- `place_read.jsx` sees a clip of the same item only when it overlaps the span by more than
+  half a frame. A 1-frame clip of that item that only touches the span edge (one frame before or
+  after the start) is not seen, and `overwrite_clip` may then stop the run with a server error
+  ("no verifiable new placement"). The run stops at that step and the read after judges the shot.
+  Nothing is corrupted.
 - `live place` and `live effect apply` make the target sequence active for every session while
   they run, and put the old one back. Tell the owner first. Do not run them while another session
-  works on another sequence. `live place` goes through the switch on every real run, also when
-  every shot is in place already: when another sequence is active, it makes the target active and
-  puts the old one back. `live effect apply` switches only when an entry has something to apply.
-  `live keys set` and every dry run never switch. When the target is active already, nothing is
+  works on another sequence. Both switch only when an entry has a step to do: a re-run with
+  nothing to do switches nothing and writes nothing. `live keys set` and every dry run never
+  switch. When the target is active already, nothing is
   switched. After a stop or a recovery the active sequence
   may stay switched: `left_switched` and the warnings name what to put back.
 - Effects: name them in render order: Gyroflow (when used), then ProcAmp, then Lumetri Color. A
@@ -407,17 +421,23 @@ One line per entry with its status, then the counts. With `--json`: `results` (p
 `name`, `target`, `status`, `skip`, `reason_code`, `reason`, `now`, `error`, `warnings`), `counts`
 (`done`, `skipped`, `refused`, `failed`, `not_run`), `first_not_run`, `stored`, `rendered` and
 `warnings`. `stored` is true when the run succeeded, null when an entry's outcome is unknown, and
-false otherwise. `rendered` is always null: nothing here checks a picture.
+false otherwise. A dry run writes nothing and marks no entry `done`, so its `stored` is false
+unless every entry has nothing to do: it is the verdict of the entries, not of a write.
+`rendered` is always null: nothing here checks a picture. A record whose outcome is unknown also
+has the key `unknown` set to true (its `now` is null); no other record has that key. Treat it as
+"the write may have landed".
 
 Other keys of the payload: `sequence` (all three commands), `left_switched` and `stopped`
 (`live place` and `live effect apply`), `marks` (`live place`: the item marks it set), and in a
-dry run `dry_run` (true) and `planned` (what each entry would get). A record also carries extras:
-`mode`, `moved` and `interpreted` (`live keys set`), `calls` and `marks` (`live place`), `effect`
-and `effect_index` (`live effect apply`).
+dry run `dry_run` (true) and `planned` (what each entry would get; also on a refused dry run). A
+record also carries extras: `mode`, `moved` and `interpreted` (`live keys set`), `calls`, `marks`
+and `removed_picture` (`live place`: the node ID of the picture clip removed for a sound-only
+shot, else null; the sound clip kept is in `now`), `effect` and `effect_index` (`live effect
+apply`).
 
 - `done`: written, and read back as planned.
 - `skipped` with `skip` set to `nothing_to_do`: success (`already_placed`, `has_effect`,
-  `no_change`). With `skip` set to `refused`: a check failed, and the entry is not success.
+  `keys_match`, `no_change`). With `skip` set to `refused`: a check failed, and the entry is not success.
 - `failed`: the write did not give the planned result, or its outcome is unknown.
 - `not_run`: the run stopped before this entry.
 
@@ -430,11 +450,16 @@ commands" above.
 ### What a re-run does
 
 - `live place`: a shot already in place is skipped (`already_placed`), a partial run is finished,
-  and a finished plan exits 0. It still goes through the switch step: when another sequence is
-  active, it makes the target active and puts the old one back.
+  and a finished plan exits 0. With nothing to do it does not switch the active sequence and
+  writes nothing.
 - `live effect apply`: a clip that holds the effect is skipped (`has_effect`), and a finished run
   exits 0.
-- `live keys set`: the keys are written again and read back, and the entry is `done` again. A clip
-  whose keys already match is not skipped.
+- `live keys set`: a clip that holds the plan already is skipped (`keys_match`) and nothing is
+  written to it: the same Rotation keys (media ticks, values within 0.0001) or the same static
+  Rotation, and the same Scale unless `--no-scale`. A clip that differs in any of these gets its
+  entry written again. Interpolation is not compared; a key set to Bezier by hand is kept on a re-run.
+
+The two no-write re-runs (`keys_match`, and `live place` with nothing to do) came after the live
+rounds and are unit-tested only.
 
 The live results are in `PREMIERE.md` ("Live checks of Plan 3").

@@ -1025,9 +1025,12 @@ def live_keys_set(ctx: click.Context, sequence_id: str, sequence_name: str | Non
     The interpolation of a key is the default of addKey. An entry with "static": true gets one Rotation value and no
     keys. An entry with no keys and "static": false is left alone (level, no change).
 
-    Per clip: Scale first, then Rotation. An entry is done when both read back as written. A failed entry does not
-    stop the others, except when a write was not sent or its outcome is unknown: then the run stops. The project is
-    not saved.
+    Per clip: Scale first, then Rotation. An entry is done when both read back as written. A clip that holds the
+    plan already (its Rotation and, unless --no-scale, its Scale) is skipped as nothing to do (keys_match), and
+    nothing is written to it. A failed entry does not stop the others. An entry refused inside its write script
+    (precondition: the clip changed after the check) fails, and the run goes on; the in and out points are checked
+    again in the Rotation write only, so a Scale written before it stays written, and the entry says so. When any
+    other write was not sent, or its outcome is unknown, the run stops there. The project is not saved.
 
     Run --dry-run first: it reads and checks every clip, shows what would be written, and writes nothing. Read
     every refusal. After a real run the exit status is 0 only when every entry is done or had nothing to do.
@@ -1106,11 +1109,13 @@ def live_place(ctx: click.Context, sequence_id: str, sequence_name: str | None, 
 
     Every shot is checked before the first write: the item (by node ID, or by a name only one item has), the
     tracks, overlaps inside the plan, and the clips already in the span. A shot that is already in place is
-    skipped, so a re-run finishes a partial run. A clip in the span is refused unless --overwrite. The plan's fps
-    must match the sequence.
+    skipped, so a re-run finishes a partial run. A clip in the span is refused unless --overwrite. A clip of the
+    same item that starts within one frame of the shot's start, but not on it, is refused, also with --overwrite.
+    The plan's fps must match the sequence.
 
     The tools work on the active sequence, so the command makes this sequence active and puts the old one back at
-    the end. While it runs, the sequence is active for every session that works in Premiere. The first failed
+    the end. It does so only when some shot has a step to do: a re-run with every shot in place writes nothing.
+    While it runs, the sequence is active for every session that works in Premiere. The first failed
     step stops the run. At the end each shot is read back: start to the frame, in and out to the item frame. The
     project is not saved.
 

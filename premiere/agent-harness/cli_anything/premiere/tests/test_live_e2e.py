@@ -1781,7 +1781,8 @@ def test_keys_set_replaces_keys(work_copy, tmp_path):
 
 def test_keys_set_static_and_rerun(work_copy, tmp_path):
     """"static": true with static_value -1.49 and --no-scale: done, Rotation has no keys and reads -1.49. The same
-    plan again: done again, exit 0 (a static write has no "already done")."""
+    plan again: skipped as nothing to do (reason_code keys_match), exit 0, nothing written. The skip on the re-run
+    was added after the live round of 2026-11-19 (which saw "done" again) and is unit-tested only so far."""
     copy_id = work_copy["id"]
     clip = _clip_on(copy_id, 0, 0)
     plan = _write_json(tmp_path, "level_static.json", [_level_entry(clip, static=True, static_value=-1.49)])
@@ -1789,8 +1790,12 @@ def test_keys_set_static_and_rerun(work_copy, tmp_path):
         data = _ok(run_cli(*_keys_set_args(work_copy, plan, "--no-scale"), timeout=PLAN_CMD_TIMEOUT_S))
         [record] = data["results"]
         print(f"keys set static ({attempt}): record {record}")
-        assert data["counts"] == _counts(done=1) and data["stored"] is True, data
-        assert record["status"] == "done" and record["mode"] == "static", record
+        if attempt == "first":
+            assert data["counts"] == _counts(done=1) and data["stored"] is True, data
+            assert record["status"] == "done" and record["mode"] == "static", record
+        else:
+            assert data["counts"] == _counts(skipped=1) and data["stored"] is True, data
+            assert record["skip"] == "nothing_to_do" and record["reason_code"] == "keys_match", record
         got = _keys_get(copy_id)
         print(f"keys set static ({attempt}): is_time_varying {got['is_time_varying']}, value {got['value']}")
         assert got["is_time_varying"] is False and got["keys"] == [], got
@@ -1886,8 +1891,9 @@ def test_place_on_a_spare_track(work_copy, app_state, tmp_path):
 
 def test_place_rerun_is_already_placed(work_copy, app_state, tmp_path):
     """One shot onto V2 at frame 400; the same command again: exit 0, the shot skipped as nothing to do
-    (reason_code already_placed), no MCP call (calls is []), the clips on the copy unchanged. The active sequence
-    is still switched and put back on the re-run (parked P-T6-1), so that is not asserted."""
+    (reason_code already_placed), no MCP call (calls is []), the clips on the copy unchanged. Since P-T6-1 was
+    fixed, a re-run with nothing to do does not switch the active sequence; that is unit-tested only
+    (test_recipes_place.py) and not asserted here."""
     copy_id = work_copy["id"]
     item = _testclip_item(copy_id)
     before = _node_ids(copy_id)

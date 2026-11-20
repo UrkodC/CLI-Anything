@@ -1072,16 +1072,134 @@ def test_level_v10_run(live, capsys, tmp_path):
 
 
 def test_rerun_is_safe(live, capsys, tmp_path):
+    # D1: a re-run of a finished plan writes nothing. Every entry is nothing to do with keys_match.
     model = level_model()
     code, first, _ = keys_set(live, capsys, tmp_path, model)
     assert code == 0
     snapshot = {node: (list(c["effects"][1]["properties"][4]["keys"] or []), c["effects"][1]["properties"][4]["value"])
                 for node, c in model.clips.items()}
-    code, out, _ = keys_set(live, capsys, tmp_path, model)
-    assert code == 0 and out["counts"]["done"] == 24 and out["stored"] is True
+    writes = list(model.writes)
+    code, out, panel = keys_set(live, capsys, tmp_path, model)
+    assert code == 0 and out["stored"] is True
+    assert out["counts"] == {"done": 0, "skipped": 24, "refused": 0, "failed": 0, "not_run": 0}
+    assert {(r["skip"], r["reason_code"]) for r in out["results"]} == {("nothing_to_do", "keys_match")}
+    assert model.writes == writes
+    assert seen(panel, WRITE_MARK) == [] and seen(panel, EFFECT_WRITE_MARK) == [] and seen(panel, RESOLVE_MARK) == []
     again = {node: (list(c["effects"][1]["properties"][4]["keys"] or []), c["effects"][1]["properties"][4]["value"])
              for node, c in model.clips.items()}
     assert again == snapshot
+
+
+def test_rerun_dry_run_says_keys_match(live, capsys, tmp_path):
+    data = level()[:2]
+    model = level_model(data)
+    assert keys_set(live, capsys, tmp_path, model, data)[0] == 0
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data, "--dry-run")
+    assert code == 0 and [p["skip"] for p in out["planned"]] == [keys.MATCH_TEXT] * 2
+    assert all(p["scale"]["new"] is None for p in out["planned"])
+    code, text, _err = human_set(live, capsys, tmp_path, model, data, "--dry-run")
+    assert code == 0 and "nothing to do" in text
+
+
+def test_rerun_with_one_part_changed_writes_that_entry(live, capsys, tmp_path):
+    data = level()[:3]
+    model = level_model(data)
+    assert keys_set(live, capsys, tmp_path, model, data)[0] == 0
+    first_key = model.rotation(data[0]["node"])["keys"][0]
+    model.rotation(data[0]["node"])["keys"][0] = (first_key[0], first_key[1] + 0.01)    # a key value off
+    model.scale(data[1]["node"])["value"] = float32(data[1]["scale"] + 0.5)             # Scale off
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 0 and [r["status"] for r in out["results"]] == ["done", "done", "skipped"]
+    assert out["results"][2]["reason_code"] == "keys_match"
+    # --no-scale: Scale is not compared, so only Rotation counts.
+    model.scale(data[1]["node"])["value"] = 100.0
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data, "--no-scale")
+    assert code == 0 and [r["reason_code"] for r in out["results"]] == ["keys_match"] * 3
+
+
+def test_breathe_then_check_again_finds_keys_match(live, capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_HOLD_S", 0.0)
+    data = level()[:2]
+    model = level_model(data)
+    assert keys_set(live, capsys, tmp_path, model, data)[0] == 0
+    for entry in data:                                       # both differ at the first check
+        prop = model.rotation(entry["node"])
+        prop["keys"][0] = (prop["keys"][0][0], prop["keys"][0][1] + 0.01)
+    node = data[1]["node"]
+    good = model.rotation(node)["keys"][0][1] - 0.01
+
+    def put_back():
+        prop = model.rotation(node)
+        prop["keys"][0] = (prop["keys"][0][0], good)
+    model.on_check[model.checks + 2] = put_back              # the check again before entry 1
+    writes = len(model.writes)
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 0 and [r["status"] for r in out["results"]] == ["done", "skipped"]
+    assert out["results"][1]["reason_code"] == "keys_match"
+    assert node not in {w[1] for w in model.writes[writes:]}
+
+
+def _check_record(*, keyframed=True, keys_read=None, value=None, scale_value=None, scale_keyframed=False) -> dict:
+    return {"found": True, "item_fps": 23.976023976024, "interpreted": False,
+            "clip": {"in_ticks": "0", "out_ticks": str(LENGTH), "start_ticks": "0", "end_ticks": str(LENGTH),
+                     "speed": 1, "reversed": False, "track_type": "video"},
+            "motion": {"effect_index": 1,
+                       "scale": {"name": "Scale", "matches": True, "value": scale_value, "keyframed": scale_keyframed},
+                       "rotation": {"name": "Rotation", "keyframed": keyframed, "keys": keys_read, "value": value}}}
+
+
+MATCH_ENTRY = {"node": "n1", "src_in": 0.0, "src_out": LENGTH / TPS, "scale": 104.4, "static": False,
+               "keys": [{"time_seconds": 0.0, "value": 1.26}, {"time_seconds": 1.0, "value": 1.01}]}
+MATCH_KEYS = [{"ticks": "0", "value": float32(1.26)}, {"ticks": str(TPS), "value": float32(1.01)}]
+
+
+def _match(entry=None, *, scale=True, **record) -> dict:
+    entry = dict(MATCH_ENTRY if entry is None else entry)
+    record = {"keys_read": MATCH_KEYS, "scale_value": float32(104.4), **record}
+    return keys._plan_entry(0, entry, keys.entry_mode(entry), _check_record(**record), FRAME, scale=scale)
+
+
+def test_plan_entry_keys_match():
+    check = _match()
+    assert check["skip"] == ("keys_match", keys.MATCH_TEXT) and check["refusal"] is None
+    assert check["write_scale"] is False
+
+
+@pytest.mark.parametrize("record, scale", [
+    ({"keys_read": [{"ticks": "0", "value": float32(1.26)}, {"ticks": str(TPS), "value": 1.0115}]}, True),
+    ({"keys_read": [{"ticks": "0", "value": float32(1.26)}, {"ticks": str(TPS + 1), "value": float32(1.01)}]}, True),
+    ({"keys_read": MATCH_KEYS[:1]}, True),
+    ({"keys_read": MATCH_KEYS + [{"ticks": str(2 * TPS), "value": 0.0}]}, True),
+    ({"keyframed": None}, True), ({"keyframed": False}, True), ({"keys_read": None}, True),
+    ({"scale_value": float32(104.5)}, True), ({"scale_value": None}, True), ({"scale_value": "104.4"}, True)])
+def test_plan_entry_keys_do_not_match(record, scale):
+    check = _match(**record, scale=scale)
+    assert check["skip"] is None and check["refusal"] is None and check["write_scale"] is True
+
+
+def test_plan_entry_keys_match_whatever_the_order_of_the_plan():
+    entry = {**MATCH_ENTRY, "keys": list(reversed(MATCH_ENTRY["keys"]))}
+    assert _match(entry)["skip"][0] == "keys_match"
+
+
+def test_plan_entry_keys_match_without_scale_ignores_scale():
+    check = _match(scale=False, scale_value=None)
+    assert check["skip"] == ("keys_match", keys.MATCH_TEXT_NO_SCALE)
+    assert _match(scale=False, keyframed=None)["skip"] is None
+
+
+def test_plan_entry_static_match():
+    entry = {**MATCH_ENTRY, "static": True, "static_value": -2.15}
+    assert _match(entry, keyframed=False, keys_read=[], value=float32(-2.15))["skip"][0] == "keys_match"
+    assert _match(entry, keyframed=False, keys_read=[], value=float32(-2.16))["skip"] is None
+    assert _match(entry, keyframed=True, keys_read=MATCH_KEYS, value=float32(-2.15))["skip"] is None
+    assert _match(entry, keyframed=None, keys_read=[], value=float32(-2.15))["skip"] is None
+    assert _match(entry, keyframed=False, keys_read=[], value=None)["skip"] is None
+
+
+def test_plan_entry_no_change_is_a_code_and_a_reason():
+    entry = {**MATCH_ENTRY, "keys": []}
+    assert _match(entry)["skip"] == ("no_change", keys.NO_CHANGE)
 
 
 def test_scale_before_rotation(live, capsys, tmp_path):
@@ -1155,7 +1273,9 @@ def test_retimed_and_slow_motion(live, capsys, tmp_path, monkeypatch):
     assert [r["reason_code"] for r in out["results"][:2]] == ["retimed", "retimed"]
     third = out["results"][2]
     assert third["status"] == "done" and third["interpreted"] is True                  # SLOW_MOTION_PROVEN
-    assert any("interpreted" in w for w in third["warnings"])
+    # M8: the read compares the item's rate with the sequence rate; it does not know the item is interpreted.
+    assert any("runs at" in w and "not the sequence rate" in w for w in third["warnings"])
+    assert not any("is interpreted" in w for w in third["warnings"])
     monkeypatch.setattr(keys, "SLOW_MOTION_PROVEN", False)
     model = level_model(data)
     model.clips[data[2]["node"]]["item_fps"] = INTERPRETED_FPS
@@ -1255,6 +1375,7 @@ def test_in_script_refusal_after_the_check(live, capsys, tmp_path):
     assert record["status"] == "failed" and results.UNKNOWN not in record and "in point" in record["error"]
     assert (rotation_keys(model, node), model.rotation(node)["value"]) == old            # Rotation unchanged
     assert record["now"]["scale"] == float32(data[1]["scale"])                         # the new Scale stays
+    assert any("Scale was written" in w for w in record["warnings"])                   # M4
     assert out["results"][2]["status"] == "done" and out["stored"] is False
 
 
@@ -1285,7 +1406,8 @@ def test_not_applied_ends_the_run(live, capsys, tmp_path, monkeypatch):
     model = level_model(data)
     fail_keys_write(monkeypatch, data[3]["node"], CliError("not_applied", "Premiere did not pick up the command."))
     code, out, _ = keys_set(live, capsys, tmp_path, model, data)
-    assert code == 1 and out["code"] == "not_done"
+    assert code == 1 and out["code"] == "not_applied"                                  # I2: the error that ended it
+    assert "results" in out and out["counts"]["done"] == 3
     assert [r["status"] for r in out["results"]] == ["done"] * 3 + ["not_run"] * 3
     assert out["first_not_run"] == 3 and out["stored"] is False
     assert any("Scale" in w for w in out["results"][3]["warnings"])                   # Scale of entry 3 was written
@@ -1298,7 +1420,7 @@ def test_unknown_outcome_stops(live, capsys, tmp_path, monkeypatch):
     model = level_model(data)
     fail_keys_write(monkeypatch, data[1]["node"], CliError("unknown_outcome", "The panel did not answer in time."))
     code, out, _ = keys_set(live, capsys, tmp_path, model, data)
-    assert code == 1 and out["stored"] is None
+    assert code == 1 and out["stored"] is None and out["code"] == "unknown_outcome"
     record = out["results"][1]
     assert record["status"] == "failed" and record[results.UNKNOWN] is True and record["now"] is None
     assert set(record) == RECORD_KEYS | {results.UNKNOWN}
@@ -1310,10 +1432,34 @@ def test_unreadable_read_back_is_unknown(live, capsys, tmp_path):
     model = level_model(data)
     model.unreadable.add(data[1]["node"])
     code, out, _ = keys_set(live, capsys, tmp_path, model, data)
-    assert code == 1 and out["stored"] is None
+    assert code == 1 and out["stored"] is None and out["code"] == "not_done"          # no error ended it
     record = out["results"][1]
     assert record["status"] == "failed" and record[results.UNKNOWN] is True and "read back" in record["error"]
     assert out["results"][2]["status"] == "not_run" and out["first_not_run"] == 2
+
+
+def test_recovery_required_ends_the_run_with_its_code(live, capsys, tmp_path, monkeypatch):
+    data = level()[:3]
+    model = level_model(data)
+    fail_keys_write(monkeypatch, data[1]["node"], CliError("recovery_required", "A recovery is open."))
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "recovery_required" and out["error"] == "A recovery is open."
+    assert [r["status"] for r in out["results"]] == ["done", "not_run", "not_run"] and out["stored"] is False
+    assert any("not sent" in w for w in out["warnings"])
+
+
+def test_a_partial_scale_write_ends_with_unknown_outcome(live, capsys, tmp_path, monkeypatch):
+    data = level()[:2]
+    model = level_model(data)
+
+    def write_entry(session, entry, found):
+        err = CliError("not_applied", "the put-back was not picked up")
+        err.partial = {"attempts": 1}
+        raise err
+    monkeypatch.setattr(keys.effects, "write_entry", write_entry)
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "unknown_outcome" and out["stored"] is None
+    assert out["results"][0][results.UNKNOWN] is True and out["results"][1]["status"] == "not_run"
 
 
 def test_interrupted_rotation_write_ends_the_run(live, capsys, tmp_path, monkeypatch):
@@ -1396,6 +1542,33 @@ def test_breathe_then_refused_goes_on_with_skip_refused(live, capsys, tmp_path, 
     assert [r["status"] for r in out["results"]] == ["done", "done", "skipped", "done"]
 
 
+def test_dry_run_with_a_refusal_carries_the_plan(live, capsys, tmp_path, sends):
+    # M5: as place and apply, a refused dry run still shows what would be written.
+    data = level()[:3]
+    model = level_model(data)
+    model.clips[data[1]["node"]]["in_ticks"] += FRAME
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data, "--dry-run")
+    assert code == 1 and out["code"] == "refused" and out["dry_run"] is True
+    assert len(out["planned"]) == 3 and out["planned"][1]["refusal"]["code"] == "clip_changed"
+    assert out["planned"][0]["refusal"] is None and out["planned"][0]["mode"] == "keys"
+    assert model.writes == [] and not any(sends)
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "refused" and "planned" not in out and "dry_run" not in out
+
+
+def test_an_unexpected_fault_is_a_recipe_error_with_the_payload(live, capsys, tmp_path, monkeypatch):
+    # M6: an Exception that is neither a CliError nor a stop.
+    data = level()[:2]
+    model = level_model(data)
+
+    def broken(*a, **k):
+        raise ValueError("a fault in the check")
+    monkeypatch.setattr(keys, "_plan_entry", broken)
+    code, out, _ = keys_set(live, capsys, tmp_path, model, data)
+    assert code == 1 and out["code"] == "recipe_error" and "ValueError: a fault in the check" in out["error"]
+    assert [r["status"] for r in out["results"]] == ["not_run", "not_run"] and model.writes == []
+
+
 def test_static_spread_override_warns(live, capsys, tmp_path):
     model = level_model()
     code, out, _ = keys_set(live, capsys, tmp_path, model, None, "--static-spread", "0.9")
@@ -1416,6 +1589,12 @@ def test_static_spread_override_warns(live, capsys, tmp_path):
     ('[{"node": "x", "src_in": 0, "src_out": 1, "scale": 0, "keys": []}]', "scale"),
     ('[{"node": "x", "src_in": 0, "src_out": 1, "scale": 100, "keys": [], "static": true}]', "static_value"),
     ('[{"node": "x", "src_in": 0, "src_out": NaN, "scale": 100, "keys": []}]', "not valid JSON"),
+    ('[{"node": "x", "src_in": 1e300, "src_out": 2e300, "scale": 100, "keys": []}]', "src_in"),
+    ('[{"node": "x", "src_in": -1e300, "src_out": 1, "scale": 100, "keys": []}]', "src_in"),
+    ('[{"node": "x", "src_in": 0, "src_out": 1, "scale": 100, "keys": [{"time_seconds": 1e300, "value": 0}]}]',
+     "key 0"),
+    ('[{"node": "x", "src_in": 0, "src_out": 1, "scale": 100, "keys": [{"time_seconds": -1e300, "value": 0}]}]',
+     "key 0"),
 ])
 def test_plan_file_faults(live, capsys, tmp_path, sends, text, where):
     code, out, panel = keys_set(live, capsys, tmp_path, KeysModel(), text)
@@ -1503,6 +1682,9 @@ def test_keys_set_help(capsys):
     lowered = text.lower()
     assert "replace the old" in lowered and "one frame before the clip end" in lowered
     assert "addkey" in lowered and "not saved" in lowered
+    # M7: a precondition fails that entry only; D1: a matching clip is skipped.
+    assert "when a write was not sent" not in lowered
+    assert "refused inside its write script" in lowered and "keys_match" in lowered
 
 
 # ---------- the two new scripts, in node ----------

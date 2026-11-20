@@ -427,6 +427,18 @@ def test_rerun_skips_placed_shots(live, bridge_dir, capsys, tmp_path, model):  #
     assert len(mcp_calls(tmp_path)) == before and live.sessions == 1
 
 
+def test_rerun_with_nothing_to_do_does_not_switch(live, bridge_dir, capsys, tmp_path, model):  # noqa: F811
+    # D2: the active sequence is switched only when some shot has a step to do.
+    plan = three(model)
+    assert run_place(capsys, bridge_dir, model, tmp_path, plan)[0] == 0
+    writes = list(model.writes)
+    assert writes == [("activate", "s1"), ("activate", "o1")]
+    code, out = run_place(capsys, bridge_dir, model, tmp_path, plan)
+    assert code == 0 and out["ok"] is True and out["stored"] is True, out
+    assert model.writes == writes and model.load()["active"] == "o1"
+    assert out["left_switched"] is None
+
+
 def test_same_item_twice(live, bridge_dir, capsys, tmp_path, model):  # noqa: F811
     model.add_item("000f4257")
     plan = {"fps": "24000/1001", "shots": [shot("000f4257", 0, 20, src_in_f=3, audio_track=1),
@@ -518,6 +530,30 @@ def test_placed_differently(live, bridge_dir, capsys, tmp_path, model):  # noqa:
     assert mcp_calls(tmp_path) == []
 
 
+@pytest.mark.parametrize("offset_ticks, refused", [
+    (FRAME, True), (FRAME // 2 + 1, True), (-FRAME, True), (FRAME // 2, False), (FRAME + 1, False)])
+def test_same_item_within_one_frame_is_placed_differently(live, bridge_dir, capsys, tmp_path, model,  # noqa: F811
+                                                          offset_ticks, refused):
+    # I3: the server's check counts a clip of the item within one frame of the start as placed already, so
+    # overwrite_clip would fail. Refused also with --overwrite, and nothing is sent.
+    model.add_item("item1")
+    model.add_clip("item1", node_id="near", track=0, start_f=0, frames=48, in_f=10)
+    model.change(lambda data: [c.__setitem__("start_ticks", 24 * FRAME + offset_ticks)
+                               for c in data["clips"] if c["node_id"] == "near"])
+    model.change(lambda data: [c.__setitem__("end_ticks", c["start_ticks"] + 48 * FRAME)
+                               for c in data["clips"] if c["node_id"] == "near"])
+    plan = {"fps": "24000/1001", "shots": [shot("item1", 24)]}
+    if refused:                                              # a real run: nothing is sent and nothing switched
+        code, out = run_place(capsys, bridge_dir, model, tmp_path, plan, "--overwrite")
+        record = out["results"][0]
+        assert code == 1 and out["code"] == "refused", out
+        assert record["reason_code"] == "placed_differently" and "within one frame" in record["reason"]
+        assert mcp_calls(tmp_path) == [] and model.writes == [] and live.sessions == 0
+    else:
+        code, out = run_place(capsys, bridge_dir, model, tmp_path, plan, "--overwrite", "--dry-run")
+        assert out["results"][0]["reason_code"] != "placed_differently", out
+
+
 def test_plan_overlap_and_fps(live, bridge_dir, capsys, tmp_path, model):  # noqa: F811
     plan = three(model)
     plan["shots"][2]["start_f"] = 90
@@ -567,6 +603,62 @@ def test_sound_only_shot(live, bridge_dir, capsys, tmp_path, model):  # noqa: F8
     assert out["results"][0]["now"]["video"] is None and out["results"][0]["now"]["audio"]["node_id"] == "n0002"
     assert live.sessions == 2
     assert model.load()["active"] == "o1"
+
+
+def test_sound_only_records_both_clips(live, bridge_dir, capsys, tmp_path, model):  # noqa: F811
+    # M9 (design section 8): the result names the sound clip kept and the picture clip removed.
+    model.add_item("item1")
+    plan = {"fps": "24000/1001", "shots": [shot("item1", 0, track=2, audio_track=1, audio_only=True)]}
+    code, out = run_place(capsys, bridge_dir, model, tmp_path, plan)
+    assert code == 0, out
+    record = out["results"][0]
+    assert record["removed_picture"] == "n0001" and record["now"]["audio"]["node_id"] == "n0002"
+    three_out = run_place(capsys, bridge_dir, model, tmp_path, three(model, ("item7", "item8", "item9")))[1]
+    assert all(r["removed_picture"] is None for r in three_out["results"])
+
+
+def test_sound_only_names_the_removed_picture_when_the_call_said_no(live, bridge_dir, capsys, tmp_path,  # noqa: F811
+                                                                    model):
+    # The remove call reports a fault, but the read after shows the shot done: the record still names the
+    # picture clip that was removed.
+    model.add_item("item1")
+    plan = {"fps": "24000/1001", "shots": [shot("item1", 0, track=2, audio_track=1, audio_only=True)]}
+
+    class Unverified:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self.inner.__exit__(*exc)
+
+        def call(self, name, arguments, timeout_s=120.0):
+            reply = self.inner.call(name, arguments, timeout_s=timeout_s)
+            if name == "remove_from_timeline":
+                reply = {**reply, "structured": {"data": {"verified": False}}}
+            return reply
+    live.wrap = lambda n, session: Unverified(session) if n == 2 else session
+    code, out = run_place(capsys, bridge_dir, model, tmp_path, plan)
+    record = out["results"][0]
+    assert record["status"] == "done" and record["removed_picture"] == "n0001", out
+    assert any("reported a fault" in w for w in record["warnings"])
+
+
+def test_sound_only_done_needs_the_planned_marks():
+    # I1: a sound-only shot is done only when the sound clip shows the planned media.
+    row = {"audio_only": True, "start_f": 0, "frames": 48, "src_in": 10 / F, "item_fps": F}
+    sound = {"node_id": "a1", "item": "i1", "start_ticks": "0", "end_ticks": str(48 * FRAME),
+             "in_ticks": str(10 * FRAME), "out_ticks": str(58 * FRAME)}
+    plan = {"node_id": "i1"}
+    ok, _now, why = place._done(row, plan, {"video": [], "audio": [sound]}, FRAME, F, {})
+    assert ok is True and why is None
+    wrong = {**sound, "in_ticks": str(99 * FRAME), "out_ticks": str(147 * FRAME)}
+    ok, now, why = place._done(row, plan, {"video": [], "audio": [wrong]}, FRAME, F, {})
+    assert ok is False and why == "the sound clip's in and out points are not the planned ones"
+    assert now["audio"]["node_id"] == "a1"
 
 
 def test_sound_only_half_done(live, bridge_dir, capsys, tmp_path, model):  # noqa: F811

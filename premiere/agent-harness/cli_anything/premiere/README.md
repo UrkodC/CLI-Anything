@@ -226,10 +226,21 @@ and writes nothing. It does not switch the active sequence. Read every refusal b
 
 Each entry gets a status:
 - `done`: written, and read back as planned.
-- `skipped`: not run. There are two kinds. Nothing to do (`already_placed`, `has_effect`, or a
-  level entry with no change) counts as success. Refused (a check failed) does not.
+- `skipped`: not run. There are two kinds. Nothing to do (`already_placed`, `has_effect`,
+  `keys_match`, or a level entry with no change, `no_change`) counts as success. Refused (a check
+  failed) does not.
 - `failed`: the write did not give the planned result, or its outcome is unknown (it may have landed).
+  A record whose outcome is unknown also has the key `unknown` set to `true`, and its `now` is
+  `null`. No other record has that key.
 - `not_run`: the run stopped before this entry.
+
+With `--json` a run prints `results` (one record per entry), `counts`, `first_not_run`, `stored`,
+`rendered` (always `null`) and `warnings`. `stored` is `true` when every entry is `done` or
+skipped for nothing to do, `null` when an entry's outcome is unknown, and `false` otherwise. A dry
+run writes nothing and marks no entry `done`, so its `stored` is `false` unless every entry has
+nothing to do: read it as the verdict of the entries, not of a write. A `live place` record also
+names the clips: `now` gives the clips in place, and for a sound-only shot `removed_picture`
+gives the node ID of the picture clip that was removed.
 
 A refusal stops the run before the first write: the error is `refused`, and nothing was written. With
 `--skip-refused` the other entries run, and the refused ones stay `skipped`. After a real run the
@@ -239,23 +250,35 @@ run exits 1 on a refusal unless `--skip-refused` is given.
 
 What a re-run does:
 - `live place` skips a shot that is already in place (`already_placed`). A re-run finishes a partial
-  run, and exits 0 when everything is in place. It still goes through the switch step: when another
-  sequence is active, it makes the target active and puts the old one back, though it places
-  nothing.
+  run, and exits 0 when everything is in place. It switches the active sequence only when some shot
+  has a step to do, so a re-run with every shot in place writes nothing.
 - `live effect apply` skips a clip that holds the effect already (`has_effect`). `--allow-second`
   applies a second one.
-- `live keys set` writes the keys again, and reads back the same keys. It does not skip a clip whose
-  keys already match.
+- `live keys set` skips a clip that holds the plan already (`keys_match`): its Rotation keys (the
+  same media ticks, values within 0.0001) or its static Rotation, and its Scale unless
+  `--no-scale`. Nothing is written to it. A clip that differs in any of these gets the whole entry
+  written again. Interpolation is not compared; a key set to Bezier by hand is kept on a re-run.
+
+The two no-write re-runs (`keys_match`, and `live place` with nothing to do) came after the live
+rounds of 2026-11-19 and are unit-tested only.
 
 Things to know:
 - New keys replace the old Rotation keys of the clip. A key at the clip end, or less than half a
   frame before it, moves to one frame before the end, and the output lists it.
+- The Rotation write script checks the clip's in and out points again before it writes; the Scale
+  write does not. When the clip was trimmed after the check, Scale is written, Rotation is refused
+  (`precondition`), the entry fails and the run goes on. The entry's warnings say Scale was written.
 - Slow motion clips (an item interpreted to another frame rate) are written, with a warning.
   Clips with a speed change or reversed are refused (`retimed`). Most slow motion in the films is a
   speed change (2.5x or 5x slow), so those clips are refused today. How keys behave on them was not
   measured (open measure `mspeed`: `premiere-pro-mcp` 1.25.0 has no speed setter).
 - Placing is overwrite only. The marks of the project item stay as set, and the output lists them.
   A clip in the span of a shot is refused unless you give `--overwrite`.
+- `place_read.jsx` sees a clip of the same item only when it overlaps the span by more than
+  half a frame. A 1-frame clip of that item that only touches the span edge (one frame before or
+  after the start) is not seen, and `overwrite_clip` may then stop the run with a server error
+  ("no verifiable new placement"). The run stops at that step and the read after judges the shot.
+  Nothing is corrupted.
 - `live place` and `live effect apply` make the target sequence active for every session while they
   run, and put the old one back. Do not run them while another session works on another sequence.
   Tell the owner first.
