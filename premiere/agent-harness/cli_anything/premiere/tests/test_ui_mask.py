@@ -160,3 +160,72 @@ def test_track_by_key_refuses_one_direction(tmp_path):
         ui_mask.track(PROCESS, tmp_path / "Test Claude.prproj", "forward", by="key", run=screen.run, run_js=screen.run_js,
                       capture=screen.capture, sleep=screen.sleep)
     assert err.value.code == "bad_direction" and screen.scripts == []
+
+
+def test_ellipse_drags_from_the_top_left_to_the_bottom_right_of_the_grown_box(tmp_path):
+    frame = cv2.resize(_frame(), (1920, 1080), interpolation=cv2.INTER_NEAREST)
+    cv2.imwrite(str(tmp_path / "f.png"), frame)
+    screen = Screen(shot=_shot_with(frame, 960, 344, 1400))
+    result = ui_mask.ellipse_mask(PROCESS, tmp_path / "f.png", (0.5, 0.2, 0.1, 0.2), grow=(0.0, 0.1), run=screen.run, run_js=screen.run_js,
+                                  capture=screen.capture, sleep=screen.sleep, display_points=1512)
+    x0, y0, x1, y1 = result["dragged_points"]
+    assert abs(x0 - (960 + 0.5 * 1400) / 2) < 6 and abs(x1 - (960 + 0.6 * 1400) / 2) < 6
+    assert abs(y0 - (344 + 0.18 * 787.5) / 2) < 6 and abs(y1 - (344 + 0.42 * 787.5) / 2) < 6
+    assert any("key code 14 using {control down, option down, command down}" in s for s in screen.scripts)
+    assert '"from": [' in screen.pointer_args[-1] and '"to": [' in screen.pointer_args[-1]
+
+
+def test_ellipse_refuses_a_box_outside_the_frame(tmp_path):
+    screen = Screen()
+    with pytest.raises(CliError) as err:
+        ui_mask.ellipse_mask(PROCESS, tmp_path / "f.png", (0.95, 0.2, 0.2, 0.2), run=screen.run, run_js=screen.run_js,
+                             capture=screen.capture, sleep=screen.sleep, display_points=1512)
+    assert err.value.code == "bad_box" and screen.scripts == []
+
+
+def _shot_with_feather(rows):
+    tpl = cv2.imread(str(ui_mask.FEATHER_ASSET))
+    shot = np.full((1964, 3024, 3), 35, np.uint8)
+    for x, y in rows:
+        shot[y:y + tpl.shape[0], x:x + tpl.shape[1]] = tpl
+    return shot
+
+
+def test_feather_clicks_the_value_and_types_the_number():
+    screen = Screen(shot=_shot_with_feather([(186, 572)]))
+    result = ui_mask.mask_feather(PROCESS, 50, run=screen.run, run_js=screen.run_js, capture=screen.capture, sleep=screen.sleep,
+                                  display_points=1512)
+    assert result["typed"] == "50" and result["clicked_points"] == [(186 + 207) / 2, (572 + 20) / 2]
+    assert any('keystroke "50"' in s for s in screen.scripts) and any(s.endswith("key code 36") for s in screen.scripts)
+
+
+def test_feather_refuses_when_two_rows_show():
+    screen = Screen(shot=_shot_with_feather([(186, 572), (186, 900)]))
+    with pytest.raises(CliError) as err:
+        ui_mask.mask_feather(PROCESS, 50, run=screen.run, run_js=screen.run_js, capture=screen.capture, sleep=screen.sleep,
+                             display_points=1512)
+    assert err.value.code == "feather_not_found" and screen.pointer_args == []
+    assert not any("keystroke" in s for s in screen.scripts)
+
+
+def test_feather_refuses_a_value_out_of_range():
+    screen = Screen()
+    with pytest.raises(CliError) as err:
+        ui_mask.mask_feather(PROCESS, 5000, run=screen.run, run_js=screen.run_js, capture=screen.capture, sleep=screen.sleep)
+    assert err.value.code == "bad_value" and screen.scripts == []
+
+
+def test_track_done_by_playhead_waits_until_it_stops(tmp_path):
+    screen = Screen()
+    positions = iter(["10", "20", "30"] + ["30"] * 20)
+    result = ui_mask.track(PROCESS, tmp_path / "Test Claude.prproj", "both", by="key", run=screen.run, run_js=screen.run_js,
+                           capture=screen.capture, sleep=screen.sleep, playhead=lambda: next(positions))
+    assert result["tracked"] is True and result["done_by"] == "playhead" and result["playhead"] == "30"
+
+
+def test_track_done_by_playhead_reports_not_started_when_it_never_moves(tmp_path):
+    screen = Screen()
+    with pytest.raises(CliError) as err:
+        ui_mask.track(PROCESS, tmp_path / "Test Claude.prproj", "both", by="key", run=screen.run, run_js=screen.run_js,
+                      capture=screen.capture, sleep=screen.sleep, playhead=lambda: "500")
+    assert err.value.code == "not_started"

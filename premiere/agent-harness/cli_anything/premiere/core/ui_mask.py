@@ -24,9 +24,12 @@ from typing import Callable
 from cli_anything.premiere.core import ui
 from cli_anything.premiere.errors import CliError
 
-KEY_O, KEY_V, KEY_T = 31, 9, 17                       # virtual key codes: O (Object Mask tool with Cmd+Opt), V (pointer tool), T
+KEY_O, KEY_V, KEY_T, KEY_E, KEY_RETURN = 31, 9, 17, 14, 36   # also E (Ellipse Mask tool) and Return
 TRACK_KEY_MODIFIERS = ("control", "option", "command")   # the owner's key for "Track mask" (cmd.track.bidirectional): Ctrl+Opt+Cmd+T
 TRACKER_ASSET = Path(__file__).parent / "assets" / "tracker_buttons_2x.png"
+FEATHER_ASSET = Path(__file__).parent / "assets" / "feather_row_2x.png"   # the stopwatch and the word "Feather" of a mask row
+FEATHER_VALUE_DX = 207                                # the value sits this many capture pixels right of the template's left edge
+OWNER_KEY_MODIFIERS = ("control", "option", "command")   # the owner's keys: +T Track mask, +E Ellipse Mask Tool, +H HSL Mask Tool, +I Invert mask
 TRACKER_BUTTONS = {"back1": 0.085, "backward": 0.245, "both": 0.408, "forward": 0.568, "forward1": 0.728}   # centre, share of width
 PICTURE_MIN_SCORE, TRACKER_MIN_SCORE = 0.80, 0.95
 SCREENCAPTURE = "/usr/sbin/screencapture"
@@ -50,6 +53,22 @@ function run(argv) {
   }
   return String($.CGDisplayPixelsWide($.CGMainDisplayID()));
 }'''
+
+
+_DRAG_JS = '''ObjC.import('CoreGraphics');
+function run(argv) {
+  var a = JSON.parse(argv[0]), tap = $.kCGHIDEventTap, n = 14, x0 = a.from[0], y0 = a.from[1], x1 = a.to[0], y1 = a.to[1];
+  $.CGEventPost(tap, $.CGEventCreateMouseEvent(null, $.kCGEventMouseMoved, $.CGPointMake(x0 - 3, y0 - 3), 0)); delay(0.3);
+  $.CGEventPost(tap, $.CGEventCreateMouseEvent(null, $.kCGEventMouseMoved, $.CGPointMake(x0, y0), 0)); delay(0.4);
+  $.CGEventPost(tap, $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseDown, $.CGPointMake(x0, y0), 0)); delay(0.15);
+  for (var i = 1; i <= n; i++) {
+    var p = $.CGPointMake(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n);
+    $.CGEventPost(tap, $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseDragged, p, 0)); delay(0.04);
+  }
+  delay(0.2); $.CGEventPost(tap, $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseUp, $.CGPointMake(x1, y1), 0));
+  return String($.CGDisplayPixelsWide($.CGMainDisplayID()));
+}'''
+_TYPE = 'tell application "System Events" to keystroke <TEXT>'
 
 
 def run_jxa(source: str, arg: str) -> str:
@@ -206,7 +225,7 @@ def object_mask(process_name: str, project_path: Path, frame_png: Path, at: tupl
 
 
 def track(process_name: str, project_path: Path, direction: str = "both", *, by: str = "button", quiet_s: float = 4.0,
-          limit_s: float = 300.0,
+          limit_s: float = 300.0, playhead: Callable[[], str | None] | None = None,
           run: Callable[[str], str] | None = None, run_js: Callable[[str, str], str] | None = None,
           capture: Callable[[Path], None] | None = None, sleep: Callable[[float], None] | None = None,
           display_points: int | None = None) -> dict:
@@ -247,6 +266,29 @@ def track(process_name: str, project_path: Path, direction: str = "both", *, by:
           x, y = (box["x"] + TRACKER_BUTTONS[direction] * box["w"]) / scale, (box["y"] + box["h"] / 2) / scale
           bring_to_front(process_name, run)
           pointer([(x - 2, y), (x, y)], (x, y), 0.4, run_js)
+    if playhead is not None:                       # shape masks write no data file: done = the playhead moved, then stopped
+        waited, start_pos, last_pos, moved, still = 0.0, None, None, False, 0.0
+        step = 0.5
+        while waited < limit_s:
+            sleep(step)
+            waited += step
+            pos = playhead()
+            if start_pos is None:
+                start_pos = pos
+            if pos != last_pos and last_pos is not None:
+                moved, still = True, 0.0
+            else:
+                still += step
+            last_pos = pos
+            if moved and still >= quiet_s:
+                return {"direction": direction, "by": by, "clicked_points": [round(x, 1), round(y, 1)] if by == "button" else None,
+                        "match": box["score"], "seconds": waited, "changed_files": {}, "tracked": True, "done_by": "playhead",
+                        "playhead": last_pos}
+            if not moved and waited >= 8.0:
+                raise CliError("not_started", "Tracking was asked for but the playhead did not move within 8 seconds. Either no mask "
+                                              "is selected, or the Track mask key is not assigned, or a very short clip was tracked "
+                                              "before the first reading. Save and check `mask list` (tracked yes or no).")
+        raise CliError("tracking_slow", f"The playhead still moved after {int(limit_s)} seconds. Tracking may still run.")
     waited, grew, last, still = 0.0, False, before, 0.0
     while waited < limit_s:
         sleep(1.0)
@@ -267,3 +309,98 @@ def track(process_name: str, project_path: Path, direction: str = "both", *, by:
     return {"direction": direction, "by": by, "clicked_points": [round(x, 1), round(y, 1)] if by == "button" else None,
             "match": box["score"], "seconds": waited,
             "changed_files": changed, "tracked": True}
+
+
+def drag(start: tuple[float, float], end: tuple[float, float], run: Callable[[str, str], str] | None = None) -> None:
+    """Press the mouse button at `start`, move to `end` in small steps and let go (points)."""
+    run = run_jxa if run is None else run
+    run(_DRAG_JS, json.dumps({"from": list(start), "to": list(end)}))
+
+
+def ellipse_mask(process_name: str, frame_png: Path, box: tuple[float, float, float, float], *,
+                 grow: tuple[float, float] = (0.0, 0.04), run: Callable[[str], str] | None = None,
+                 run_js: Callable[[str, str], str] | None = None, capture: Callable[[Path], None] | None = None,
+                 sleep: Callable[[float], None] | None = None, display_points: int | None = None) -> dict:
+    """Draw an Ellipse Mask over `box` on the selected clip: tool key, then a drag from the top left to the bottom right.
+
+    `box` is x, y, width, height as shares of the frame (for example a face box from a detector, measured on `frame_png`).
+    `grow` widens the box on each side by a share of its width and of its height. `frame_png` is the frame the Program
+    Monitor shows now; it is found on a screen capture. The tool key is the owner's key for "Ellipse Mask Tool"
+    (Ctrl+Opt+Cmd+E, Edit mode). An ellipse writes no mask data file: check the result with `mask list` after a save.
+    """
+    x, y, w, h = box
+    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and 0.0 < w <= 1.0 and 0.0 < h <= 1.0 and x + w <= 1.0001 and y + h <= 1.0001):
+        raise CliError("bad_box", "The box must be x,y,width,height as shares of the frame, inside the frame.")
+    capture, sleep = run_capture if capture is None else capture, time.sleep if sleep is None else sleep
+    gx, gy = grow[0] * w, grow[1] * h
+    with tempfile.TemporaryDirectory() as tmp:
+        shot = Path(tmp) / "screen.png"
+        bring_to_front(process_name, run)
+        capture(shot)
+        found = find_picture(shot, frame_png)
+        if found["score"] < PICTURE_MIN_SCORE:
+            raise CliError("picture_not_found", f"The frame was not found in the Program Monitor (best match {found['score']}). "
+                                                "Nothing was pressed or dragged.")
+        points = display_points if display_points is not None else pointer([], None, 0.0, run_js)
+        scale = _scale(shot, points)
+        start = ((found["x"] + max(0.0, x - gx) * found["w"]) / scale, (found["y"] + max(0.0, y - gy) * found["h"]) / scale)
+        end = ((found["x"] + min(1.0, x + w + gx) * found["w"]) / scale, (found["y"] + min(1.0, y + h + gy) * found["h"]) / scale)
+        bring_to_front(process_name, run)
+        press(KEY_E, OWNER_KEY_MODIFIERS, run)
+        sleep(1.0)
+        drag(start, end, run_js)
+    sleep(1.5)
+    return {"dragged_points": [round(v, 1) for v in (*start, *end)], "picture": found, "scale": round(scale, 3), "drawn": True}
+
+
+def find_rows(capture_png: Path, template_png: Path, min_score: float) -> list[dict]:
+    """Every place where the template shows on the capture with at least `min_score`, best first (at most 4)."""
+    cv2, _ = _cv()
+    shot, tpl = cv2.imread(str(capture_png)), cv2.imread(str(template_png))
+    if shot is None or tpl is None:
+        raise CliError("ui_failed", "Cannot read the capture or the template picture.")
+    result, found = cv2.matchTemplate(shot, tpl, cv2.TM_CCOEFF_NORMED), []
+    for _ in range(4):
+        _, score, _, loc = cv2.minMaxLoc(result)
+        if score < min_score:
+            break
+        found.append({"x": int(loc[0]), "y": int(loc[1]), "w": int(tpl.shape[1]), "h": int(tpl.shape[0]), "score": round(float(score), 3)})
+        y0, y1, x0, x1 = max(0, loc[1] - tpl.shape[0]), loc[1] + tpl.shape[0], max(0, loc[0] - tpl.shape[1]), loc[0] + tpl.shape[1]
+        result[y0:y1, x0:x1] = -1.0
+    return found
+
+
+def mask_feather(process_name: str, value: float, *, run: Callable[[str], str] | None = None,
+                 run_js: Callable[[str, str], str] | None = None, capture: Callable[[Path], None] | None = None,
+                 sleep: Callable[[float], None] | None = None, display_points: int | None = None) -> dict:
+    """Type `value` into the Feather field of the mask that shows in Effect Controls.
+
+    A script cannot write the Feather of a mask, so this finds the row "Feather" of the mask on a screen capture, clicks
+    its number, types the value and presses Return. Exactly one Feather row must show: none or two click nothing.
+    It is not read back here: save and use `mask list`.
+    """
+    if not (0.0 <= float(value) <= 1000.0):
+        raise CliError("bad_value", "Feather must be a number from 0 to 1000.")
+    capture, sleep = run_capture if capture is None else capture, time.sleep if sleep is None else sleep
+    run = ui.run_osascript if run is None else run
+    text = ("%.1f" % float(value)).rstrip("0").rstrip(".")
+    with tempfile.TemporaryDirectory() as tmp:
+        shot = Path(tmp) / "screen.png"
+        bring_to_front(process_name, run)
+        capture(shot)
+        rows = find_rows(shot, FEATHER_ASSET, TRACKER_MIN_SCORE)
+        if len(rows) != 1:
+            raise CliError("feather_not_found", f"{len(rows)} Feather rows of a mask show on the screen; exactly one is needed. "
+                                                "Select the clip, show Effect Controls and scroll to the mask. Nothing was clicked.")
+        points = display_points if display_points is not None else pointer([], None, 0.0, run_js)
+        scale = _scale(shot, points)
+        x, y = (rows[0]["x"] + FEATHER_VALUE_DX) / scale, (rows[0]["y"] + rows[0]["h"] / 2) / scale
+        bring_to_front(process_name, run)
+        pointer([(x - 2, y), (x, y)], (x, y), 0.3, run_js)
+    sleep(0.8)
+    bring_to_front(process_name, run)
+    run(_TYPE.replace("<TEXT>", json.dumps(text)))
+    sleep(0.3)
+    press(KEY_RETURN, (), run)
+    sleep(0.8)
+    return {"typed": text, "clicked_points": [round(x, 1), round(y, 1)], "match": rows[0]["score"]}

@@ -458,6 +458,27 @@ def _checked_project(project: str, lease_wait: float, timeout: float, allow_unte
         guarded_state(client, write=True, project=project, any_project=False, allow_untested=allow_untested, hard_limit_s=timeout)
 
 
+def _edit_mode_app() -> dict:
+    """The running Premiere, in Edit mode. The mask keys exist in Edit mode only, so another mode sends nothing."""
+    app = _running_app()
+    mode = ui_core.mode_get(app["process_name"])
+    if mode != "edit":
+        raise CliError("wrong_mode", f"Premiere is in {mode} mode. The mask keys work in Edit mode only. Nothing was pressed. "
+                                     "Switch with: cli-anything-premiere ui mode set edit")
+    return app
+
+
+def _playhead_reader(lease_wait: float, timeout: float, allow_untested: bool):
+    """A function that reads the playhead of the active sequence as text (ticks), or None."""
+    def read() -> str | None:
+        client = _client(lease_wait)
+        with client.lease():
+            state, _ = guarded_state(client, write=False, project=None, any_project=False, allow_untested=allow_untested, hard_limit_s=timeout)
+        value = state.get("playhead_ticks")
+        return None if value is None else str(value)
+    return read
+
+
 @ui_mask.command("object")
 @click.option("--project", required=True, help="Path of the project that must be the active one (a Claude working copy).")
 @click.option("--frame", "frame_png", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path),
@@ -488,7 +509,7 @@ def ui_mask_object(ctx: click.Context, project: str, frame_png: Path, at_text: s
         return
     try:
         _checked_project(project, lease_wait, timeout, allow_untested)
-        app = _running_app()
+        app = _edit_mode_app()
         result = ui_mask_core.object_mask(app["process_name"], Path(project), frame_png, (parts[0], parts[1]), hover_s=hover_s)
     except CliError as err:
         _fail(ctx, err)
@@ -506,13 +527,15 @@ def ui_mask_object(ctx: click.Context, project: str, frame_png: Path, at_text: s
 @click.option("--direction", type=click.Choice(list(ui_mask_core.TRACKER_BUTTONS)), default="both", show_default=True,
               help="Which Tracker button to click.")
 @click.option("--limit", "limit_s", type=float, default=300.0, show_default=True, help="Longest wait for the tracking, in seconds.")
+@click.option("--done", "done_by", type=click.Choice(["data", "playhead"]), default="data", show_default=True,
+              help="data: done when the mask data file stops growing (Object Mask). playhead: done when the playhead stops (shape masks write no data file).")
 @click.option("--by", type=click.Choice(["key", "button"]), default="key", show_default=True,
               help="key: press Ctrl+Opt+Cmd+T, the key you gave to 'Track mask' (both directions). button: click a Tracker button.")
 @live_options
 @json_option
 @click.pass_context
-def ui_mask_track(ctx: click.Context, project: str, direction: str, limit_s: float, by: str, lease_wait: float, timeout: float,
-                  allow_untested: bool) -> None:
+def ui_mask_track(ctx: click.Context, project: str, direction: str, limit_s: float, done_by: str, by: str, lease_wait: float,
+                  timeout: float, allow_untested: bool) -> None:
     """Track the selected mask and wait until the mask data stops growing.
 
     --by key (default) presses Ctrl+Opt+Cmd+T. Premiere has no default key for "Track mask": assign it once in
@@ -525,13 +548,76 @@ def ui_mask_track(ctx: click.Context, project: str, direction: str, limit_s: flo
     """
     try:
         _checked_project(project, lease_wait, timeout, allow_untested)
-        app = _running_app()
-        result = ui_mask_core.track(app["process_name"], Path(project), direction, by=by, limit_s=limit_s)
+        app = _edit_mode_app()
+        reader = _playhead_reader(lease_wait, timeout, allow_untested) if done_by == "playhead" else None
+        result = ui_mask_core.track(app["process_name"], Path(project), direction, by=by, limit_s=limit_s, playhead=reader)
     except CliError as err:
         _fail(ctx, err)
         return
     total = sum(result["changed_files"].values())
     _emit(ctx, result, f"Tracked ({direction}) in {int(result['seconds'])} s. Mask data: {total} bytes in {len(result['changed_files'])} file(s).")
+
+
+@ui_mask.command("ellipse")
+@click.option("--project", required=True, help="Path of the project that must be the active one (a Claude working copy).")
+@click.option("--frame", "frame_png", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="The frame the Program Monitor shows now (from `live frame export`). It is found on the screen.")
+@click.option("--box", "box_text", required=True, help="The box to cover, as shares of the frame: x,y,width,height (a face box, for example).")
+@click.option("--grow", "grow_text", default="0,0.04", show_default=True, help="Widen the box on each side by these shares of its width and height: gx,gy.")
+@live_options
+@json_option
+@click.pass_context
+def ui_mask_ellipse(ctx: click.Context, project: str, frame_png: Path, box_text: str, grow_text: str, lease_wait: float,
+                    timeout: float, allow_untested: bool) -> None:
+    """Draw an Ellipse Mask over a box of the frame on the selected clip.
+
+    Before: select the clip, put the playhead on the frame, export that frame and give it as --frame. The command
+    presses Ctrl+Opt+Cmd+E (assign that key to "Ellipse Mask Tool" once, in Edit mode) and drags over the box.
+    Do not use the mouse or the keyboard while it runs.
+
+    drawn: the keys and the drag were sent. It is not a check that Premiere made the mask: an ellipse writes no data
+    file, so save and run `mask list`. With no effect selected the mask is "unassigned": the next effect you apply to
+    the clip takes it. The project is not saved.
+    """
+    try:
+        box = [float(v) for v in box_text.split(",")]
+        grow = [float(v) for v in grow_text.split(",")]
+        if len(box) != 4 or len(grow) != 2:
+            raise ValueError
+    except ValueError:
+        _fail(ctx, CliError("bad_box", "Give --box as x,y,width,height and --grow as gx,gy."))
+        return
+    try:
+        _checked_project(project, lease_wait, timeout, allow_untested)
+        app = _edit_mode_app()
+        result = ui_mask_core.ellipse_mask(app["process_name"], frame_png, (box[0], box[1], box[2], box[3]), grow=(grow[0], grow[1]))
+    except CliError as err:
+        _fail(ctx, err)
+        return
+    _emit(ctx, result, f"Dragged an ellipse over {result['dragged_points']} (frame match {result['picture']['score']}). Check it with `mask list` after a save.")
+
+
+@ui_mask.command("feather")
+@click.argument("value", type=float)
+@click.option("--project", required=True, help="Path of the project that must be the active one (a Claude working copy).")
+@live_options
+@json_option
+@click.pass_context
+def ui_mask_feather(ctx: click.Context, value: float, project: str, lease_wait: float, timeout: float, allow_untested: bool) -> None:
+    """Set the Feather of the mask that shows in Effect Controls to VALUE, by typing into its field.
+
+    Premiere gives scripts no way to write the Feather of a mask. The row "Feather" of the mask must show on the screen,
+    and only one: select the clip, show Effect Controls (Shift+5) and scroll to the mask. It is not read back here:
+    save and run `mask list`. Do not use the mouse or the keyboard while it runs. The project is not saved.
+    """
+    try:
+        _checked_project(project, lease_wait, timeout, allow_untested)
+        app = _edit_mode_app()
+        result = ui_mask_core.mask_feather(app["process_name"], value)
+    except CliError as err:
+        _fail(ctx, err)
+        return
+    _emit(ctx, result, f"Typed {result['typed']} into the Feather field (row match {result['match']}). Check it with `mask list` after a save.")
 
 
 @click.group()

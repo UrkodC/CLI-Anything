@@ -166,3 +166,16 @@ the Vision LUT, 2.39 bars above) the Track Matte layers were removed and the nat
 - Gains measured for a masked Lumetri after the Vision LUT on this dusk face: Temperature +1 = b about +0.16 and a about -0.06;
   Tint +1 = a about +0.37 (the first try, Temperature 29 / Tint 3.4, gave only b +3.7 and a -0.55).
 - `mask list` on the film project: ellipse, tracked, feather 50. No dialog. v5 was not touched.
+
+## Commands for the face-only chain, live run (2026-11-22, test copy, sequence "Face cmd - Claude")
+
+- New: `ui mask ellipse --project P --frame F.png --box X,Y,W,H [--grow GX,GY]`, `ui mask feather VALUE --project P`,
+  `ui mask track --done data|playhead`; every `ui mask` command refuses when Window > Mode is not "edit" (wrong_mode).
+- First run: the Premiere window was mostly off the screen. `ellipse` refused with picture_not_found (best match 0.578) and `feather`
+  with feather_not_found (0 rows): nothing was pressed. `track --done playhead` reported tracked with no mask: fixed, it must now see
+  the playhead move and reports not_started after 8 s without movement.
+- Second run, window on screen: ellipse dragged over 882.2,209.6 to 946.2,294.5 points (frame match 0.995); feather typed 50 (row
+  match 1.000); track done by playhead in 9.5 s (playhead back at 0); `apply_effect` Lumetri; `mask list` on the saved project shows
+  a new ellipse mask, tracked, feather 50.
+- A script for a whole shot needs, besides these: the face box (a detector on the exported frame), `set_clip_selection`,
+  `set_playhead_position`, `live frame export`, `apply_effect`, `live effect set`, and a frame diff as the proof.
