@@ -218,3 +218,29 @@ a solve against the v5 (Track Matte) frame with up to 3 steps, frames at 3 times
 - Cleaning a stray unassigned mask by script: `apply_effect` Lumetri (takes the mask), then `remove_effect` on that Lumetri (index 2):
   the mask goes with the effect.
 - `mask list` object IDs change between saves: do not use them to find the new mask.
+
+## Object Mask INTERSECT face ellipse: the spill fix (2026-11-23, Before Dark, same test sequence)
+
+The user picked this test. Run on the 4 spill shots (S2 C2495, S5 C2491, S7 C2496, S9 C2498). Script:
+`<film folder>/Claude assets/scripts/native_face_obj.sh KEY` (it ends with `native_face.py KEY --from effect`).
+
+- Chain per shot: remove the old masked Lumetri (the mask goes with it) > `ui mask ellipse` > `ui mask feather 50` > `ui mask track --done
+  playhead` > `ui mask object --at` the face centre (Premiere takes the whole boy; no storage dialog came in this project) >
+  `ui mask track --done data` (7 s) > Blend Mode of the Object Mask set to Intersect > `apply_effect` Lumetri: ONE new Lumetri takes
+  BOTH unassigned masks > values as before.
+- Blend Mode has no key and no script property. It is a drop-down in Effect Controls under "Unassigned Masks" (items Add, Subtract,
+  Intersect). Set by two mouse clicks by position (the menu, then the item): 588,522.5 and 593,602.3 points with the window as it was
+  on that day, Effect Controls scrolled to the top, rows in the order ellipse then object. `mask list` reads it back: blend_mode 2
+  (printed "mode 2": name it "intersect"; 0 = add, so 1 should be subtract, not measured).
+- Result (`all/numbers_object_intersect.json`, picture `all/object_intersect_end_frames.jpg`), spill = change where v5 did not change:
+  S7 C2496 14 to 18 thousand px (max 31 to 38) fell to 0.5 to 1.9 thousand (max 10 to 23); S2 C2495 end 6432 px (max 26) to 8 px (max 5);
+  S9 C2498 end 6292 px (max 29) to 724 px (max 7); S5 C2491 end 88 thousand px (max 63) to 4 thousand (max 9). No warm rim or patch
+  on the sky in the pictures. Face box against v5: 1.5 to 2.6 on 11 of 12 frames, 3.21 on one (C2495 at 3.316 s).
+- Not fixed: S5 C2491 at 10.95 and 11.70 s keeps 5 to 9 thousand px (max 14 to 24) outside the v5 skin area. It is inside the boy
+  (hair, ear, collar), not on the sky: the Object Mask is the whole boy, so the ellipse still colours hair. Also on C2491's end the
+  ellipse is off the face (tracking), so only part of the face gets the fix. The Object Mask edge has Feather 0.
+- Screen-step failures in this run, all caught by the readback: `not_front` (the Claude app took the front place; retry works), the
+  Blend Mode click missed once with no reason seen, and missed three times when Effect Controls had scrolled down by itself (fix:
+  scroll wheel events to the top before the click).
+- To build in the CLI: `ui mask blend add|subtract|intersect` (find the Blend Mode row of the wanted mask on a capture, not a fixed
+  point), the name of mode 2 in `mask list`, a scroll-to-top of Effect Controls, and the front-app retry inside every `ui mask` command.
