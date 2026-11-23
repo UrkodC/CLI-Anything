@@ -150,3 +150,19 @@ Automatic face-only chain, each step proven by a readback: face box (YuNet on th
 the box > Track mask key (done = playhead stops) > `apply_effect` (takes the mask) > Feather by the field > `live effect set` on the
 effect > frame diff. To build next as commands: `ui mask ellipse --box X,Y,W,H`, `ui mask feather VALUE`, and a mode check ("edit")
 in every `ui mask` command.
+
+## First run on a film shot (2026-11-22): Before Dark, shot 3, sequence "v6 native mask test"
+
+A duplicate of the approved v5; on shot 3 (C2489, 2.67 s, clip with Rotation keys, Scale 104.8, Position Y 1230, ProcAmp, Lumetri with
+the Vision LUT, 2.39 bars above) the Track Matte layers were removed and the native chain ran on the V1 clip:
+- face box from YuNet on the exported SEQUENCE frame (graded, with bars; brightened for the detector) at 7.0 s; frame found on the
+  capture with score 0.999; ellipse drag over the box (+0 % width, +4 % height); Feather 50 by the field (template score 1.000);
+  Track mask key from the middle of the shot (the playhead was back at the clip start within 2 s); `apply_effect` Lumetri Color:
+  the new Lumetri was effect index 2 (Contrast 0), the old graded one index 3.
+- Masked Lumetri (after the LUT): Temperature 60, Tint 16, Exposure 0.4.
+- Frame diffs at 5.9, 7.0 and 8.2 s against the same frames without any fix: 94 to 97 thousand changed pixels, 52 to 56 % of the face
+  box over the threshold (the feather fades the rest), 3 % of the changed area outside the face box. Face-centre Lab shift (8-bit):
+  native +3.4 / +0.8 / +4.1, Track Matte version +4.0 / +1.4 / +5.4. Native against Track Matte inside the face box: 1.9 to 2.0 / 255.
+- Gains measured for a masked Lumetri after the Vision LUT on this dusk face: Temperature +1 = b about +0.16 and a about -0.06;
+  Tint +1 = a about +0.37 (the first try, Temperature 29 / Tint 3.4, gave only b +3.7 and a -0.55).
+- `mask list` on the film project: ellipse, tracked, feather 50. No dialog. v5 was not touched.
