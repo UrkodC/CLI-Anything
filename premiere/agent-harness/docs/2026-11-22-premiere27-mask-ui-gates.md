@@ -270,3 +270,22 @@ no-fix frame (luma over 110: sky, some light hair) and change by more than 3 lev
 Limits: 3 stills per shot; the bright-pixel measure also counts light hair; the 4 other face shots of v7 still use the v5 mattes.
 Result: for a face fix the SAM 2 matte with Track Matte Key is the best of the three (v5 look, least sky spill, fully scripted). The
 `ui mask` route stays a tool for cases with no rendered matte.
+
+## Acceptance of the default face matte (2026-11-23): `face_matte_sam2.py`, growth 0, all 8 face shots of Before Dark
+
+User decision 2026-11-23: the SAM 2 skin matte with Track Matte Key is the default face fix for new films; the `ui mask` route is a
+spare tool. Script (tools session): `~/.claude/skills/cinematic-story-edit/scripts/face_matte_sam2.py VERSION "shot list"`, a drop-in
+for a film's `face_matte.py`. Run as version `v7acc` on shots 1, 2, 4, 5, 6, 8, 12, 15 (0-based): 8 mattes in about 8 minutes, the frame
+counts equal v5; the face was found on every frame except 2 of 34 on C2496. Placed by script in "Before Dark - Claude v7 sam2 matte
+test" in place of all 8 v5 mattes. No screen step.
+
+24 stills, 3 per shot, new against v5 (`all/numbers_acceptance_sam2_growth0.json`, picture `all/acceptance_sam2_growth0.jpg`):
+- Face box, mean difference to v5: 0.00 to 0.21 / 255. Face-centre Lab shift: equal to v5 to 0.01 on all 24 frames.
+- Outside the face area: 0.0 difference to v5 on all 24 frames (the rest of the film is untouched).
+- Bright (sky) pixels changed by more than 3 levels: lower than or equal to v5 on all 24 frames. On the shots with sky behind the head
+  v5 changes 1080 to 13934 px and the new matte 0 to 1606 px (C2491: 13224 / 13934 / 7856 fell to 238 / 142 / 4). The highest
+  leftover is C2496 (886, 1606, 528 px) and C2492 at 14.87 s (1269 px, v5 1396): bright pixels inside the head (light hair, skin), not
+  checked one by one.
+- In the change maps v5 has a soft halo past the head outline; the new matte ends at the outline.
+Not checked in Premiere: every frame (the tools session measured matte flicker on every frame of 4 shots: growth 0 is at or under v5).
+The v7 sequence is a test, not exported; v5 print stays the approved film.
