@@ -244,3 +244,10 @@ The user picked this test. Run on the 4 spill shots (S2 C2495, S5 C2491, S7 C249
   scroll wheel events to the top before the click).
 - To build in the CLI: `ui mask blend add|subtract|intersect` (find the Blend Mode row of the wanted mask on a capture, not a fixed
   point), the name of mode 2 in `mask list`, a scroll-to-top of Effect Controls, and the front-app retry inside every `ui mask` command.
+- Checked after the run, at 100 % (`all/leftover_100pct.jpg`): the leftover on C2491 at 10.95 and 11.70 s (5211 and 9255 px, about the
+  same as with the ellipse alone) lies on dark pixels (no-fix luma median 31 and 41, 0 % brighter than 100; sky is about 156): it is
+  hair, which gets warmer. On C2496 at 16.29 s 27 % of the 1857 leftover px are bright: hair tips against the sky at the top edge.
+- Limits of this proof: 3 still frames per shot, 12 frames in all. No frame-by-frame check, so flicker of the hard Object Mask edge
+  (Feather 0) and the fade of the fix when the ellipse leaves the face (C2491) are not measured. Object Mask ∩ ellipse is a CANDIDATE
+  for the native route, not the default. It matches the v5 Track Matte on stills; it is not a better picture. Gain: no rendered matte
+  file. Cost: hands off the computer, clicks by fixed position, several missed screen steps per run.
