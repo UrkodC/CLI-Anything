@@ -24,7 +24,8 @@ from typing import Callable
 from cli_anything.premiere.core import ui
 from cli_anything.premiere.errors import CliError
 
-KEY_O, KEY_V = 31, 9                                  # virtual key codes: O (Object Mask tool with Cmd+Opt), V (pointer tool)
+KEY_O, KEY_V, KEY_T = 31, 9, 17                       # virtual key codes: O (Object Mask tool with Cmd+Opt), V (pointer tool), T
+TRACK_KEY_MODIFIERS = ("control", "option", "command")   # the owner's key for "Track mask" (cmd.track.bidirectional): Ctrl+Opt+Cmd+T
 TRACKER_ASSET = Path(__file__).parent / "assets" / "tracker_buttons_2x.png"
 TRACKER_BUTTONS = {"back1": 0.085, "backward": 0.245, "both": 0.408, "forward": 0.568, "forward1": 0.728}   # centre, share of width
 PICTURE_MIN_SCORE, TRACKER_MIN_SCORE = 0.80, 0.95
@@ -204,11 +205,15 @@ def object_mask(process_name: str, project_path: Path, frame_png: Path, at: tupl
             "made": bool(changed)}
 
 
-def track(process_name: str, project_path: Path, direction: str = "both", *, quiet_s: float = 4.0, limit_s: float = 300.0,
+def track(process_name: str, project_path: Path, direction: str = "both", *, by: str = "button", quiet_s: float = 4.0,
+          limit_s: float = 300.0,
           run: Callable[[str], str] | None = None, run_js: Callable[[str, str], str] | None = None,
           capture: Callable[[Path], None] | None = None, sleep: Callable[[float], None] | None = None,
           display_points: int | None = None) -> dict:
-    """Click one Tracker button of the selected mask and wait until the mask data stops growing.
+    """Start the tracking of the selected mask and wait until the mask data stops growing.
+
+    by="key" presses Ctrl+Opt+Cmd+T, the key the owner gave to the command "Track mask" (forward and backward); Premiere has no
+    default key for it. by="button" clicks one Tracker button in Effect Controls:
 
     The buttons must show in Effect Controls (the mask is selected and the panel is scrolled to it). They are found on
     a screen capture; a match under 0.95 clicks nothing. Done means: a mask data file grew, then did not change for
@@ -216,21 +221,32 @@ def track(process_name: str, project_path: Path, direction: str = "both", *, qui
     """
     if direction not in TRACKER_BUTTONS:
         raise CliError("bad_direction", f"{direction!r} is not a direction. Use one of: {', '.join(TRACKER_BUTTONS)}.")
+    if by not in ("key", "button"):
+        raise CliError("bad_route", "Use by='key' or by='button'.")
+    if by == "key" and direction != "both":
+        raise CliError("bad_direction", "The Track mask key tracks forward and backward. For one direction use the button route.")
     capture, sleep = run_capture if capture is None else capture, time.sleep if sleep is None else sleep
     before = mask_data(project_path)
+    box, x, y = {"score": None}, 0.0, 0.0
+    if by == "key":
+        bring_to_front(process_name, run)
+        press(KEY_T, TRACK_KEY_MODIFIERS, run)
     with tempfile.TemporaryDirectory() as tmp:
-        shot = Path(tmp) / "screen.png"
-        bring_to_front(process_name, run)
-        capture(shot)
-        box = find_tracker(shot)
-        if box["score"] < TRACKER_MIN_SCORE:
-            raise CliError("tracker_not_found", f"The Tracker buttons were not found on the screen (best match {box['score']}). "
-                                                "Select the mask and scroll Effect Controls to it. Nothing was clicked.")
-        points = display_points if display_points is not None else pointer([], None, 0.0, run_js)
-        scale = _scale(shot, points)
-        x, y = (box["x"] + TRACKER_BUTTONS[direction] * box["w"]) / scale, (box["y"] + box["h"] / 2) / scale
-        bring_to_front(process_name, run)
-        pointer([(x - 2, y), (x, y)], (x, y), 0.4, run_js)
+        if by == "key":
+            pass
+        else:
+          shot = Path(tmp) / "screen.png"
+          bring_to_front(process_name, run)
+          capture(shot)
+          box = find_tracker(shot)
+          if box["score"] < TRACKER_MIN_SCORE:
+              raise CliError("tracker_not_found", f"The Tracker buttons were not found on the screen (best match {box['score']}). "
+                                                  "Select the mask and scroll Effect Controls to it. Nothing was clicked.")
+          points = display_points if display_points is not None else pointer([], None, 0.0, run_js)
+          scale = _scale(shot, points)
+          x, y = (box["x"] + TRACKER_BUTTONS[direction] * box["w"]) / scale, (box["y"] + box["h"] / 2) / scale
+          bring_to_front(process_name, run)
+          pointer([(x - 2, y), (x, y)], (x, y), 0.4, run_js)
     waited, grew, last, still = 0.0, False, before, 0.0
     while waited < limit_s:
         sleep(1.0)
@@ -243,10 +259,11 @@ def track(process_name: str, project_path: Path, direction: str = "both", *, qui
         if grew and still >= quiet_s:
             break
         if not grew and waited >= 15.0:
-            raise CliError("not_started", "The Tracker button was clicked but no mask data changed within 15 seconds. "
-                                          "Look at Premiere: a dialog may be open, or no mask is selected.")
+            raise CliError("not_started", "Tracking was asked for but no mask data changed within 15 seconds. Look at Premiere: "
+                                          "a dialog may be open, no mask is selected, or the Track mask key is not assigned.")
     else:
         raise CliError("tracking_slow", f"The mask data still changed after {int(limit_s)} seconds. Tracking may still run.")
     changed = {n: size for n, size in last.items() if before.get(n) != size}
-    return {"direction": direction, "clicked_points": [round(x, 1), round(y, 1)], "match": box["score"], "seconds": waited,
+    return {"direction": direction, "by": by, "clicked_points": [round(x, 1), round(y, 1)] if by == "button" else None,
+            "match": box["score"], "seconds": waited,
             "changed_files": changed, "tracked": True}

@@ -506,14 +506,18 @@ def ui_mask_object(ctx: click.Context, project: str, frame_png: Path, at_text: s
 @click.option("--direction", type=click.Choice(list(ui_mask_core.TRACKER_BUTTONS)), default="both", show_default=True,
               help="Which Tracker button to click.")
 @click.option("--limit", "limit_s", type=float, default=300.0, show_default=True, help="Longest wait for the tracking, in seconds.")
+@click.option("--by", type=click.Choice(["key", "button"]), default="key", show_default=True,
+              help="key: press Ctrl+Opt+Cmd+T, the key you gave to 'Track mask' (both directions). button: click a Tracker button.")
 @live_options
 @json_option
 @click.pass_context
-def ui_mask_track(ctx: click.Context, project: str, direction: str, limit_s: float, lease_wait: float, timeout: float,
+def ui_mask_track(ctx: click.Context, project: str, direction: str, limit_s: float, by: str, lease_wait: float, timeout: float,
                   allow_untested: bool) -> None:
-    """Track the selected mask: click a Tracker button in Effect Controls and wait until the mask data stops growing.
+    """Track the selected mask and wait until the mask data stops growing.
 
-    The Tracker buttons must show on the screen (select the mask; scroll Effect Controls to it). They are found on a
+    --by key (default) presses Ctrl+Opt+Cmd+T. Premiere has no default key for "Track mask": assign it once in
+    Premiere > Keyboard Shortcuts. --by button clicks a Tracker button in Effect Controls instead. For that route the
+    Tracker buttons must show on the screen (select the mask; scroll Effect Controls to it). They are found on a
     screen capture; when they are not found, nothing is clicked. Do not use the mouse while it runs.
 
     tracked: a mask data file grew and then stayed the same for 4 seconds. It is not a check that the mask stayed on
@@ -522,7 +526,7 @@ def ui_mask_track(ctx: click.Context, project: str, direction: str, limit_s: flo
     try:
         _checked_project(project, lease_wait, timeout, allow_untested)
         app = _running_app()
-        result = ui_mask_core.track(app["process_name"], Path(project), direction, limit_s=limit_s)
+        result = ui_mask_core.track(app["process_name"], Path(project), direction, by=by, limit_s=limit_s)
     except CliError as err:
         _fail(ctx, err)
         return

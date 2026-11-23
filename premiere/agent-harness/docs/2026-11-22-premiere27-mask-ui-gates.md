@@ -65,3 +65,18 @@ Change to blur mask, Change to opacity mask, Invert mask, Rename Mask Or Selecti
 Panels > Program Monitor Panel: Toggle mask bounding box. So tracking HAS a command ("Track mask") that can get a key: the Tracker
 button click of gate 4 is then not needed. Built after gate 4: `ui mask object` and `ui mask track` (core/ui_mask.py, tests/test_ui_mask.py,
 extra "screen" = numpy + opencv-python-headless); live test of the two commands not run yet.
+
+## Live test of the commands (2026-11-22, test copy, Premiere 27.0.0)
+
+- The owner assigned keys (read back from `~/Documents/Adobe/Premiere Pro/27.0/Profile-*/Mac/[Custom].kys`):
+  Track mask = `cmd.track.bidirectional` = Ctrl+Opt+Cmd+T; HSL Mask Tool = `cmd.tools.22hslselection` = Ctrl+Opt+Cmd+H;
+  Ellipse Mask Tool = `cmd.tools.19ellipseselection` = Ctrl+Opt+Cmd+E; Invert mask = `cmd.invert.mask` = Ctrl+Opt+Cmd+I.
+- `ui mask object --project P --frame F.png --at 0.54,0.224`: frame found on the capture with score 0.997 (box 964,350 1392x783 px),
+  click at 857.8,262.7 points (the same point as the hand-made gate), a new `.prmf` of 56,896 bytes, exit 0, no dialog (second mask).
+  Without numpy and opencv in the tool environment it refused with no_picture_matching before any event.
+  Install: `uv tool install --force --editable <harness> --with numpy --with opencv-python-headless`.
+- `ui mask track --project P` (default `--by key`, key code 17 with control, option, command): tracked in 14 s, new data file 1,525,812 bytes.
+- `mask list` on the saved project: masks 01 and 02, both object, both tracked, 2 data files each.
+- Fixture kept: `fixture_3_two_object_masks_tracked.prproj`.
+- Still open: assign a mask to an effect (`cmd.change.to.effect.mask` has no key yet), face-only mask, `ui mask tool` for HSL and
+  ellipse (keys now exist), invert by key, an on/off frame diff of an assigned mask, the owning clip in `mask list`.

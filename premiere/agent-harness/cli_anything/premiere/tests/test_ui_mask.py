@@ -134,3 +134,29 @@ def test_track_reports_not_started_when_nothing_grows(tmp_path):
         ui_mask.track(PROCESS, tmp_path / "Test Claude.prproj", "forward", run=screen.run, run_js=screen.run_js,
                       capture=screen.capture, sleep=screen.sleep, display_points=1512)
     assert err.value.code == "not_started"
+
+
+def test_track_by_key_presses_the_track_mask_key_and_takes_no_capture(tmp_path):
+    screen = Screen(shot=None)
+    project = tmp_path / "Test Claude.prproj"
+    folder = tmp_path / "Test Claude Masks"
+    folder.mkdir()
+    ticks = {"n": 0}
+
+    def sleep(seconds: float) -> None:
+        ticks["n"] += 1
+        if ticks["n"] == 2:
+            (folder / "b.prmf").write_bytes(b"y" * 50)
+
+    result = ui_mask.track(PROCESS, project, "both", by="key", run=screen.run, run_js=screen.run_js, capture=screen.capture, sleep=sleep)
+    assert result["tracked"] is True and result["by"] == "key" and result["clicked_points"] is None
+    assert any("key code 17 using {control down, option down, command down}" in s for s in screen.scripts)
+    assert screen.pointer_args == []
+
+
+def test_track_by_key_refuses_one_direction(tmp_path):
+    screen = Screen()
+    with pytest.raises(CliError) as err:
+        ui_mask.track(PROCESS, tmp_path / "Test Claude.prproj", "forward", by="key", run=screen.run, run_js=screen.run_js,
+                      capture=screen.capture, sleep=screen.sleep)
+    assert err.value.code == "bad_direction" and screen.scripts == []
