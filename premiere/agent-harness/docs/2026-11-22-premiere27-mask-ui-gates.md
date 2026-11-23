@@ -1,0 +1,58 @@
+# Premiere 27 mask tools through the screen route: gate results (2026-11-22)
+
+Goal (user, 2026-11-22): give the CLI access to the Premiere 27 mask tools (Object Mask, HSL Mask, tracking) and read masks from the saved project.
+Test project (a copy, never a film): `/Volumes/Samsung 2TB/Videos Premiere/Claude templates/Premiere 2027 tests/masks/Mask gate test Claude.prproj`,
+sequence "Mask gate - Claude", one clip (C2489) with Lumetri. `fixture_0_no_mask.prproj` = the file before any mask.
+
+## Measured
+
+- Way 2 start: no saved project on the Mac or the Samsung drive holds a real Object or HSL mask (scan of the unzipped XML for AEMask, HSLMask,
+  CompoundComponent). `wb_test/PP27 wb test.prproj` holds one script-applied `AE.ADBE AEMask` (default whole-frame mask).
+- Gate 1 (Accessibility): System Events sees the menu bar but 0 windows of Premiere. Panels, toolbar and mask buttons are NOT exposed.
+  `screencapture -x` works and shows the Program Monitor, so positions come from the picture. Display: 3024x1964 px, 2 px per point.
+- Gate 2 (tool keys, from `Keyboard Shortcuts/en/Adobe Premiere Pro Defaults.kys`, context global): Object Mask tool = Cmd+Opt+O
+  (`cmd.tools.object.selection`), draw mode = Cmd+Opt+L, add to mask = Cmd+=, subtract = Cmd+-, Program Monitor zoom to fit = Cmd+Shift+0,
+  Color Mode: add Adjust = Shift+N, Style = Shift+B, LUT = Shift+V, clip level = Opt+Shift+S, sequence level = Opt+Shift+D.
+  Commands that exist with NO default key (the user must assign one): `cmd.tools.19ellipseselection`, `20rectselection`, `21bezierselection`,
+  `22hslselection`, `23luminanceselection`, `cmd.invert.mask`, `cmd.set.mask.blend.mode.to.add|intersect|subtract`,
+  `cmd.change.to.effect.mask|blur.mask|opacity.mask`. No command name for mask tracking was found in the program files.
+- Gate 3 (pointer): PASSED. With the clip selected and Premiere in front: `key code 31 using {command down, option down}` switches to the
+  Object Mask tool (the Program Monitor shows Smooth / Sharp). CoreGraphics mouse-moved events from `osascript -l JavaScript`
+  (CGEventCreateMouseEvent, kCGHIDEventTap), a few small moves then about 3 s wait, make Premiere highlight the object under the pointer in red.
+  A left click made "Object Mask (01) - Smooth" under "Unassigned Masks" in Effect Controls, with Tracker buttons, Feather, Opacity, Expansion,
+  Inverted and Blend Mode. The hover picked the WHOLE BOY, not the face. A face-only mask needs the draw mode (lasso) or an intersect.
+- Traps: `tell application "Adobe Premiere Pro 2027" to activate` times out (-1712): use System Events `set frontmost of process`. `keystroke "o"`
+  with modifiers did not select the tool and the monitor zoom went to 10 %: use `key code`. The front app changed to the terminal between two
+  commands: check the front app inside the same command as the event. `live effect get` does not list an unassigned mask.
+- First mask in a project opens a dialog "Object Mask Data Storage" (masks are stored in a folder next to the project file). Only the user clicks
+  dialogs. For way 2 this means the mask data is NOT all inside the .prproj.
+
+- Gate 4 (tracking): PASSED. The five Tracker buttons are found on a fresh screen capture by template matching (score 1.000; a stored
+  crop of the buttons), the middle one (track forward and backward) sits at 42 % of the template width. One click: the playhead ran to the
+  end, then back to 0; a second `.prmf` file grew to 1.98 MB in about 12 s for an 11.5 s 4K clip. No dialog. A blind click at remembered
+  coordinates missed once because the panel had scrolled: always locate the buttons on a capture taken in the same command.
+  Scroll: `CGEventCreateScrollWheelEvent2(null, 0, 1, dy, 0, 0)` after a mouse move over the panel.
+- Way 2 (saved file, format 46): an Object Mask is a `VideoFilterComponent` with MatchName `AE.ADBE AEMask2`, DisplayName "Mask2",
+  InstanceName "01", 36 params, held as a SubComponent of a container component (the "Unassigned Masks" list). Params by index: 4 and 5
+  (no name) turn true after tracking; 7 and 8 "Tracker" (binary; 8 lists the GUIDs of the `.prmf` files in `<project name> Masks/`),
+  9 "Path", 10 to 17 Transform (Position, Scale, Rotation, Anchor Point), 19 to 25 Sharpness, 27 Feather, 28 Opacity, 29 Expansion,
+  32 Blend Mode, 33 Type (4 for this Object Mask), 34 "User Interactions" (binary: the clicks). The mask picture itself is in the
+  `.prmf` files (binary, magic "prmf", version 4): 57 KB for the first frame, 1.98 MB after tracking. `clip effects FILE` does not list it yet.
+  Fixtures next to the test project: `fixture_0_no_mask`, `fixture_1_object_mask`, `fixture_2_object_mask_tracked` (.prproj).
+
+## Open
+
+- Assign the mask to Lumetri (drag, or `cmd.change.to.effect.mask` with a user-assigned key), then on/off frame diff.
+- Way 2: diff `fixture_0_no_mask.prproj` against the saved project with the mask, and read the external mask folder.
+
+## Built on 2026-11-22
+
+- `cli-anything-premiere mask list FILE` (new `core/masks.py`, tests in `tests/test_masks.py`, local fixtures in `tests/fixtures_local/masks/`):
+  lists each mask with type, feather, opacity, expansion, blend mode, tracked or not, and the `.prmf` data files with sizes. Read-only.
+  Not done: the clip that carries the mask is not resolved yet (prints "?"); only the Object Mask type number is measured; a mask
+  assigned to an effect is not measured (only an unassigned one).
+- Not built yet (way 1 as commands): `ui mask object` (tool key, hover, click at a point given in frame fractions, found on a screen
+  capture by matching an exported frame) and `ui mask track` (find the Tracker buttons by template, click, wait until the data file stops
+  growing). The proof scripts are in `docs/2026-11-22-mask-ui-gates/` (`mouse.js`, `scroll.js`, `tracker_tpl.png`).
+- Still open for way 1: assign the mask to an effect (drag, or a user-assigned key for `cmd.change.to.effect.mask`), a face-only mask
+  (the hover picks the whole person), HSL and shape tools (no default keys), and an on/off frame diff of an assigned mask.

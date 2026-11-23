@@ -22,6 +22,7 @@ REPL_COMMANDS = {
     "sequence clips FILE [--sequence NAME] [--kind video|audio] [--track N]": "List the clips on the tracks",
     "clip effects FILE [--sequence NAME] [--track N] --clip N [--effect NAME] [--all]": "Effects of one clip, in render order, with values and keyframes",
     "colormode list FILE": "Clips that carry a Color Mode grade",
+    "mask list FILE": "Masks of a saved project: type, settings, tracked or not, mask data files",
     "live state": "Version, open projects, active sequence and selection of the running Premiere",
     "live run SCRIPT.jsx [--args JSON] [--write] [--verify CHECK.jsx] [--project PATH]": "Run a script in the running Premiere",
     "doctor": "Check the connection to the running Premiere. Changes nothing",
@@ -322,6 +323,34 @@ def colormode_list(ctx: click.Context, file: Path) -> None:
     note = prproj.color_mode_note(len(found), proj.color_mode_markers)
     human = (_table(["sequence", "track", "clip", "name", "start"], rows) + "\n" + note) if rows else note
     _emit(ctx, {"clips": found, "color_mode_markers": proj.color_mode_markers, "note": note}, human)
+
+
+@cli.group()
+def mask() -> None:
+    """Masks made with the Premiere 27 mask tools."""
+
+
+@mask.command("list")
+@file_argument
+@json_option
+@click.pass_context
+def mask_list(ctx: click.Context, file: Path) -> None:
+    """List the masks of a saved project: type, settings, tracked or not, and the mask data files.
+
+    Read-only. The mask picture lives in .prmf files in the folder "<project name> Masks" next to the project
+    and is not decoded. Measured on an Object Mask of Premiere 27.0.0.
+    """
+    from cli_anything.premiere.core import masks as masks_core
+    try:
+        result = masks_core.list_masks(file)
+    except CliError as err:
+        _fail(ctx, err)
+        return
+    rows = [[m["instance"], m["type_name"], m.get("clip") or "?", "yes" if m["tracked"] else "no", m.get("feather"), m.get("opacity"),
+             m.get("expansion"), m["blend_mode_name"], len(m["data_files"]), sum(d["bytes"] for d in m["data_files"])] for m in result["masks"]]
+    human = (_table(["mask", "type", "clip", "tracked", "feather", "opacity", "expansion", "blend", "files", "bytes"], rows)
+             if rows else "No mask in this project.") + "\n" + result["note"]
+    _emit(ctx, {"ok": True, **result}, human)
 
 
 @cli.command("repl")
