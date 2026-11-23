@@ -251,3 +251,22 @@ The user picked this test. Run on the 4 spill shots (S2 C2495, S5 C2491, S7 C249
   (Feather 0) and the fade of the fix when the ellipse leaves the face (C2491) are not measured. Object Mask ∩ ellipse is a CANDIDATE
   for the native route, not the default. It matches the v5 Track Matte on stills; it is not a better picture. Gain: no rendered matte
   file. Cost: hands off the computer, clicks by fixed position, several missed screen steps per run.
+
+## Three methods compared on the 4 spill shots (2026-11-23)
+
+Third method: SAM 2 skin mattes made by the tools session (`<film folder>/Claude renders/matte/sam2/`, script `face_matte_sam2.py`: the
+v5 skin matte limited by a SAM 2 person mask), placed with the existing Track Matte recipe in a copy of v5, sequence
+"Before Dark - Claude v7 sam2 matte test". Only scripted calls: `duplicate_sequence`, `import_media`, `remove_from_timeline`, `live place`.
+No screen step, no hands-off time.
+
+Measure independent of any method (`all/numbers_three_methods.json`, picture `all/three_methods.jpg`): pixels that are bright in the
+no-fix frame (luma over 110: sky, some light hair) and change by more than 3 levels. 12 frames, 3 per shot.
+- v5 Track Matte: 1080 to 13934 px on every frame, max 14 to 23 levels. The approved v5 matte itself spills a little onto the sky
+  (soft feather); nobody saw it at this strength.
+- Object Mask ∩ ellipse: 0 to 3639 px, max up to 38 (highest on S7 C2496).
+- SAM 2 matte: 0 to 1641 px, max 3 to 30; the lowest of the three on 9 of 12 frames.
+- Face-centre Lab shift: SAM 2 equals v5 to 0.02 (same grade layer, same strength). Object ∩ ellipse differs by up to 1.3.
+- Coverage: the mattes (v5, SAM 2) fix face, ear and neck; the ellipse fixes the face oval only.
+Limits: 3 stills per shot; the bright-pixel measure also counts light hair; the 4 other face shots of v7 still use the v5 mattes.
+Result: for a face fix the SAM 2 matte with Track Matte Key is the best of the three (v5 look, least sky spill, fully scripted). The
+`ui mask` route stays a tool for cases with no rendered matte.
