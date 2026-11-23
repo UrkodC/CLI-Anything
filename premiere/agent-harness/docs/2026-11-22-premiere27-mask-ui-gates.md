@@ -179,3 +179,30 @@ the Vision LUT, 2.39 bars above) the Track Matte layers were removed and the nat
   a new ellipse mask, tracked, feather 50.
 - A script for a whole shot needs, besides these: the face box (a detector on the exported frame), `set_clip_selection`,
   `set_playhead_position`, `live frame export`, `apply_effect`, `live effect set`, and a frame diff as the proof.
+
+## All face shots of a film by one script (2026-11-23): Before Dark, sequence "v6 native mask test"
+
+Script: `<film folder>/Claude assets/scripts/native_face.py SHOT` (film folder = `20261122 Low light`). Per shot: select, playhead, `ui mask ellipse`
+(YuNet box on the exported frame), `ui mask feather 50`, `ui mask track --done playhead`, `apply_effect` Lumetri, a probe (Exposure +1.5 must
+change only the face area) to find the masked Lumetri, three probe writes for the gains of Temperature, Tint and Exposure at the face centre,
+a solve against the v5 (Track Matte) frame with up to 3 steps, frames at 3 times.
+
+- 7 shots run (C2495, C2491, C2492, C2496, C2498, C2509, C2519), 8 masks in `mask list`, all ellipse, feather 50, tracked, held by Lumetri.
+  The masked Lumetri was effect index 2 on every shot. About 60 to 90 s per shot.
+- Native against v5 inside the face box (mean, 8-bit): 0.8 to 3.5 / 255 on 20 of 21 frames (no fix against v5: 2.7 to 6.4). Lab shift at the
+  face centre within about 0.5 of v5. Solved values: Temperature 56 to 93, Tint 11 to 29, Exposure 0.37 to 0.82 on the dusk shots;
+  Temperature 20.5, Tint -11.3, Exposure 0.24 on the lamp-lit shot (C2519). The gains are not linear: the first solve misses by about 1 Lab unit.
+- FAIL, 1 frame: C2491 at 12.45 s (5.2 / 255, worse than no fix). The head turns to a profile against the sky and the feathered ellipse lies
+  partly on the sky: a warm patch shows next to the face. The Track Matte (skin shape) does not have this. An ellipse is wrong for a profile
+  or a turning head against a bright background.
+- The screen steps were not reliable while another app (VS Code, the terminal host) took the front place back:
+  1. `ui mask feather` reported ok (row match 1.000, typed 50) but the field did not open; the Return key then started a render and play to
+     the sequence end, and the next `live frame export` timed out. `mask list`: feather 0, not tracked.
+  2. `ui mask ellipse` reported drawn but no mask was made (small face box, 29 x 37 points).
+  3. `ui mask feather` refused with not_front.
+  The script now reads back after every screen step: save, `mask list`, mask count +1 after the ellipse, feather stored, tracked true,
+  playhead inside the clip after tracking; one retry; `stop_playback` after feather and track. To build into the CLI: the same readbacks
+  inside `ui mask ellipse` / `feather` (they need a save), and no Return key when the field did not open.
+- Cleaning a stray unassigned mask by script: `apply_effect` Lumetri (takes the mask), then `remove_effect` on that Lumetri (index 2):
+  the mask goes with the effect.
+- `mask list` object IDs change between saves: do not use them to find the new mask.
