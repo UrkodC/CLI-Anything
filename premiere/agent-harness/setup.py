@@ -51,6 +51,10 @@ setup(
         "dev": [
             "pytest>=7.0.0",
         ],
+        "screen": [
+            "numpy>=1.24",
+            "opencv-python-headless>=4.8",
+        ],
     },
     entry_points={
         "console_scripts": [
@@ -63,6 +67,7 @@ setup(
             "skills/SKILL.md",
             "tests/TEST.md",
             "core/scripts/*.jsx",
+            "core/assets/*.png",
         ],
     },
     include_package_data=True,

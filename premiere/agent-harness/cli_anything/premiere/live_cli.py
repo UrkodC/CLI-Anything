@@ -15,6 +15,7 @@ import click
 from cli_anything.premiere.core import bridge, guard
 from cli_anything.premiere.core import doctor as doctor_core   # `doctor` below is the click group
 from cli_anything.premiere.core import ui as ui_core      # `ui` below is the click group
+from cli_anything.premiere.core import ui_mask as ui_mask_core
 from cli_anything.premiere.core.bridge import BridgeClient, install_signal_handlers, restore_signal_handlers
 from cli_anything.premiere.core.mcp_client import McpSession
 # guarded_state and run_script live in core/session.py; these names stay importable from here.
@@ -393,7 +394,7 @@ def mcp_batch(ctx: click.Context, file: Path, timeout: float, lease_wait: float)
 
 @click.group()
 def ui() -> None:
-    """Click Premiere menus (Window > Mode)."""
+    """Click Premiere menus (Window > Mode) and use the mask tools on the screen."""
 
 
 @ui.group("mode")
@@ -443,6 +444,90 @@ def ui_mode_set(ctx: click.Context, mode: str) -> None:
     if result["reverted_once"]:
         human += " Premiere switched back once, so the menu item was clicked a second time."
     _emit(ctx, result, human)
+
+
+@ui.group("mask")
+def ui_mask() -> None:
+    """Premiere 27 mask tools through the screen: Object Mask and tracking."""
+
+
+def _checked_project(project: str, lease_wait: float, timeout: float, allow_untested: bool) -> None:
+    """Pass the write guards: the project at PATH is the active one and is a Claude working copy."""
+    client = _client(lease_wait)
+    with client.lease():
+        guarded_state(client, write=True, project=project, any_project=False, allow_untested=allow_untested, hard_limit_s=timeout)
+
+
+@ui_mask.command("object")
+@click.option("--project", required=True, help="Path of the project that must be the active one (a Claude working copy).")
+@click.option("--frame", "frame_png", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="The frame the Program Monitor shows now (from `live frame export`). It is found on the screen.")
+@click.option("--at", "at_text", required=True, help="Where to click, as two shares of the frame: x,y (0.5,0.5 is the centre).")
+@click.option("--hover", "hover_s", type=float, default=3.0, show_default=True, help="Seconds to hover before the click.")
+@live_options
+@json_option
+@click.pass_context
+def ui_mask_object(ctx: click.Context, project: str, frame_png: Path, at_text: str, hover_s: float, lease_wait: float,
+                   timeout: float, allow_untested: bool) -> None:
+    """Make an Object Mask on the selected clip with one click in the Program Monitor.
+
+    Before: select the clip, put the playhead on the frame, export that frame and give it as --frame. The command
+    brings Premiere to the front, finds the frame on a screen capture, presses Cmd+Opt+O (Object Mask tool), hovers
+    and clicks. Do not use the mouse or the keyboard while it runs.
+
+    made: a mask data file (.prmf) in "<project name> Masks" is new or changed. It is not a check of the mask shape:
+    Premiere picks the whole object under the pointer. When nothing changed, look at Premiere: the first mask of a
+    project opens a dialog that only you may click. The project is not saved.
+    """
+    try:
+        parts = [float(v) for v in at_text.split(",")]
+        if len(parts) != 2:
+            raise ValueError
+    except ValueError:
+        _fail(ctx, CliError("bad_point", "Give --at as two numbers: x,y."))
+        return
+    try:
+        _checked_project(project, lease_wait, timeout, allow_untested)
+        app = _running_app()
+        result = ui_mask_core.object_mask(app["process_name"], Path(project), frame_png, (parts[0], parts[1]), hover_s=hover_s)
+    except CliError as err:
+        _fail(ctx, err)
+        return
+    human = (f"Clicked at {result['clicked_points']} (frame match {result['picture']['score']}). "
+             + (f"Mask data changed: {', '.join(result['new_or_changed_files'])}." if result["made"]
+                else "No mask data changed. Look at Premiere: a dialog may be open."))
+    _emit(ctx, result, human)
+    if not result["made"]:
+        ctx.exit(1)
+
+
+@ui_mask.command("track")
+@click.option("--project", required=True, help="Path of the project that must be the active one (a Claude working copy).")
+@click.option("--direction", type=click.Choice(list(ui_mask_core.TRACKER_BUTTONS)), default="both", show_default=True,
+              help="Which Tracker button to click.")
+@click.option("--limit", "limit_s", type=float, default=300.0, show_default=True, help="Longest wait for the tracking, in seconds.")
+@live_options
+@json_option
+@click.pass_context
+def ui_mask_track(ctx: click.Context, project: str, direction: str, limit_s: float, lease_wait: float, timeout: float,
+                  allow_untested: bool) -> None:
+    """Track the selected mask: click a Tracker button in Effect Controls and wait until the mask data stops growing.
+
+    The Tracker buttons must show on the screen (select the mask; scroll Effect Controls to it). They are found on a
+    screen capture; when they are not found, nothing is clicked. Do not use the mouse while it runs.
+
+    tracked: a mask data file grew and then stayed the same for 4 seconds. It is not a check that the mask stayed on
+    the subject: check frames at several times. The project is not saved.
+    """
+    try:
+        _checked_project(project, lease_wait, timeout, allow_untested)
+        app = _running_app()
+        result = ui_mask_core.track(app["process_name"], Path(project), direction, limit_s=limit_s)
+    except CliError as err:
+        _fail(ctx, err)
+        return
+    total = sum(result["changed_files"].values())
+    _emit(ctx, result, f"Tracked ({direction}) in {int(result['seconds'])} s. Mask data: {total} bytes in {len(result['changed_files'])} file(s).")
 
 
 @click.group()

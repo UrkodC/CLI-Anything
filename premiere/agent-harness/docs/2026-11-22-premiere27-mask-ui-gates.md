@@ -56,3 +56,12 @@ sequence "Mask gate - Claude", one clip (C2489) with Lumetri. `fixture_0_no_mask
   growing). The proof scripts are in `docs/2026-11-22-mask-ui-gates/` (`mouse.js`, `scroll.js`, `tracker_tpl.png`).
 - Still open for way 1: assign the mask to an effect (drag, or a user-assigned key for `cmd.change.to.effect.mask`), a face-only mask
   (the hover picks the whole person), HSL and shape tools (no default keys), and an on/off frame diff of an assigned mask.
+
+## Keyboard Shortcuts window (user's screenshots, 2026-11-22, preset "Adobe Premiere Pro Default")
+
+Search "mask" lists these commands under Application: Object Mask Tool, Ellipse Mask Tool, Rectangle Mask Tool, Pen Mask Tool,
+HSL Mask Tool, Luminance Mask Tool, Change mask overlay color to (black & white, blue, cyan, green, magenta, none, red, yellow),
+Change to blur mask, Change to opacity mask, Invert mask, Rename Mask Or Selection, **Track mask**, **Unassign mask**; under
+Panels > Program Monitor Panel: Toggle mask bounding box. So tracking HAS a command ("Track mask") that can get a key: the Tracker
+button click of gate 4 is then not needed. Built after gate 4: `ui mask object` and `ui mask track` (core/ui_mask.py, tests/test_ui_mask.py,
+extra "screen" = numpy + opencv-python-headless); live test of the two commands not run yet.

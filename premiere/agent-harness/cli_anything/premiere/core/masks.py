@@ -11,7 +11,8 @@ from __future__ import annotations
 import base64
 import gzip
 import re
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as ET  # types only; parsing goes through defusedxml
+from defusedxml import ElementTree as SafeET
 from pathlib import Path
 
 from cli_anything.premiere.errors import CliError
@@ -27,7 +28,7 @@ _NAMED = {"Feather": "feather", "Opacity": "opacity", "Expansion": "expansion", 
 def _root(file: Path) -> ET.Element:
     try:
         with gzip.open(file, "rb") as handle:
-            return ET.parse(handle).getroot()
+            return SafeET.parse(handle).getroot()
     except (OSError, EOFError, ET.ParseError) as exc:
         raise CliError("bad_project", f"Cannot read {file} as a Premiere project: {exc}.") from None
 

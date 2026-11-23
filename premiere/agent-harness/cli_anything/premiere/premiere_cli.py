@@ -33,6 +33,8 @@ REPL_COMMANDS = {
     "mcp batch FILE": "Run the calls in FILE in one server session. No write check of the CLI runs",
     "ui mode get": "Show which mode is checked in Window > Mode",
     "ui mode set MODE": "Switch Premiere to import, edit, color or export mode",
+    "ui mask object --project PATH --frame FILE.png --at X,Y": "Make an Object Mask on the selected clip with one click in the Program Monitor",
+    "ui mask track --project PATH [--direction both|forward|backward]": "Click a Tracker button of the selected mask and wait for the tracking",
     "live clip list --sequence ID [--track-type video|audio|both] [--track N] [--detail]": "The clips of one sequence, one line per clip",
     "live effect get --sequence ID (--track N --clip N | --node-id ID) [--effect NAME]": "The effects of one clip and their properties",
     "live effect set --sequence ID (--track N --clip N | --node-id ID) --effect NAME --index N --name NAME --value JSON [--dry-run]": "Write one effect value, read it back",
@@ -412,7 +414,7 @@ class LazyGroup(click.Group):
 
 cli.add_command(LazyGroup(name="live",     import_path="cli_anything.premiere.live_cli:live",     help="Read and change the running Premiere 27 with scripts."))
 cli.add_command(LazyGroup(name="mcp",      import_path="cli_anything.premiere.live_cli:mcp",      help="Call any tool of the premiere-pro-mcp server."))
-cli.add_command(LazyGroup(name="ui",       import_path="cli_anything.premiere.live_cli:ui",       help="Click Premiere menus (Window > Mode)."))
+cli.add_command(LazyGroup(name="ui",       import_path="cli_anything.premiere.live_cli:ui",       help="Click Premiere menus (Window > Mode) and use the mask tools on the screen."))
 cli.add_command(LazyGroup(name="recovery", import_path="cli_anything.premiere.live_cli:recovery", help="Show an open recovery of the bridge."))
 cli.add_command(LazyGroup(name="doctor",   import_path="cli_anything.premiere.live_cli:doctor",   help="Check the connection to the running Premiere. Changes nothing."))
 
