@@ -130,3 +130,23 @@ Limits: Object Mask takes the whole person (a face-only mask is still open); Edi
   found on a capture) or a smaller ellipse. Until then the Track Matte route gives the better edge (skin shape, feathered).
 - Trap: during this test Premiere was found in Color mode (the owner may have switched it). The four mask keys exist in Edit mode only:
   check `ui mode get` before sending a mask key, and stop when the mode is not "edit".
+
+## Feather by the screen route: PROVEN (2026-11-22, test copy, Edit mode)
+
+- With the clip selected and Effect Controls in front (Shift+5), the mask rows show under the effect: "Ellipse Mask (01)", Tracker, Path,
+  Transform, Feather, Opacity, Expansion. (An Object Mask has Tracker, Sharpness, Feather: the row count differs, so do not use a fixed
+  offset from the Tracker row.)
+- The "Feather" label with its stopwatch was found by template matching (score 1.000; `feather_tpl.png`, 130x40 px at 2x). The value
+  sits 207 px right of the template's left edge. One click opens the number field with the old value selected; `keystroke "60"` then
+  key code 36 (Return) sets it.
+- Readback: `mask list` on the saved project shows feather 60. Frame diff with Exposure +1.5 on and off: the largest step along a line
+  through the face fell from 39.7 / 34.3 / 51.0 (hard edge) to 3.3 / 3.0 / 2.3 at 0, 5 and 10 s. The feather spreads outward too
+  (changed pixels 170,618 to 219,814): use a smaller ellipse or a negative Expansion for a strong correction.
+- Fixture: `fixture_6_ellipse_face_mask_feather60.prproj`.
+- Side finding: after the owner opened Color mode once, the clip carries a "Color Mode Effect" with match name
+  `AE.ADBE CompoundComponent` in `live effect get`. That is the first real file that confirms the match name `colormode list` looks for.
+
+Automatic face-only chain, each step proven by a readback: face box (YuNet on the exported frame) > Ellipse Mask Tool key > drag over
+the box > Track mask key (done = playhead stops) > `apply_effect` (takes the mask) > Feather by the field > `live effect set` on the
+effect > frame diff. To build next as commands: `ui mask ellipse --box X,Y,W,H`, `ui mask feather VALUE`, and a mode check ("edit")
+in every `ui mask` command.
