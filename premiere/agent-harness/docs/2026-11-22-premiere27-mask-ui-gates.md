@@ -113,3 +113,20 @@ Fixture: `fixture_4_masks_assigned_to_lumetri.prproj`.
 Full chain for a film shot, all by command: select the clip, playhead on a frame, `live frame export`, `ui mask object`, `ui mask track`,
 `apply_effect` (the face effect), `live effect set` on the masked effect, on/off frame diff, `mask list` after a save.
 Limits: Object Mask takes the whole person (a face-only mask is still open); Edit mode only; Premiere in front and hands off while it runs.
+
+## Automatic face-only mask: tracked Ellipse Mask from a face detector box (2026-11-22, test copy)
+
+- Face box from YuNet on the exported frame (brightened S-Log3): x 0.513 y 0.142 w 0.087 h 0.202 of the frame at 0 s.
+- Ellipse Mask Tool by the owner's key (key code 14 with control, option, command), then a mouse DRAG (down, 14 dragged events, up) from
+  the top-left to the bottom-right of the box grown by 10 % of its width and 12 % of its height: the ellipse sat on the face.
+- Track mask key: the playhead ran from 0 to the clip end (11.47 s) and stopped; an ellipse mask writes no .prmf file, so "done" is
+  "the playhead stopped moving", not "the data file stopped growing".
+- Lumetri applied after it took the mask. Exposure +1.5 on and off, frame diff against a fresh face box at 0, 2.5, 5, 7.5, 10 s:
+  face covered 96, 96, 94, 96, 97 %; centre offset at most 9 px at 4K; 15 to 22 % of the mask lies outside the face box (hair, a rim
+  of sky): the edge is hard (Feather 0).
+- `mask list` shows it as Type 1 (now named "ellipse"), tracked, no data files, holder Lumetri.
+- NOT solved: Feather. The mask's Feather, Opacity and Expansion are not in the effect's script properties (Lumetri shows only its own
+  88 Show Mask, 90 Invert Mask, 113 Feather of HSL Secondary and Vignette). A soft edge needs a UI step (type into the Feather field
+  found on a capture) or a smaller ellipse. Until then the Track Matte route gives the better edge (skin shape, feathered).
+- Trap: during this test Premiere was found in Color mode (the owner may have switched it). The four mask keys exist in Edit mode only:
+  check `ui mode get` before sending a mask key, and stop when the mode is not "edit".

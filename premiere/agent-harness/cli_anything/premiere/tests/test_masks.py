@@ -54,3 +54,10 @@ def test_a_file_that_is_no_project_is_refused(tmp_path):
 def test_command_prints_json():
     done = CliRunner().invoke(cli, ["--json", "mask", "list", str(LOCAL / "fixture_2_object_mask_tracked.prproj")])
     assert done.exit_code == 0 and '"tracked": true' in done.output
+
+
+@pytest.mark.skipif(not (LOCAL / "fixture_5_ellipse_face_mask_tracked_on_lumetri.prproj").is_file(), reason="local mask fixture is missing")
+def test_ellipse_mask_on_an_effect_is_listed_with_its_type():
+    found = masks.list_masks(LOCAL / "fixture_5_ellipse_face_mask_tracked_on_lumetri.prproj")["masks"]
+    ellipse = [m for m in found if m["type"] == 1]
+    assert len(ellipse) == 1 and ellipse[0]["type_name"] == "ellipse" and ellipse[0]["tracked"] is True and ellipse[0]["data_files"] == []

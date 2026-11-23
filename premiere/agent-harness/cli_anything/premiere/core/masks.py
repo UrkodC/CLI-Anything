@@ -18,7 +18,7 @@ from pathlib import Path
 from cli_anything.premiere.errors import CliError
 
 MASK_MATCH_NAME = "AE.ADBE AEMask2"
-TYPE_NAMES = {4: "object"}                       # measured: an Object Mask has Type 4. Other numbers are not measured yet.
+TYPE_NAMES = {1: "ellipse", 4: "object"}        # measured: Ellipse Mask 1, Object Mask 4. Other numbers are not measured yet.
 BLEND_NAMES = {0: "add"}                         # measured: the default "Add" is 0.
 TRACKED_PARAMS = (4, 5)                          # two unnamed flags that turn true after tracking
 _GUID = re.compile(rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
