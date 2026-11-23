@@ -80,3 +80,36 @@ extra "screen" = numpy + opencv-python-headless); live test of the two commands 
 - Fixture kept: `fixture_3_two_object_masks_tracked.prproj`.
 - Still open: assign a mask to an effect (`cmd.change.to.effect.mask` has no key yet), face-only mask, `ui mask tool` for HSL and
   ellipse (keys now exist), invert by key, an on/off frame diff of an assigned mask, the owning clip in `mask list`.
+
+## Assigning a mask to an effect (2026-11-22, from the full command list and Adobe's help page)
+
+- The owner pasted the full list of the Keyboard Shortcuts window (Copy To Clipboard). It has NO "Change to effect mask" command
+  (the name `cmd.change.to.effect.mask` in the .kys file is not offered). Mask commands that can get keys: the six mask tools,
+  Change Draw Mode, Add to object, Subtract from object, Add / Subtract / Intersect (blend modes), Invert mask, Track mask,
+  Unassign mask, Change to blur mask, Change to opacity mask, Rename Mask Or Selection, Input to this Effect / Source (Color Managed)
+  (HSL key source), Toggle mask bounding box, the overlay colours. Color Mode: Add Adjust / Style / LUT Operation, Target Clip Level.
+- Adobe help "Apply effects to existing unassigned masks" (read 2026-11-22): "When you eventually apply an effect, all unassigned masks
+  on the clip are automatically moved to that effect and used to constrain it." And: with an effect selected in Effect Controls, a new
+  mask goes to that effect.
+- Plan to test (not run yet): make and track the mask, THEN apply the face effect by script (`live effect apply`, for example a second
+  Lumetri Color). If a script-applied effect takes the unassigned masks, no key and no drag is needed. Prove with `mask list` and an
+  on/off frame diff. Open question: the test clip got its Lumetri BEFORE the masks, and they stayed unassigned, as the page says.
+- Shortcuts are stored PER MODE. The owner pasted the list twice: in Mode "Edit" the four new keys show (Track mask, HSL Mask Tool,
+  Ellipse Mask Tool, Invert mask: Ctrl+Opt+Cmd+T/H/E/I); in Mode "Color" the same commands show no key, and the Color Mode keys
+  (Add Adjust Operation Shift+N, Activate Exposure W, ...) show only there. So `ui mask track --by key` works in Edit mode only,
+  until the keys are also given in Color mode. "Object Mask Tool" shows no key in either list, yet Cmd+Opt+O switched the tool in
+  Edit mode in three live runs (the defaults file has it under context "global"). Neither list has a command that assigns a mask to an effect.
+
+## Assigning by applying the effect after the masks: PROVEN for a script (2026-11-22)
+
+Test copy, clip with Lumetri #1 and two tracked, unassigned Object Masks. `apply_effect` "Lumetri Color" through the MCP server added a
+second Lumetri (verified). Exposure +1.5 on one of the two Lumetri effects changed 100 % of the frame; the same on the other changed
+16.0 %, 16.0 % and 15.9 % of the frame at 0, 5 and 10 s, inside a box around the boy (x 1463-2679, y 219-2159 at 0 s; the box moves
+with him). So a script-applied effect takes the unassigned masks of the clip, as Adobe's help says for hand use, and the tracked mask
+follows through the clip. No key, no drag. In `live effect get` the masked Lumetri was the one listed first (effect index 2) and the
+old, unmasked one was index 3: find the masked one by a frame diff, not by its place in the list. Exposure was set back to 0 on both.
+Fixture: `fixture_4_masks_assigned_to_lumetri.prproj`.
+
+Full chain for a film shot, all by command: select the clip, playhead on a frame, `live frame export`, `ui mask object`, `ui mask track`,
+`apply_effect` (the face effect), `live effect set` on the masked effect, on/off frame diff, `mask list` after a save.
+Limits: Object Mask takes the whole person (a face-only mask is still open); Edit mode only; Premiere in front and hands off while it runs.
