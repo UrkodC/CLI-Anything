@@ -189,12 +189,24 @@ a solve against the v5 (Track Matte) frame with up to 3 steps, frames at 3 times
 
 - 7 shots run (C2495, C2491, C2492, C2496, C2498, C2509, C2519), 8 masks in `mask list`, all ellipse, feather 50, tracked, held by Lumetri.
   The masked Lumetri was effect index 2 on every shot. About 60 to 90 s per shot.
-- Native against v5 inside the face box (mean, 8-bit): 0.8 to 3.5 / 255 on 20 of 21 frames (no fix against v5: 2.7 to 6.4). Lab shift at the
-  face centre within about 0.5 of v5. Solved values: Temperature 56 to 93, Tint 11 to 29, Exposure 0.37 to 0.82 on the dusk shots;
-  Temperature 20.5, Tint -11.3, Exposure 0.24 on the lamp-lit shot (C2519). The gains are not linear: the first solve misses by about 1 Lab unit.
-- FAIL, 1 frame: C2491 at 12.45 s (5.2 / 255, worse than no fix). The head turns to a profile against the sky and the feathered ellipse lies
-  partly on the sky: a warm patch shows next to the face. The Track Matte (skin shape) does not have this. An ellipse is wrong for a profile
-  or a turning head against a bright background.
+- Shots by sheet name: S2 C2495, S5 C2491, S6 C2492, S7 C2496, S9 C2498, S13 C2509, S16 C2519 (script keys 1, 4, 5, 6, 8, 12, 15).
+- Native against v5 inside the face box (mean, 8-bit; bar set from shot 3 = about 2 to 3): 18 of 21 frames at 0.8 to 3.0; over the bar:
+  C2495 at 5.485 s 3.52, C2496 at 15.828 s 3.51, C2491 at 12.45 s 5.22 (worse than no fix, 3.07). Lab shift at the face centre within
+  about 0.5 to 1 of v5. Solved values: Temperature 56 to 93, Tint 11 to 29, Exposure 0.37 to 0.82 on the dusk shots; Temperature 20.5,
+  Tint -11.3, Exposure 0.24 on the lamp-lit C2519. The gains are not linear: the first solve misses by about 1 Lab unit.
+- SPILL, measured later from the saved frames (`all/numbers.json`: where v5 did not change within 20 px, how much the native version
+  changed): the first check (share of the change outside a grown face box) read 0.0 on every frame and could not see spill.
+  Clean on all 3 times (under 100 px over 3 levels, or under 8 levels): S6 C2492, S16 C2519; small on S13 C2509 (dark background, max 19).
+  Visible warm rim on the bright sky: S7 C2496 at all 3 times (14 to 18 thousand px, max 31 to 38), S2 C2495 at the end (6.4 thousand px,
+  max 26), S9 C2498 at the end (6.3 thousand px, max 29), S5 C2491 middle (11 thousand px, max 24) and end (88 thousand px, max 63:
+  a warm patch on the sky beside the face). So 4 of 7 shots show spill on at least one frame. Picture: `all/worst_frames.jpg`.
+- Offset between the centre of the native change and the YuNet box centre: 0 to 67 px on 20 frames (face width 200 to 500 px), and
+  -167 / +99 px on C2491 at 12.45 s (39 % of the face width): there the tracked ellipse did not follow the head as it turned and dropped.
+  Not separated: how much of the smaller spill is the round shape with an outward feather, and how much is tracking lag. Both end the
+  same way: a warm correction lands on sky, and on a bright sky a small shift shows. The Track Matte (skin shape) has none of this.
+- The V1 clips were not changed by the misfired keys: native against v5 outside the face area is 0.0 mean, 1 to 2 max on all 21 frames.
+- Limit: the mild (v4-strength) fix already needs Temperature 56 to 93 after the LUT, and two shots hit the 100 limit on the first
+  solve. A stronger fix does not fit in a Lumetri after the LUT with these sliders.
 - The screen steps were not reliable while another app (VS Code, the terminal host) took the front place back:
   1. `ui mask feather` reported ok (row match 1.000, typed 50) but the field did not open; the Return key then started a render and play to
      the sequence end, and the next `live frame export` timed out. `mask list`: feather 0, not tracked.
